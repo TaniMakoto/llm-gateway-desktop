@@ -757,78 +757,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "llm-gateway-desktop"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "async-stream",
- "auto-launch",
- "axum",
- "base64 0.22.1",
- "brotli 7.0.0",
- "bytes",
- "chrono",
- "dirs 5.0.1",
- "flate2",
- "futures",
- "hmac",
- "http",
- "http-body",
- "http-body-util",
- "httparse",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "indexmap 2.13.0",
- "json-five",
- "json5",
- "log",
- "objc2 0.5.2",
- "objc2-app-kit 0.2.2",
- "once_cell",
- "regex",
- "reqwest 0.12.28",
- "rquickjs",
- "rusqlite",
- "rust_decimal",
- "rustls",
- "rustls-native-certs",
- "serde",
- "serde_json",
- "serde_yaml",
- "serial_test",
- "sha2",
- "tauri",
- "tauri-build",
-
- "tauri-plugin-dialog",
- "tauri-plugin-log",
- "tauri-plugin-opener",
- "tauri-plugin-process",
- "tauri-plugin-single-instance",
- "tauri-plugin-store",
- "tauri-plugin-updater",
- "tauri-plugin-window-state",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls",
- "toml 0.8.23",
- "toml_edit 0.22.27",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "url",
- "uuid",
- "webkit2gtk",
- "webpki-roots 0.26.11",
- "windows-sys 0.61.2",
- "winreg 0.52.0",
- "zip 2.4.2",
- "zstd",
-]
-
-[[package]]
 name = "cesu8"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -946,26 +874,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
-]
-
-[[package]]
-name = "const-random"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87e00182fe74b066627d63b85fd550ac2998d4b0bd86bfed477a0ae4c7c71359"
-dependencies = [
- "const-random-macro",
-]
-
-[[package]]
-name = "const-random-macro"
-version = "0.1.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9d839f2a20b0aee515dc581a6172f2321f96cab76c1a38a4c584a194955390e"
-dependencies = [
- "getrandom 0.2.17",
- "once_cell",
- "tiny-keccak",
 ]
 
 [[package]]
@@ -1376,15 +1284,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "dlv-list"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "442039f5147480ba31067cb00ada1adae6892028e40e45fc5de7b7df6dcc1b5f"
-dependencies = [
- "const-random",
 ]
 
 [[package]]
@@ -2388,9 +2287,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.27.7"
+version = "0.27.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3c93eb611681b207e1fe55d5a71ecf91572ec8a6705cdb6857f7d8d5242cf58"
+checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
 dependencies = [
  "http",
  "hyper",
@@ -2398,7 +2297,6 @@ dependencies = [
  "log",
  "rustls",
  "rustls-native-certs",
- "rustls-pki-types",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -2443,7 +2341,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.6.1",
+ "windows-registry",
 ]
 
 [[package]]
@@ -2938,6 +2836,77 @@ name = "litemap"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
+
+[[package]]
+name = "llm-gateway-desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "async-stream",
+ "auto-launch",
+ "axum",
+ "base64 0.22.1",
+ "brotli 7.0.0",
+ "bytes",
+ "chrono",
+ "dirs 5.0.1",
+ "flate2",
+ "futures",
+ "hmac",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httparse",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "indexmap 2.13.0",
+ "json-five",
+ "json5",
+ "log",
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
+ "once_cell",
+ "regex",
+ "reqwest 0.12.28",
+ "rquickjs",
+ "rusqlite",
+ "rust_decimal",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "serial_test",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-log",
+ "tauri-plugin-opener",
+ "tauri-plugin-process",
+ "tauri-plugin-single-instance",
+ "tauri-plugin-store",
+ "tauri-plugin-updater",
+ "tauri-plugin-window-state",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "toml 0.8.23",
+ "toml_edit 0.22.27",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "url",
+ "uuid",
+ "webkit2gtk",
+ "webpki-roots 0.26.11",
+ "windows-sys 0.61.2",
+ "winreg 0.52.0",
+ "zip 2.4.2",
+ "zstd",
+]
 
 [[package]]
 name = "lock_api"
@@ -3535,16 +3504,6 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
-
-[[package]]
-name = "ordered-multimap"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49203cdcae0030493bad186b28da2fa25645fa276a51b6fec8010d281e02ef79"
-dependencies = [
- "dlv-list",
- "hashbrown 0.14.5",
-]
 
 [[package]]
 name = "ordered-stream"
@@ -4629,16 +4588,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-ini"
-version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "796e8d2b6696392a43bea58116b667fb4c29727dc5abd27d6acf338bb4f688c7"
-dependencies = [
- "cfg-if",
- "ordered-multimap",
-]
-
-[[package]]
 name = "rust_decimal"
 version = "1.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4685,7 +4634,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5678,27 +5627,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tauri-plugin-deep-link"
-version = "2.4.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94deb2e2e4641514ac496db2cddcfc850d6fc9d51ea17b82292a0490bd20ba5b"
-dependencies = [
- "dunce",
- "plist",
- "rust-ini",
- "serde",
- "serde_json",
- "tauri",
- "tauri-plugin",
- "tauri-utils",
- "thiserror 2.0.18",
- "tracing",
- "url",
- "windows-registry 0.5.3",
- "windows-result 0.3.4",
-]
-
-[[package]]
 name = "tauri-plugin-dialog"
 version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6080,15 +6008,6 @@ checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
-]
-
-[[package]]
-name = "tiny-keccak"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
-dependencies = [
- "crunchy",
 ]
 
 [[package]]
@@ -7108,17 +7027,6 @@ checksum = "9150af68066c4c5c07ddc0ce30421554771e528bde427614c61038bc2c92c2b1"
 dependencies = [
  "windows-core 0.61.2",
  "windows-link 0.1.3",
-]
-
-[[package]]
-name = "windows-registry"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b8a9ed28765efc97bbc954883f4e6796c33a06546ebafacbabee9696967499e"
-dependencies = [
- "windows-link 0.1.3",
- "windows-result 0.3.4",
- "windows-strings 0.4.2",
 ]
 
 [[package]]
