@@ -8,7 +8,7 @@
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::{LocalProxyRequestOverrides, Provider, ProviderMeta};
-use crate::proxy::types::{ProxyConfig, ProxyServerInfo, ProxyStatus};
+use crate::proxy::types::{ProxyServerInfo, ProxyStatus};
 use crate::store::AppState;
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
