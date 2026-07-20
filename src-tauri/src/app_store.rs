@@ -65,6 +65,13 @@ fn read_override_from_store(app: &tauri::AppHandle) -> Option<PathBuf> {
 
 /// 从 Store 刷新 app_config_dir 覆盖值并更新缓存
 pub fn refresh_app_config_dir_override(app: &tauri::AppHandle) -> Option<PathBuf> {
+    if crate::portable::is_portable() {
+        // Never inherit a path override from an installed copy. Portable mode
+        // must remain anchored to the directory containing portable.flag.
+        update_cached_override(None);
+        return None;
+    }
+
     let value = read_override_from_store(app);
     update_cached_override(value.clone());
     value
@@ -75,6 +82,12 @@ pub fn set_app_config_dir_to_store(
     app: &tauri::AppHandle,
     path: Option<&str>,
 ) -> Result<(), AppError> {
+    if crate::portable::is_portable() {
+        return Err(AppError::Message(
+            "Portable mode always stores data in the local data directory".to_string(),
+        ));
+    }
+
     let store = app
         .store_builder("app_paths.json")
         .build()

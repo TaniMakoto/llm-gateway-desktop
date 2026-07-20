@@ -156,3 +156,66 @@ jobs:
           uploadWorkflowArtifacts: true
           workflowArtifactNamePattern: "[platform]-[arch]-[bundle]"
           releaseAssetNamePattern: "[name]_[version]_[platform]_[arch][setup].[ext]"
+
+      - name: Create Windows portable ZIP
+        if: matrix.platform == 'windows-2022'
+        shell: pwsh
+        run: |
+          $version = (Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
+          $portableRoot = Join-Path $PWD "portable"
+          $packageDir = Join-Path $portableRoot "LLM Gateway Desktop"
+          $exePath = "src-tauri/target/release/llm-gateway-desktop.exe"
+
+          if (-not (Test-Path $exePath)) {
+            throw "Portable executable was not found: $exePath"
+          }
+
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "data") | Out-Null
+          New-Item -ItemType File -Force -Path (Join-Path $packageDir "portable.flag") | Out-Null
+          Copy-Item $exePath (Join-Path $packageDir "LLM Gateway Desktop.exe")
+          Copy-Item "LICENSE" $packageDir
+          Copy-Item "THIRD_PARTY_NOTICES.md" $packageDir
+          Copy-Item "README.md" $packageDir
+
+          @"
+          LLM Gateway Desktop $version - Windows x64 Portable
+
+          Extract the whole folder, then run LLM Gateway Desktop.exe.
+          Do not run the executable directly from inside the ZIP archive.
+
+          This package runs in portable mode because portable.flag is present.
+          Database, settings, logs, crash reports and WebView2 browser data are
+          stored in the local data folder next to the executable.
+
+          Keep portable.flag beside the executable. Deleting it switches the
+          application back to the normal per-user data directory on next launch.
+
+          Microsoft Edge WebView2 Runtime is required. It is normally already
+          installed on supported Windows 10 and Windows 11 systems.
+          "@ | Set-Content (Join-Path $packageDir "PORTABLE_README.txt") -Encoding UTF8
+
+          $zipName = "LLM-Gateway-Desktop_${version}_windows_x64_portable.zip"
+          $zipPath = Join-Path $portableRoot $zipName
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          Write-Host "Created portable package: $zipPath"
+
+      - name: Upload Windows portable ZIP artifact
+        if: matrix.platform == 'windows-2022'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-portable
+          path: portable/*.zip
+          if-no-files-found: error
+
+      - name: Upload Windows portable ZIP to Release
+        if: matrix.platform == 'windows-2022' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $zip = Get-ChildItem "portable/*.zip" | Select-Object -First 1
+          if (-not $zip) {
+            throw "Portable ZIP was not created."
+          }
+          gh release upload "${{ github.ref_name }}" $zip.FullName --clobber

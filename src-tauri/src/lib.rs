@@ -26,6 +26,7 @@ mod model_capabilities;
 mod openclaw_config;
 mod opencode_config;
 mod panic_hook;
+mod portable;
 mod prompt;
 mod prompt_files;
 mod provider;
@@ -106,6 +107,14 @@ fn macos_tray_icon() -> Option<Image<'static>> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Portable mode must be prepared before Tauri creates the Windows webview,
+    // otherwise WebView2 may place browser data outside the portable folder.
+    match portable::prepare_runtime() {
+        Ok(Some(data_dir)) => panic_hook::init_app_config_dir(data_dir),
+        Ok(None) => {}
+        Err(error) => eprintln!("Failed to prepare portable data directory: {error}"),
+    }
+
     // 设置 panic hook，在应用崩溃时记录日志到 <app_config_dir>/crash.log（默认 ~/.llm-gateway-desktop/crash.log）
     panic_hook::setup_panic_hook();
 
@@ -124,7 +133,7 @@ pub fn run() {
         }));
     }
 
-    let builder = builder
+    builder = builder
         // 拦截窗口关闭：根据设置决定是否最小化到托盘
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -159,19 +168,35 @@ pub fn run() {
         })
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_store::Builder::new().build())
-        .plugin(
-            tauri_plugin_window_state::Builder::default()
-                .with_state_flags(window_state_flags())
-                .build(),
-        )
-        .setup(|app| {
+        .plugin(tauri_plugin_opener::init());
+
+    // Store and window-state plugins persist files in the operating system app
+    // data directory. They are useful for installed builds, but portable mode
+    // deliberately avoids creating those external files.
+    if !portable::is_portable() {
+        builder = builder
+            .plugin(tauri_plugin_store::Builder::new().build())
+            .plugin(
+                tauri_plugin_window_state::Builder::default()
+                    .with_state_flags(window_state_flags())
+                    .build(),
+            );
+    }
+
+    let builder = builder.setup(|app| {
             let _ = rustls::crypto::ring::default_provider().install_default();
 
-            // 预先刷新 Store 覆盖配置，确保后续路径读取正确（日志/数据库等）
-            app_store::refresh_app_config_dir_override(app.handle());
-            panic_hook::init_app_config_dir(crate::config::get_app_config_dir());
+            // Installed builds may use the saved path override. Portable mode
+            // intentionally skips the OS-level store and stays in local `data`.
+            if !portable::is_portable() {
+                app_store::refresh_app_config_dir_override(app.handle());
+            }
+
+            let app_config_dir = crate::config::get_app_config_dir();
+            if let Err(error) = std::fs::create_dir_all(&app_config_dir) {
+                return Err(error.into());
+            }
+            panic_hook::init_app_config_dir(app_config_dir.clone());
             #[cfg(target_os = "windows")]
             set_windows_app_user_model_id(app.handle());
 
@@ -218,7 +243,6 @@ pub fn run() {
             usage_events::init(app.handle().clone());
 
             // 初始化数据库
-            let app_config_dir = crate::config::get_app_config_dir();
             let db_path = app_config_dir.join("llm-gateway.db");
             // This product uses a dedicated database and deliberately does not import
             // LLM Gateway Desktop JSON/live application configuration.
@@ -697,6 +721,10 @@ fn window_state_flags() -> StateFlags {
 /// 当前应用的退出路径会拦截 `ExitRequested` 并最终直接 `std::process::exit(0)`，
 /// 这里需要在真正结束进程前手动落盘，避免 window-state 插件的默认退出钩子被绕过。
 pub fn save_window_state_before_exit(app_handle: &tauri::AppHandle) {
+    if portable::is_portable() {
+        return;
+    }
+
     if let Err(err) = app_handle.save_window_state(window_state_flags()) {
         log::error!("退出前保存窗口状态失败: {err}");
     } else {

@@ -181,6 +181,13 @@ pub fn get_claude_settings_path() -> PathBuf {
 
 /// 获取应用配置目录路径 (~/.llm-gateway-desktop)
 pub fn get_app_config_dir() -> PathBuf {
+    // A portable package is explicitly self-contained. The marker next to the
+    // executable takes precedence over any path override saved by an installed
+    // copy of the application on the same machine.
+    if let Some(portable_dir) = crate::portable::data_dir() {
+        return portable_dir;
+    }
+
     if let Some(custom) = crate::app_store::get_app_config_dir_override() {
         return custom;
     }

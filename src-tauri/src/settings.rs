@@ -546,12 +546,10 @@ impl Default for AppSettings {
 
 impl AppSettings {
     fn settings_path() -> Option<PathBuf> {
-        // settings.json 保留用于旧版本迁移和无数据库场景
-        Some(
-            crate::config::get_home_dir()
-                .join(".llm-gateway-desktop")
-                .join("settings.json"),
-        )
+        // settings.json follows the application data directory. In portable
+        // mode this resolves to `<exe directory>/data/settings.json`; installed
+        // builds continue to use the normal user data directory.
+        Some(crate::config::get_app_config_dir().join("settings.json"))
     }
 
     fn normalize_paths(&mut self) {

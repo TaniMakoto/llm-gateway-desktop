@@ -153,3 +153,13 @@ Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) be
 ## License
 
 MIT. This repository contains third-party MIT-licensed code; required attribution is preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+## Windows portable package
+
+Release builds include a Windows x64 portable ZIP in addition to NSIS and MSI installers.
+Extract the entire folder and run `LLM Gateway Desktop.exe`. The included
+`portable.flag` enables portable mode, so application-owned data is written to
+`data/` beside the executable. Keep the folder writable and do not run the EXE
+directly from inside the ZIP archive.
+
+Removing `portable.flag` makes the same executable use the normal per-user data
+directory on its next launch.
