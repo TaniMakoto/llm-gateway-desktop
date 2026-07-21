@@ -71,7 +71,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use tauri::image::Image;
-use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::RunEvent;
 use tauri::Manager;
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
@@ -308,7 +308,15 @@ pub fn run() {
             let mut tray_builder = TrayIconBuilder::with_id(tray::TRAY_ID)
                 .tooltip("LLM Gateway Desktop")
                 .on_tray_icon_event(|tray, event| {
-                    if matches!(event, TrayIconEvent::Click { .. }) {
+                    // 仅左键单击（松开）打开主界面。右键必须留给系统弹出菜单，
+                    // 否则在 Windows 上右键会同时触发 show → 抢走焦点导致菜单一闪即消、
+                    // 主界面反被弹出，用户无法从托盘退出（issue: 右键关不掉）。
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
                         gateway::handle_gateway_tray_menu_event(
                             tray.app_handle(),
                             "gateway_show",
@@ -319,7 +327,7 @@ pub fn run() {
                 .on_menu_event(|app, event| {
                     gateway::handle_gateway_tray_menu_event(app, &event.id.0);
                 })
-                .show_menu_on_left_click(true);
+                .show_menu_on_left_click(false);
 
             // 使用平台对应的托盘图标（macOS 使用模板图标适配深浅色）
             #[cfg(target_os = "macos")]
