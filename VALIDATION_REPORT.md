@@ -6,14 +6,16 @@ Validation date: 2026-07-20
 ## Completed in this environment
 
 - JSON and TOML manifests parse successfully.
-- The renamed Cargo root package is present in `Cargo.lock`.
-- Required public routes are present.
+- TypeScript/TSX syntax transpiles successfully.
+- Required public gateway routes are present.
 - Python development tools compile successfully.
 - Delimiter/static structure checks pass for the selected Rust files.
 - Mock API tests pass 8/8 for health, model listing, JSON responses, and SSE streams.
-- Public-source scan finds no private credentials. Example-looking AWS values are standard unit-test fixtures.
-- Application branding, package names, data-directory names, icons, and release labels were replaced.
-- The only intentional upstream project reference is the legally required attribution in `THIRD_PARTY_NOTICES.md`.
+- Provider compatibility fields are connected from the UI to gateway provider metadata.
+- Upstream model discovery accepts OpenAI-style and Anthropic-style model-list response shapes.
+- Model-discovery authentication supports Bearer and `x-api-key` plus `anthropic-version`.
+- All constructors for the expanded Rust model/provider structs were updated.
+- Public-source scan finds no private credentials.
 
 ## Not executed here
 

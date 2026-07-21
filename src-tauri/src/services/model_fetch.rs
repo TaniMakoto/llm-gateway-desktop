@@ -4,9 +4,11 @@
 //! 主要面向第三方聚合站（硅基流动、OpenRouter 等），以及把 Anthropic
 //! 协议挂在兼容子路径上的官方供应商（DeepSeek、Kimi、智谱 GLM 等）。
 
-use reqwest::header::{HeaderValue, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, USER_AGENT};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// 获取到的模型信息
@@ -15,18 +17,7 @@ use std::time::Duration;
 pub struct FetchedModel {
     pub id: String,
     pub owned_by: Option<String>,
-}
-
-/// OpenAI 兼容的 /v1/models 响应格式
-#[derive(Debug, Deserialize)]
-struct ModelsResponse {
-    data: Option<Vec<ModelEntry>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelEntry {
-    id: String,
-    owned_by: Option<String>,
+    pub display_name: Option<String>,
 }
 
 const FETCH_TIMEOUT_SECS: u64 = 15;
@@ -58,7 +49,34 @@ pub async fn fetch_models(
     models_url_override: Option<&str>,
     user_agent: Option<HeaderValue>,
 ) -> Result<Vec<FetchedModel>, String> {
-    if api_key.is_empty() {
+    let custom_headers = HashMap::new();
+    fetch_models_with_options(
+        base_url,
+        api_key,
+        is_full_url,
+        models_url_override,
+        user_agent,
+        "bearer",
+        "openai_chat",
+        &custom_headers,
+    )
+    .await
+}
+
+/// Fetch models using the same public HTTP compatibility settings as normal
+/// gateway traffic. This supports both OpenAI-style Bearer authentication and
+/// Anthropic-style `x-api-key` + `anthropic-version` authentication.
+pub async fn fetch_models_with_options(
+    base_url: &str,
+    api_key: &str,
+    is_full_url: bool,
+    models_url_override: Option<&str>,
+    user_agent: Option<HeaderValue>,
+    auth_style: &str,
+    api_format: &str,
+    custom_headers: &HashMap<String, String>,
+) -> Result<Vec<FetchedModel>, String> {
+    if api_key.trim().is_empty() {
         return Err("API Key is required to fetch models".to_string());
     }
 
@@ -68,41 +86,34 @@ pub async fn fetch_models(
 
     for url in &candidates {
         log::debug!("[ModelFetch] Trying endpoint: {url}");
-        let mut request = client
+        let headers = build_fetch_headers(
+            api_key,
+            auth_style,
+            api_format,
+            custom_headers,
+            user_agent.as_ref(),
+        )?;
+        let response = match client
             .get(url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS));
-        // 自定义 User-Agent：部分 /models 端点同样有 UA 白名单（如 Kimi Coding Plan），
-        // 与转发 / 检测路径共用同一 UA，避免"代理可用但取模型失败"。
-        if let Some(ua) = &user_agent {
-            request = request.header(USER_AGENT, ua.clone());
-        }
-        let response = match request.send().await {
+            .headers(headers)
+            .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+            .send()
+            .await
+        {
             Ok(r) => r,
-            Err(e) => {
-                return Err(format!("Request failed: {e}"));
-            }
+            Err(e) => return Err(format!("Request failed: {e}")),
         };
 
         let status = response.status();
 
         if status.is_success() {
-            let resp: ModelsResponse = response
+            let payload: Value = response
                 .json()
                 .await
                 .map_err(|e| format!("Failed to parse response: {e}"))?;
-
-            let mut models: Vec<FetchedModel> = resp
-                .data
-                .unwrap_or_default()
-                .into_iter()
-                .map(|m| FetchedModel {
-                    id: m.id,
-                    owned_by: m.owned_by,
-                })
-                .collect();
-
+            let mut models = parse_models_payload(&payload)?;
             models.sort_by(|a, b| a.id.cmp(&b.id));
+            models.dedup_by(|a, b| a.id == b.id);
             return Ok(models);
         }
 
@@ -120,6 +131,99 @@ pub async fn fetch_models(
         "All candidates failed: {}",
         last_err.unwrap_or_else(|| "no candidates".to_string())
     ))
+}
+
+fn build_fetch_headers(
+    api_key: &str,
+    auth_style: &str,
+    api_format: &str,
+    custom_headers: &HashMap<String, String>,
+    user_agent: Option<&HeaderValue>,
+) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+
+    // Authentication is controlled by the dedicated setting. Ignore auth-like
+    // custom headers to avoid duplicate credentials and accidental key leakage.
+    for (name, value) in custom_headers {
+        if name.eq_ignore_ascii_case("authorization")
+            || name.eq_ignore_ascii_case("x-api-key")
+            || name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("user-agent")
+        {
+            continue;
+        }
+        let header_name = HeaderName::from_bytes(name.trim().as_bytes())
+            .map_err(|e| format!("Invalid custom header name {name:?}: {e}"))?;
+        let header_value = HeaderValue::from_str(value.trim())
+            .map_err(|e| format!("Invalid custom header value for {name:?}: {e}"))?;
+        headers.insert(header_name, header_value);
+    }
+
+    let use_x_api_key = auth_style.eq_ignore_ascii_case("x-api-key")
+        || (auth_style.eq_ignore_ascii_case("auto")
+            && api_format.eq_ignore_ascii_case("anthropic"));
+    if use_x_api_key {
+        headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_str(api_key.trim())
+                .map_err(|e| format!("Invalid API key header value: {e}"))?,
+        );
+        if !headers.contains_key("anthropic-version") {
+            headers.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static("2023-06-01"),
+            );
+        }
+    } else {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", api_key.trim()))
+                .map_err(|e| format!("Invalid API key header value: {e}"))?,
+        );
+    }
+
+    if let Some(ua) = user_agent {
+        headers.insert(USER_AGENT, ua.clone());
+    }
+
+    Ok(headers)
+}
+
+fn parse_models_payload(payload: &Value) -> Result<Vec<FetchedModel>, String> {
+    let entries = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| payload.get("models").and_then(Value::as_array))
+        .or_else(|| payload.as_array())
+        .ok_or_else(|| "Model list response does not contain a data/models array".to_string())?;
+
+    let models = entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id").and_then(Value::as_str)?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            Some(FetchedModel {
+                id: id.to_string(),
+                owned_by: entry
+                    .get("owned_by")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                display_name: entry
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if models.is_empty() {
+        Err("Model list response contained no model IDs".to_string())
+    } else {
+        Ok(models)
+    }
 }
 
 /// 构造「模型列表端点」的候选 URL 列表
@@ -449,10 +553,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_response() {
-        let json = r#"{"object":"list","data":[{"id":"gpt-4","object":"model","owned_by":"openai"},{"id":"claude-3-sonnet","object":"model","owned_by":"anthropic"}]}"#;
-        let resp: ModelsResponse = serde_json::from_str(json).unwrap();
-        let data = resp.data.unwrap();
+    fn test_parse_openai_models_response() {
+        let payload = serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id":"gpt-4","object":"model","owned_by":"openai"},
+                {"id":"claude-3-sonnet","object":"model","owned_by":"anthropic"}
+            ]
+        });
+        let data = parse_models_payload(&payload).unwrap();
         assert_eq!(data.len(), 2);
         assert_eq!(data[0].id, "gpt-4");
         assert_eq!(data[0].owned_by.as_deref(), Some("openai"));
@@ -460,18 +569,52 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_response_no_owned_by() {
-        let json = r#"{"object":"list","data":[{"id":"my-model","object":"model"}]}"#;
-        let resp: ModelsResponse = serde_json::from_str(json).unwrap();
-        let data = resp.data.unwrap();
-        assert_eq!(data[0].id, "my-model");
+    fn test_parse_anthropic_models_response() {
+        let payload = serde_json::json!({
+            "data": [
+                {
+                    "type": "model",
+                    "id": "claude-sonnet-example",
+                    "display_name": "Claude Sonnet Example",
+                    "created_at": "2025-01-01T00:00:00Z"
+                }
+            ],
+            "has_more": false
+        });
+        let data = parse_models_payload(&payload).unwrap();
+        assert_eq!(data[0].id, "claude-sonnet-example");
+        assert_eq!(data[0].display_name.as_deref(), Some("Claude Sonnet Example"));
         assert!(data[0].owned_by.is_none());
     }
 
     #[test]
-    fn test_parse_response_empty_data() {
-        let json = r#"{"object":"list","data":[]}"#;
-        let resp: ModelsResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.data.unwrap().is_empty());
+    fn test_parse_response_empty_data_is_error() {
+        let payload = serde_json::json!({"object":"list","data":[]});
+        assert!(parse_models_payload(&payload).is_err());
+    }
+
+    #[test]
+    fn test_anthropic_fetch_headers() {
+        let headers = build_fetch_headers(
+            "test-key",
+            "auto",
+            "anthropic",
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "test-key"
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-version")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "2023-06-01"
+        );
+        assert!(headers.get(AUTHORIZATION).is_none());
     }
 }

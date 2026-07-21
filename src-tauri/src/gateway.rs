@@ -9,8 +9,9 @@ use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::{LocalProxyRequestOverrides, Provider, ProviderMeta};
 use crate::proxy::types::{ProxyServerInfo, ProxyStatus};
+use crate::services::model_fetch;
 use crate::store::AppState;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -41,6 +42,16 @@ impl GatewayApiFormat {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GatewayCachedModel {
+    pub id: String,
+    #[serde(default)]
+    pub owned_by: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GatewayProvider {
     pub id: String,
     pub name: String,
@@ -52,6 +63,17 @@ pub struct GatewayProvider {
     pub enabled: bool,
     #[serde(default = "default_auth_style")]
     pub auth_style: String,
+    /// Optional public HTTP User-Agent override for upstream compatibility.
+    #[serde(default)]
+    pub custom_user_agent: String,
+    /// Optional exact model-list endpoint. Empty means derive `/v1/models`.
+    #[serde(default)]
+    pub models_url: String,
+    /// Last successfully fetched upstream model list, used by the route editor.
+    #[serde(default)]
+    pub cached_models: Vec<GatewayCachedModel>,
+    #[serde(default)]
+    pub models_fetched_at: Option<String>,
     #[serde(default)]
     pub custom_headers: HashMap<String, String>,
     #[serde(default)]
@@ -118,6 +140,13 @@ pub struct GatewaySnapshot {
     pub status: ProxyStatus,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelFetchResult {
+    pub models: Vec<GatewayCachedModel>,
+    pub fetched_at: String,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -148,7 +177,11 @@ fn normalize_config(mut config: GatewayConfig) -> GatewayConfig {
         provider.base_url = provider.base_url.trim().trim_end_matches('/').to_string();
         provider.api_key = provider.api_key.trim().to_string();
         provider.auth_style = provider.auth_style.trim().to_ascii_lowercase();
+        provider.custom_user_agent = provider.custom_user_agent.trim().to_string();
+        provider.models_url = provider.models_url.trim().to_string();
         provider.notes = provider.notes.trim().to_string();
+        provider.cached_models.sort_by(|a, b| a.id.cmp(&b.id));
+        provider.cached_models.dedup_by(|a, b| a.id == b.id);
         provider.custom_headers = provider
             .custom_headers
             .drain()
@@ -196,6 +229,33 @@ fn validate_config(config: &GatewayConfig) -> Result<(), String> {
             .map_err(|_| format!("供应商 {} 的 Base URL 无效", provider.name))?;
         if !matches!(parsed_url.scheme(), "http" | "https") {
             return Err(format!("供应商 {} 的 Base URL 仅支持 HTTP/HTTPS", provider.name));
+        }
+        if !provider.models_url.trim().is_empty() {
+            let models_url = url::Url::parse(provider.models_url.trim())
+                .map_err(|_| format!("供应商 {} 的模型列表 URL 无效", provider.name))?;
+            if !matches!(models_url.scheme(), "http" | "https") {
+                return Err(format!("供应商 {} 的模型列表 URL 仅支持 HTTP/HTTPS", provider.name));
+            }
+        }
+        if crate::provider::parse_custom_user_agent(Some(&provider.custom_user_agent)).is_err() {
+            return Err(format!("供应商 {} 的 User-Agent 包含非法控制字符", provider.name));
+        }
+        for (name, value) in &provider.custom_headers {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "authorization" | "x-api-key" | "host" | "content-length" | "user-agent"
+            ) {
+                return Err(format!(
+                    "供应商 {} 的请求头 {} 应使用专用配置项，而不是自定义请求头",
+                    provider.name, name
+                ));
+            }
+            HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                format!("供应商 {} 的请求头名称无效: {}", provider.name, name)
+            })?;
+            HeaderValue::from_str(value).map_err(|_| {
+                format!("供应商 {} 的请求头值无效: {}", provider.name, name)
+            })?;
         }
         if !matches!(provider.auth_style.as_str(), "auto" | "bearer" | "x-api-key") {
             return Err(format!("供应商 {} 的鉴权方式无效", provider.name));
@@ -275,6 +335,9 @@ fn provider_meta(provider: &GatewayProvider) -> ProviderMeta {
         }
         _ => Some("ANTHROPIC_AUTH_TOKEN".to_string()),
     };
+    if !provider.custom_user_agent.trim().is_empty() {
+        meta.custom_user_agent = Some(provider.custom_user_agent.trim().to_string());
+    }
     if !provider.custom_headers.is_empty() {
         meta.local_proxy_request_overrides = Some(LocalProxyRequestOverrides {
             headers: provider.custom_headers.clone(),
@@ -519,6 +582,37 @@ pub async fn stop_gateway(state: tauri::State<'_, AppState>) -> Result<(), Strin
 }
 
 #[tauri::command]
+pub async fn fetch_gateway_provider_models(
+    provider: GatewayProvider,
+) -> Result<GatewayModelFetchResult, String> {
+    let user_agent = crate::provider::parse_custom_user_agent(Some(&provider.custom_user_agent))
+        .map_err(|e| format!("User-Agent 无效: {e}"))?;
+    let models = model_fetch::fetch_models_with_options(
+        provider.base_url.trim(),
+        provider.api_key.trim(),
+        false,
+        (!provider.models_url.trim().is_empty()).then_some(provider.models_url.trim()),
+        user_agent,
+        provider.auth_style.trim(),
+        provider.api_format.as_wire_name(),
+        &provider.custom_headers,
+    )
+    .await?
+    .into_iter()
+    .map(|model| GatewayCachedModel {
+        id: model.id,
+        owned_by: model.owned_by,
+        display_name: model.display_name,
+    })
+    .collect();
+
+    Ok(GatewayModelFetchResult {
+        models,
+        fetched_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+#[tauri::command]
 pub fn generate_gateway_api_key() -> String {
     generate_local_key()
 }
@@ -597,6 +691,10 @@ mod tests {
             api_format: format,
             enabled: true,
             auth_style: "auto".to_string(),
+            custom_user_agent: String::new(),
+            models_url: String::new(),
+            cached_models: Vec::new(),
+            models_fetched_at: None,
             custom_headers: HashMap::new(),
             notes: String::new(),
         }

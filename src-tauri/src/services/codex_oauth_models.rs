@@ -74,6 +74,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
         models.push(FetchedModel {
             id: id.to_string(),
             owned_by: Some("Codex".to_string()),
+            display_name: None,
         });
         return;
     }
@@ -83,6 +84,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
             models.push(FetchedModel {
                 id: id.to_string(),
                 owned_by: Some("Codex".to_string()),
+                display_name: None,
             });
         }
         return;
@@ -104,7 +106,12 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
     )
     .or_else(|| Some("Codex".to_string()));
 
-    models.push(FetchedModel { id, owned_by });
+    let display_name = string_field(obj, &["display_name", "displayName", "title"]);
+    models.push(FetchedModel {
+        id,
+        owned_by,
+        display_name,
+    });
 }
 
 fn string_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {

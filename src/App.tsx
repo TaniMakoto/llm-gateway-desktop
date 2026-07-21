@@ -35,6 +35,12 @@ import { cn } from "@/lib/utils";
 type ApiFormat = "openai_chat" | "openai_responses" | "anthropic";
 type Tab = "dashboard" | "providers" | "routes" | "settings";
 
+interface CachedModel {
+  id: string;
+  ownedBy?: string | null;
+  displayName?: string | null;
+}
+
 interface GatewayProvider {
   id: string;
   name: string;
@@ -43,9 +49,18 @@ interface GatewayProvider {
   apiFormat: ApiFormat;
   enabled: boolean;
   authStyle: "auto" | "bearer" | "x-api-key";
+  customUserAgent: string;
+  modelsUrl: string;
+  cachedModels: CachedModel[];
+  modelsFetchedAt?: string | null;
   customHeaders: Record<string, string>;
   notes: string;
  }
+
+interface ModelFetchResult {
+  models: CachedModel[];
+  fetchedAt: string;
+}
 
 interface RouteTarget {
   providerId: string;
@@ -144,6 +159,7 @@ function App() {
   const [editingProviderId, setEditingProviderId] = useState<string | null>(null);
   const [showProviderKey, setShowProviderKey] = useState(false);
   const [headersText, setHeadersText] = useState("");
+  const [fetchingModels, setFetchingModels] = useState(false);
 
   const dirty = useMemo(
     () => JSON.stringify(config) !== JSON.stringify(savedConfig),
@@ -245,6 +261,10 @@ function App() {
       apiFormat: "openai_chat",
       enabled: true,
       authStyle: "auto",
+      customUserAgent: "",
+      modelsUrl: "",
+      cachedModels: [],
+      modelsFetchedAt: null,
       customHeaders: {},
       notes: "",
     };
@@ -256,7 +276,13 @@ function App() {
 
   const openProvider = (provider: GatewayProvider) => {
     setEditingProviderId(provider.id);
-    setProviderEditor(structuredClone(provider));
+    setProviderEditor({
+      ...structuredClone(provider),
+      customUserAgent: provider.customUserAgent ?? "",
+      modelsUrl: provider.modelsUrl ?? "",
+      cachedModels: provider.cachedModels ?? [],
+      modelsFetchedAt: provider.modelsFetchedAt ?? null,
+    });
     setHeadersText(
       Object.entries(provider.customHeaders)
         .map(([key, value]) => `${key}: ${value}`)
@@ -275,6 +301,40 @@ function App() {
       result[trimmed.slice(0, index).trim()] = trimmed.slice(index + 1).trim();
     }
     return result;
+  };
+
+  const fetchProviderModels = async () => {
+    if (!providerEditor) return;
+    if (!providerEditor.baseUrl.trim() || !providerEditor.apiKey.trim()) {
+      toast.error("请先填写 Base URL 和 API Key");
+      return;
+    }
+
+    let customHeaders: Record<string, string>;
+    try {
+      customHeaders = parseHeaders(headersText);
+    } catch (error) {
+      toast.error(String(error));
+      return;
+    }
+
+    setFetchingModels(true);
+    try {
+      const result = await invoke<ModelFetchResult>("fetch_gateway_provider_models", {
+        provider: { ...providerEditor, customHeaders },
+      });
+      setProviderEditor({
+        ...providerEditor,
+        customHeaders,
+        cachedModels: result.models,
+        modelsFetchedAt: result.fetchedAt,
+      });
+      toast.success(`已获取 ${result.models.length} 个上游模型`);
+    } catch (error) {
+      toast.error(`获取模型失败：${String(error)}`);
+    } finally {
+      setFetchingModels(false);
+    }
   };
 
   const commitProvider = () => {
@@ -486,6 +546,7 @@ function App() {
                         <span className="tag">{formatLabels[provider.apiFormat]}</span>
                         <span className="tag">{provider.authStyle === "auto" ? "自动鉴权" : provider.authStyle}</span>
                         <span className="tag font-mono">{maskKey(provider.apiKey)}</span>
+                        {(provider.cachedModels?.length ?? 0) > 0 && <span className="tag">{provider.cachedModels.length} 个模型</span>}
                       </div>
                       {provider.notes && <p className="mt-4 line-clamp-2 text-xs text-muted-foreground">{provider.notes}</p>}
                     </div>
@@ -521,7 +582,20 @@ function App() {
                               <select className="input" value={target.providerId} onChange={(event) => patchTarget(routeIndex, targetIndex, { providerId: event.target.value })}>
                                 {config.providers.map((item) => <option key={item.id} value={item.id}>{item.name} · {formatLabels[item.apiFormat]}</option>)}
                               </select>
-                              <input className="input font-mono" value={target.upstreamModel} onChange={(event) => patchTarget(routeIndex, targetIndex, { upstreamModel: event.target.value })} placeholder="上游真实模型名" />
+                              <div>
+                                <input
+                                  className="input w-full font-mono"
+                                  list={`provider-models-${routeIndex}-${targetIndex}`}
+                                  value={target.upstreamModel}
+                                  onChange={(event) => patchTarget(routeIndex, targetIndex, { upstreamModel: event.target.value })}
+                                  placeholder="上游真实模型名"
+                                />
+                                <datalist id={`provider-models-${routeIndex}-${targetIndex}`}>
+                                  {(config.providers.find((item) => item.id === target.providerId)?.cachedModels ?? []).map((model) => (
+                                    <option key={model.id} value={model.id}>{model.displayName || model.ownedBy || model.id}</option>
+                                  ))}
+                                </datalist>
+                              </div>
                               <div className="flex gap-1">
                                 <button className="icon-button" disabled={targetIndex === 0} onClick={() => moveTarget(routeIndex, targetIndex, -1)}><ArrowUp className="h-4 w-4" /></button>
                                 <button className="icon-button" disabled={targetIndex === route.targets.length - 1} onClick={() => moveTarget(routeIndex, targetIndex, 1)}><ArrowDown className="h-4 w-4" /></button>
@@ -606,7 +680,22 @@ function App() {
               <div className="sm:col-span-2"><Field label="API Key"><div className="relative"><input className="input w-full pr-10 font-mono" type={showProviderKey ? "text" : "password"} value={providerEditor.apiKey} onChange={(event) => setProviderEditor({ ...providerEditor, apiKey: event.target.value })} placeholder="sk-..." /><button className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground" onClick={() => setShowProviderKey(!showProviderKey)}>{showProviderKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button></div></Field></div>
               <Field label="鉴权方式"><select className="input w-full" value={providerEditor.authStyle} onChange={(event) => setProviderEditor({ ...providerEditor, authStyle: event.target.value as GatewayProvider["authStyle"] })}><option value="auto">自动</option><option value="bearer">Authorization: Bearer</option><option value="x-api-key">x-api-key</option></select></Field>
               <Field label="状态"><label className="switch-label h-10"><input type="checkbox" checked={providerEditor.enabled} onChange={(event) => setProviderEditor({ ...providerEditor, enabled: event.target.checked })} />启用供应商</label></Field>
+              <div className="sm:col-span-2"><Field label="自定义 User-Agent（可选）"><input className="input w-full font-mono" value={providerEditor.customUserAgent} onChange={(event) => setProviderEditor({ ...providerEditor, customUserAgent: event.target.value })} placeholder="例如 MyClient/1.0" /></Field><p className="mt-1 text-[11px] leading-5 text-muted-foreground">用于上游公开兼容要求；不会注入官方客户端私有令牌、身份提示词或设备指纹。</p></div>
+              <div className="sm:col-span-2"><Field label="模型列表 URL（可选）"><input className="input w-full font-mono" value={providerEditor.modelsUrl} onChange={(event) => setProviderEditor({ ...providerEditor, modelsUrl: event.target.value })} placeholder="留空时自动尝试 /v1/models" /></Field></div>
               <div className="sm:col-span-2"><Field label="自定义请求头（每行一个 Header: Value）"><textarea className="input min-h-24 w-full resize-y font-mono text-xs" value={headersText} onChange={(event) => setHeadersText(event.target.value)} placeholder={"HTTP-Referer: https://example.com\nX-Title: My Gateway"} /></Field></div>
+              <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-medium">上游模型列表</div>
+                    <div className="mt-1 text-[11px] text-muted-foreground">{providerEditor.cachedModels.length ? `已缓存 ${providerEditor.cachedModels.length} 个模型` : "尚未获取"}{providerEditor.modelsFetchedAt ? ` · ${new Date(providerEditor.modelsFetchedAt).toLocaleString()}` : ""}</div>
+                  </div>
+                  <button className="secondary-button" disabled={fetchingModels} onClick={() => void fetchProviderModels()}>
+                    <RefreshCw className={cn("h-4 w-4", fetchingModels && "animate-spin")} />
+                    {fetchingModels ? "获取中" : "获取模型"}
+                  </button>
+                </div>
+                {providerEditor.cachedModels.length > 0 && <div className="mt-3 max-h-36 overflow-y-auto rounded border bg-background p-2 font-mono text-[11px] leading-5">{providerEditor.cachedModels.map((model) => <div key={model.id} className="truncate" title={model.displayName || model.id}>{model.id}</div>)}</div>}
+              </div>
               <div className="sm:col-span-2"><Field label="备注"><textarea className="input min-h-20 w-full resize-y" value={providerEditor.notes} onChange={(event) => setProviderEditor({ ...providerEditor, notes: event.target.value })} /></Field></div>
             </div>
             <div className="mt-6 flex justify-end gap-2"><button className="secondary-button" onClick={() => setProviderEditor(null)}>取消</button><button className="primary-button" onClick={commitProvider}><Check className="h-4 w-4" />确定</button></div>

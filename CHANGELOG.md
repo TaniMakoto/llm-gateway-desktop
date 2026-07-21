@@ -12,6 +12,9 @@ All notable changes will be documented in this file.
 - Model aliases and ordered failover routes
 - Desktop management UI and system tray
 - Cross-platform GitHub Actions packaging
+- Provider-level custom User-Agent support
+- OpenAI- and Anthropic-style upstream model discovery
+- Cached model suggestions in the route editor
 
 ### Known limitations
 

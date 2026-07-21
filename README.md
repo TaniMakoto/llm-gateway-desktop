@@ -9,7 +9,8 @@ A local desktop gateway for managing multiple LLM API providers behind one stabl
 - Local endpoint, defaulting to `http://127.0.0.1:10888`
 - Desktop configuration UI and system tray
 - Local API-key authentication
-- Multiple upstream providers and custom headers
+- Multiple upstream providers, custom User-Agent, and custom headers
+- Upstream model discovery with cached model selection in route editing
 - Model aliases and ordered failover routes
 - OpenAI Chat Completions compatible endpoint
 - OpenAI Responses compatible endpoint
@@ -34,7 +35,7 @@ The three client formats can be routed to OpenAI Chat, OpenAI Responses, or Anth
 
 ## Quick start
 
-1. Open **Upstream Providers** and add an API base URL, API key, upstream format, authentication mode, and optional headers.
+1. Open **Upstream Providers** and add an API base URL, API key, upstream format, authentication mode, and optional compatibility headers. Use **Fetch Models** to cache the upstream model list when the provider exposes a models endpoint.
 2. Open **Model Routes** and create a local alias such as `best-code`. Add one or more ordered upstream targets.
 3. Open **Gateway Settings**, save the listening address and local access key, then start the gateway.
 4. Point a compatible client at the local endpoint.
@@ -95,6 +96,8 @@ Configuration and upstream credentials are stored locally under:
 └── logs/
 ```
 
+Provider compatibility settings are ordinary public HTTP options: a custom User-Agent, custom request headers, and an optional exact model-list URL. The project does not inject proprietary client tokens, device identifiers, private prompts, or other material intended to bypass an upstream access-control policy.
+
 The listener defaults to loopback only. Keep it on `127.0.0.1` unless remote access is intentionally secured. Prompt bodies are not intended to be logged by default, but logs and database backups should still be treated as sensitive. See [SECURITY.md](SECURITY.md).
 
 ## Local development
@@ -136,7 +139,7 @@ The workflow at `.github/workflows/build-release.yml` validates the source and b
 - macOS Apple Silicon: app and DMG
 - macOS Intel: app and DMG
 
-A manual workflow run uploads build artifacts. Pushing a tag such as `v0.1.0` also creates a draft GitHub Release. See [docs/GITHUB_ACTIONS_BUILD.md](docs/GITHUB_ACTIONS_BUILD.md). A complete public-repository checklist is in [docs/PUBLISH_GITHUB.md](docs/PUBLISH_GITHUB.md).
+A manual workflow run uploads build artifacts. Pushing a tag such as `v0.1.0` also creates a draft GitHub Release. See [docs/GITHUB_ACTIONS_BUILD.md](docs/GITHUB_ACTIONS_BUILD.md). A complete public-repository checklist is in [docs/PUBLISH_GITHUB.md](docs/PUBLISH_GITHUB.md). Provider compatibility and model discovery are documented in [docs/UPSTREAM_COMPATIBILITY.md](docs/UPSTREAM_COMPATIBILITY.md).
 
 ## Project structure
 

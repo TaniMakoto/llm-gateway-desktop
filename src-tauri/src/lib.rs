@@ -466,6 +466,7 @@ pub fn run() {
             gateway::save_gateway_config,
             gateway::start_gateway,
             gateway::stop_gateway,
+            gateway::fetch_gateway_provider_models,
             gateway::generate_gateway_api_key,
             commands::set_window_theme,
         ]);
