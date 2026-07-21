@@ -40,7 +40,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
     "clsx": "^2.1.1",
-    "lucide-react": "^0.542.0",
+    "lucide-react": "^1.25.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "sonner": "^2.0.7",
