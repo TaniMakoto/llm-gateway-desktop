@@ -54,6 +54,8 @@ interface GatewayProvider {
   cachedModels: CachedModel[];
   modelsFetchedAt?: string | null;
   customHeaders: Record<string, string>;
+  impersonateCodexClient: boolean;
+  codexClientVersion: string;
   notes: string;
  }
 
@@ -266,6 +268,8 @@ function App() {
       cachedModels: [],
       modelsFetchedAt: null,
       customHeaders: {},
+      impersonateCodexClient: false,
+      codexClientVersion: "",
       notes: "",
     };
     setEditingProviderId(null);
@@ -282,6 +286,8 @@ function App() {
       modelsUrl: provider.modelsUrl ?? "",
       cachedModels: provider.cachedModels ?? [],
       modelsFetchedAt: provider.modelsFetchedAt ?? null,
+      impersonateCodexClient: provider.impersonateCodexClient ?? false,
+      codexClientVersion: provider.codexClientVersion ?? "",
     });
     setHeadersText(
       Object.entries(provider.customHeaders)
@@ -681,6 +687,13 @@ function App() {
               <Field label="鉴权方式"><select className="input w-full" value={providerEditor.authStyle} onChange={(event) => setProviderEditor({ ...providerEditor, authStyle: event.target.value as GatewayProvider["authStyle"] })}><option value="auto">自动</option><option value="bearer">Authorization: Bearer</option><option value="x-api-key">x-api-key</option></select></Field>
               <Field label="状态"><label className="switch-label h-10"><input type="checkbox" checked={providerEditor.enabled} onChange={(event) => setProviderEditor({ ...providerEditor, enabled: event.target.checked })} />启用供应商</label></Field>
               <div className="sm:col-span-2"><Field label="自定义 User-Agent（可选）"><input className="input w-full font-mono" value={providerEditor.customUserAgent} onChange={(event) => setProviderEditor({ ...providerEditor, customUserAgent: event.target.value })} placeholder="例如 MyClient/1.0" /></Field><p className="mt-1 text-[11px] leading-5 text-muted-foreground">用于上游公开兼容要求；不会注入官方客户端私有令牌、身份提示词或设备指纹。</p></div>
+              <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
+                <label className="switch-label"><input type="checkbox" checked={providerEditor.impersonateCodexClient} onChange={(event) => setProviderEditor({ ...providerEditor, impersonateCodexClient: event.target.checked })} />以 Codex 客户端身份转发</label>
+                <p className="mt-1 text-[11px] leading-5 text-muted-foreground">部分上游会校验客户端指纹（返回 <code>unauthorized client detected</code>）。开启后转发时发送 <code>codex_cli_rs</code> 的 User-Agent 及成对的 <code>originator</code>/<code>version</code> 兼容标识；不含私有令牌或设备指纹。若已填自定义 User-Agent，则以其为准。</p>
+                {providerEditor.impersonateCodexClient && (
+                  <div className="mt-2"><Field label="Codex 版本（可选）"><input className="input w-full font-mono" value={providerEditor.codexClientVersion} onChange={(event) => setProviderEditor({ ...providerEditor, codexClientVersion: event.target.value })} placeholder="留空使用默认 0.144.1" /></Field></div>
+                )}
+              </div>
               <div className="sm:col-span-2"><Field label="模型列表 URL（可选）"><input className="input w-full font-mono" value={providerEditor.modelsUrl} onChange={(event) => setProviderEditor({ ...providerEditor, modelsUrl: event.target.value })} placeholder="留空时自动尝试 /v1/models" /></Field></div>
               <div className="sm:col-span-2"><Field label="自定义请求头（每行一个 Header: Value）"><textarea className="input min-h-24 w-full resize-y font-mono text-xs" value={headersText} onChange={(event) => setHeadersText(event.target.value)} placeholder={"HTTP-Referer: https://example.com\nX-Title: My Gateway"} /></Field></div>
               <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">

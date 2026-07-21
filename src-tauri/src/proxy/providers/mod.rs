@@ -37,6 +37,9 @@ pub mod transform_codex_chat;
 pub mod transform_gemini;
 pub mod transform_responses;
 
+// 供 gateway 复用的规范 Codex 客户端身份常量（单一事实源在 claude.rs）。
+pub(crate) use claude::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
+
 use crate::app_config::AppType;
 use crate::provider::Provider;
 use serde::{Deserialize, Serialize};

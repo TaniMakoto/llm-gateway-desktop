@@ -76,6 +76,13 @@ pub struct GatewayProvider {
     pub models_fetched_at: Option<String>,
     #[serde(default)]
     pub custom_headers: HashMap<String, String>,
+    /// 以官方 Codex CLI 客户端身份转发（发送 codex_cli_rs 的 User-Agent 与
+    /// 成对的 originator/version），用于要求 Codex 客户端指纹的上游兼容。
+    #[serde(default)]
+    pub impersonate_codex_client: bool,
+    /// Codex 客户端伪装使用的版本号。留空则使用内置默认值。
+    #[serde(default)]
+    pub codex_client_version: String,
     #[serde(default)]
     pub notes: String,
 }
@@ -178,6 +185,7 @@ fn normalize_config(mut config: GatewayConfig) -> GatewayConfig {
         provider.api_key = provider.api_key.trim().to_string();
         provider.auth_style = provider.auth_style.trim().to_ascii_lowercase();
         provider.custom_user_agent = provider.custom_user_agent.trim().to_string();
+        provider.codex_client_version = provider.codex_client_version.trim().to_string();
         provider.models_url = provider.models_url.trim().to_string();
         provider.notes = provider.notes.trim().to_string();
         provider.cached_models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -239,6 +247,11 @@ fn validate_config(config: &GatewayConfig) -> Result<(), String> {
         }
         if crate::provider::parse_custom_user_agent(Some(&provider.custom_user_agent)).is_err() {
             return Err(format!("供应商 {} 的 User-Agent 包含非法控制字符", provider.name));
+        }
+        if provider.impersonate_codex_client && !provider.codex_client_version.trim().is_empty() {
+            HeaderValue::from_str(provider.codex_client_version.trim()).map_err(|_| {
+                format!("供应商 {} 的 Codex 版本号包含非法字符", provider.name)
+            })?;
         }
         for (name, value) in &provider.custom_headers {
             if matches!(
@@ -338,9 +351,28 @@ fn provider_meta(provider: &GatewayProvider) -> ProviderMeta {
     if !provider.custom_user_agent.trim().is_empty() {
         meta.custom_user_agent = Some(provider.custom_user_agent.trim().to_string());
     }
-    if !provider.custom_headers.is_empty() {
+
+    // Codex 客户端身份伪装：把开关翻译成既有的 custom_user_agent + override headers，
+    // 复用已验证的注入链路（forwarder 无需改动）。originator/version 必须成对发送。
+    let mut override_headers = provider.custom_headers.clone();
+    if provider.impersonate_codex_client {
+        use crate::proxy::providers::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
+        let version = if provider.codex_client_version.trim().is_empty() {
+            CODEX_OAUTH_CLIENT_VERSION
+        } else {
+            provider.codex_client_version.trim()
+        };
+        // 自定义 UA 优先：仅当用户未显式设置时才合成 codex_cli_rs/<version>。
+        if meta.custom_user_agent.is_none() {
+            meta.custom_user_agent = Some(format!("{CODEX_OAUTH_ORIGINATOR}/{version}"));
+        }
+        // 身份对在 clone 之后插入，确保成对匹配，优先于用户可能手填的同名头。
+        override_headers.insert("originator".to_string(), CODEX_OAUTH_ORIGINATOR.to_string());
+        override_headers.insert("version".to_string(), version.to_string());
+    }
+    if !override_headers.is_empty() {
         meta.local_proxy_request_overrides = Some(LocalProxyRequestOverrides {
-            headers: provider.custom_headers.clone(),
+            headers: override_headers,
             body: None,
         });
     }
@@ -696,6 +728,8 @@ mod tests {
             cached_models: Vec::new(),
             models_fetched_at: None,
             custom_headers: HashMap::new(),
+            impersonate_codex_client: false,
+            codex_client_version: String::new(),
             notes: String::new(),
         }
     }
@@ -707,6 +741,76 @@ mod tests {
         assert_eq!(config.listen_port, 10888);
         assert!(config.require_auth);
         assert!(config.local_api_key.starts_with("local-sk-"));
+    }
+
+    fn override_headers(meta: &ProviderMeta) -> HashMap<String, String> {
+        meta.local_proxy_request_overrides
+            .as_ref()
+            .map(|o| o.headers.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn impersonate_codex_client_synthesizes_three_headers() {
+        let mut p = provider("codex", GatewayApiFormat::OpenaiResponses);
+        p.impersonate_codex_client = true;
+        let meta = provider_meta(&p);
+        assert_eq!(
+            meta.custom_user_agent.as_deref(),
+            Some("codex_cli_rs/0.144.1")
+        );
+        let headers = override_headers(&meta);
+        assert_eq!(headers.get("originator").map(String::as_str), Some("codex_cli_rs"));
+        assert_eq!(headers.get("version").map(String::as_str), Some("0.144.1"));
+    }
+
+    #[test]
+    fn custom_user_agent_beats_spoofed_ua() {
+        let mut p = provider("codex", GatewayApiFormat::OpenaiResponses);
+        p.impersonate_codex_client = true;
+        p.custom_user_agent = "MyClient/9.9".to_string();
+        let meta = provider_meta(&p);
+        assert_eq!(meta.custom_user_agent.as_deref(), Some("MyClient/9.9"));
+        // 身份对仍独立注入
+        let headers = override_headers(&meta);
+        assert_eq!(headers.get("originator").map(String::as_str), Some("codex_cli_rs"));
+        assert_eq!(headers.get("version").map(String::as_str), Some("0.144.1"));
+    }
+
+    #[test]
+    fn custom_version_override_applied() {
+        let mut p = provider("codex", GatewayApiFormat::OpenaiResponses);
+        p.impersonate_codex_client = true;
+        p.codex_client_version = "0.150.0".to_string();
+        let meta = provider_meta(&p);
+        assert_eq!(
+            meta.custom_user_agent.as_deref(),
+            Some("codex_cli_rs/0.150.0")
+        );
+        let headers = override_headers(&meta);
+        assert_eq!(headers.get("version").map(String::as_str), Some("0.150.0"));
+        assert_eq!(headers.get("originator").map(String::as_str), Some("codex_cli_rs"));
+    }
+
+    #[test]
+    fn toggle_off_injects_nothing() {
+        let p = provider("codex", GatewayApiFormat::OpenaiResponses);
+        let meta = provider_meta(&p);
+        assert!(meta.custom_user_agent.is_none());
+        assert!(meta.local_proxy_request_overrides.is_none());
+    }
+
+    #[test]
+    fn spoof_merges_with_custom_headers() {
+        let mut p = provider("codex", GatewayApiFormat::OpenaiResponses);
+        p.impersonate_codex_client = true;
+        p.custom_headers
+            .insert("X-Title".to_string(), "foo".to_string());
+        let meta = provider_meta(&p);
+        let headers = override_headers(&meta);
+        assert_eq!(headers.get("X-Title").map(String::as_str), Some("foo"));
+        assert_eq!(headers.get("originator").map(String::as_str), Some("codex_cli_rs"));
+        assert_eq!(headers.get("version").map(String::as_str), Some("0.144.1"));
     }
 
     #[test]

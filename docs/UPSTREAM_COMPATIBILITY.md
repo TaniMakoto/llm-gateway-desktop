@@ -6,7 +6,17 @@ Each provider can define the public HTTP compatibility settings used by normal i
 - Authentication: automatic, Bearer, or `x-api-key`
 - Custom User-Agent
 - Custom request headers
+- Codex client identity (optional)
 - Optional exact model-list URL
+
+## Codex client identity
+
+Some upstreams that emulate the OpenAI Codex/ChatGPT backend validate a client fingerprint and reject requests from generic clients (for example returning `unauthorized client detected`). When the **impersonate Codex client** toggle is enabled for a provider, forwarded requests carry the public Codex CLI compatibility markers:
+
+- `User-Agent: codex_cli_rs/<version>` (only when no custom User-Agent is set; a custom User-Agent takes precedence)
+- `originator: codex_cli_rs` and a matching `version: <version>` header (sent as a pair)
+
+The version defaults to a built-in value and can be overridden per provider when an upstream pins a specific client version. These are public compatibility identifiers only — no private tokens, identity prompts, or device fingerprints are sent. Use this only with upstreams you are authorized to access.
 
 ## Model discovery
 
