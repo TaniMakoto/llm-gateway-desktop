@@ -97,6 +97,8 @@ pub async fn test_proxy_url(url: String) -> Result<ProxyTestResult, String> {
     let proxy = reqwest::Proxy::all(&url).map_err(|e| format!("Invalid proxy URL: {e}"))?;
 
     let client = reqwest::Client::builder()
+        // 只测试用户输入的这个代理，不混入系统环境变量代理。
+        .no_proxy()
         .proxy(proxy)
         .timeout(std::time::Duration::from_secs(10))
         .connect_timeout(std::time::Duration::from_secs(10))

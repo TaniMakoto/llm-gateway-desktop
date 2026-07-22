@@ -35,6 +35,7 @@ pub fn set_proxy_port(port: u16) {
 }
 
 /// 获取 LLM Gateway Desktop 代理服务器的监听端口
+#[allow(dead_code)] // 仅供 proxy_points_to_loopback 的自环检测测试使用
 fn get_proxy_port() -> u16 {
     LLM_GATEWAY_PROXY_PORT
         .get()
@@ -215,6 +216,9 @@ pub fn is_proxy_enabled() -> bool {
 /// 构建 HTTP 客户端
 fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
     let mut builder = Client::builder()
+        // 全局先禁用 reqwest 的系统环境变量代理自动检测；下面只有在用户明确
+        // 配置代理 URL 时才追加该唯一代理。
+        .no_proxy()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
@@ -226,7 +230,7 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         .no_deflate()
         .no_zstd();
 
-    // 有代理地址则使用代理，否则跟随系统代理
+    // 显式配置了代理才用；否则严格直连（不读取系统环境变量代理）。
     if let Some(url) = proxy_url {
         // 先验证 URL 格式和 scheme
         let parsed = url::Url::parse(url)
@@ -246,16 +250,11 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         builder = builder.proxy(proxy);
         log::debug!("[GlobalProxy] Proxy configured: {}", mask_url(url));
     } else {
-        // 未设置全局代理时，让 reqwest 自动检测系统代理（环境变量）
-        // 若系统代理指向本机，禁用系统代理避免自环
-        if system_proxy_points_to_loopback() {
-            builder = builder.no_proxy();
-            log::warn!(
-                "[GlobalProxy] System proxy points to localhost, bypassing to avoid recursion"
-            );
-        } else {
-            log::debug!("[GlobalProxy] Following system proxy (no explicit proxy configured)");
-        }
+        // 关键：明确关闭 reqwest 对 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 环境变量的
+        // 自动检测。用户在 UI 里“不填代理”即为“严格直连”，避免被本机的系统代理
+        // 意外劫持（例如指向已经关闭的代理端口，或指向不能访问上游的旁路代理）。
+        builder = builder.no_proxy();
+        log::debug!("[GlobalProxy] No proxy configured: strict direct connection");
     }
 
     builder
@@ -263,6 +262,7 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
 }
 
+#[allow(dead_code)] // 空代理时已改为严格直连，此自环检测仅保留供参考与测试
 fn system_proxy_points_to_loopback() -> bool {
     const KEYS: [&str; 6] = [
         "HTTP_PROXY",
@@ -280,6 +280,7 @@ fn system_proxy_points_to_loopback() -> bool {
         .any(|value| proxy_points_to_loopback(&value))
 }
 
+#[allow(dead_code)] // 见 system_proxy_points_to_loopback
 fn proxy_points_to_loopback(value: &str) -> bool {
     fn host_is_loopback(host: &str) -> bool {
         if host.eq_ignore_ascii_case("localhost") {

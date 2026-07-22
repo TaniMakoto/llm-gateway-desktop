@@ -506,24 +506,11 @@ fn provider_meta(
         _ if format == GatewayApiFormat::Anthropic => Some("ANTHROPIC_API_KEY".to_string()),
         _ => Some("ANTHROPIC_AUTH_TOKEN".to_string()),
     };
-    if !provider.custom_user_agent.trim().is_empty() {
-        meta.custom_user_agent = Some(provider.custom_user_agent.trim().to_string());
-    }
+    let (user_agent, fingerprint_headers) = client_fingerprint(provider);
+    meta.custom_user_agent = user_agent;
 
     let mut override_headers = provider.custom_headers.clone();
-    if provider.impersonate_codex_client {
-        use crate::proxy::providers::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
-        let version = if provider.codex_client_version.trim().is_empty() {
-            CODEX_OAUTH_CLIENT_VERSION
-        } else {
-            provider.codex_client_version.trim()
-        };
-        if meta.custom_user_agent.is_none() {
-            meta.custom_user_agent = Some(format!("{CODEX_OAUTH_ORIGINATOR}/{version}"));
-        }
-        override_headers.insert("originator".to_string(), CODEX_OAUTH_ORIGINATOR.to_string());
-        override_headers.insert("version".to_string(), version.to_string());
-    }
+    override_headers.extend(fingerprint_headers);
     if !override_headers.is_empty() {
         meta.local_proxy_request_overrides = Some(LocalProxyRequestOverrides {
             headers: override_headers,
@@ -531,6 +518,34 @@ fn provider_meta(
         });
     }
     meta
+}
+
+/// 计算一个供应商对外发请求时应使用的“客户端指纹”：
+/// 返回 (有效 User-Agent, 需要额外注入的请求头)。
+///
+/// 与 `provider_meta` 中的注入规则保持一致，供“获取模型”“测试对话”等
+/// 直连上游的场景复用，确保 `impersonateCodexClient` 开关在所有出站路径生效。
+fn client_fingerprint(provider: &GatewayProvider) -> (Option<String>, HashMap<String, String>) {
+    let mut headers: HashMap<String, String> = HashMap::new();
+    let mut user_agent = (!provider.custom_user_agent.trim().is_empty())
+        .then(|| provider.custom_user_agent.trim().to_string());
+
+    if provider.impersonate_codex_client {
+        use crate::proxy::providers::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
+        let version = if provider.codex_client_version.trim().is_empty() {
+            CODEX_OAUTH_CLIENT_VERSION
+        } else {
+            provider.codex_client_version.trim()
+        };
+        // 用户显式填写的自定义 UA 优先；否则合成 codex_cli_rs/<version>。
+        if user_agent.is_none() {
+            user_agent = Some(format!("{CODEX_OAUTH_ORIGINATOR}/{version}"));
+        }
+        headers.insert("originator".to_string(), CODEX_OAUTH_ORIGINATOR.to_string());
+        headers.insert("version".to_string(), version.to_string());
+    }
+
+    (user_agent, headers)
 }
 
 fn materialize_provider(
@@ -825,8 +840,12 @@ pub async fn fetch_gateway_provider_models(
     request: FetchProviderModelsRequest,
 ) -> Result<GatewayModelFetchResult, String> {
     let provider = request.provider;
-    let user_agent = crate::provider::parse_custom_user_agent(Some(&provider.custom_user_agent))
+    let (effective_user_agent, fingerprint_headers) = client_fingerprint(&provider);
+    let user_agent = crate::provider::parse_custom_user_agent(effective_user_agent.as_deref())
         .map_err(|e| format!("User-Agent 无效: {e}"))?;
+    // Codex 身份对在 clone 之后覆盖，确保 originator/version 与 UA 版本一致。
+    let mut request_headers = provider.custom_headers.clone();
+    request_headers.extend(fingerprint_headers);
     let format = request.api_format.unwrap_or(GatewayApiFormat::OpenaiChat);
     let models = model_fetch::fetch_models_with_options(
         provider.base_url.trim(),
@@ -836,7 +855,7 @@ pub async fn fetch_gateway_provider_models(
         user_agent,
         provider.auth_style.trim(),
         format.as_wire_name(),
-        &provider.custom_headers,
+        &request_headers,
     )
     .await?
     .into_iter()
@@ -983,6 +1002,7 @@ fn build_test_client(
             let proxy = reqwest::Proxy::all(trimmed)
                 .map_err(|e| format!("代理配置无效: {e}"))?;
             let client = reqwest::Client::builder()
+                .no_proxy()
                 .proxy(proxy)
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(15))
@@ -1058,38 +1078,16 @@ async fn run_direct_test(
         req = req.header("anthropic-version", "2023-06-01");
     }
 
-    // 自定义 UA / Codex 伪装
-    let ua = if request.provider.impersonate_codex_client
-        && request.provider.custom_user_agent.trim().is_empty()
-    {
-        use crate::proxy::providers::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
-        let ver = if request.provider.codex_client_version.trim().is_empty() {
-            CODEX_OAUTH_CLIENT_VERSION
-        } else {
-            request.provider.codex_client_version.trim()
-        };
-        Some(format!("{CODEX_OAUTH_ORIGINATOR}/{ver}"))
-    } else if !request.provider.custom_user_agent.trim().is_empty() {
-        Some(request.provider.custom_user_agent.trim().to_string())
-    } else {
-        None
-    };
-    if let Some(ua) = ua {
-        req = req.header("User-Agent", ua);
-    }
-    if request.provider.impersonate_codex_client {
-        use crate::proxy::providers::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
-        let ver = if request.provider.codex_client_version.trim().is_empty() {
-            CODEX_OAUTH_CLIENT_VERSION
-        } else {
-            request.provider.codex_client_version.trim()
-        };
-        req = req.header("originator", CODEX_OAUTH_ORIGINATOR);
-        req = req.header("version", ver);
+    // 自定义 UA / Codex 伪装：复用与真实转发、获取模型相同的指纹规则。
+    let (user_agent, fingerprint_headers) = client_fingerprint(&request.provider);
+    if let Some(user_agent) = user_agent {
+        req = req.header("User-Agent", user_agent);
     }
 
-    // 自定义头（禁保留头）
-    for (name, value) in &request.provider.custom_headers {
+    // 自定义头（禁保留头）；Codex 身份对最后覆盖，确保 originator/version 成对一致。
+    let mut request_headers = request.provider.custom_headers.clone();
+    request_headers.extend(fingerprint_headers);
+    for (name, value) in &request_headers {
         let lower = name.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
@@ -1171,11 +1169,19 @@ pub async fn test_gateway_model(
         return Err("测试消息不能为空".to_string());
     }
 
-    // 通过网关路径下，代理由网关自身的全局代理决定；前端也会禁用代理开关。
-    // 后端为兼容仍尊重 mode 构建的客户端（用来复用请求发送），但记录 proxy_effective 为
-    // 空以避免误导用户。
+    // 通过网关测试时，本地测试请求必须严格直连本地监听端口；真正的
+    // “网关 → 上游”出站段仍由网关共享客户端按全局代理配置决定。
     let (client, proxy_effective) = if request.via_gateway {
-        (crate::proxy::http_client::get(), None)
+        let local_client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("构建本地网关测试客户端失败: {e}"))?;
+        (
+            local_client,
+            crate::proxy::http_client::get_current_proxy_url(),
+        )
     } else {
         build_test_client(request.proxy_mode, &request.custom_proxy_url)?
     };
@@ -1342,6 +1348,16 @@ mod tests {
             Some("codex_cli_rs/0.144.1")
         );
         let headers = override_headers(&meta);
+        assert_eq!(headers.get("originator").map(String::as_str), Some("codex_cli_rs"));
+        assert_eq!(headers.get("version").map(String::as_str), Some("0.144.1"));
+    }
+
+    #[test]
+    fn client_fingerprint_applies_codex_identity_to_direct_requests() {
+        let mut p = provider_with_format("codex", GatewayApiFormat::OpenaiResponses);
+        p.impersonate_codex_client = true;
+        let (user_agent, headers) = client_fingerprint(&p);
+        assert_eq!(user_agent.as_deref(), Some("codex_cli_rs/0.144.1"));
         assert_eq!(headers.get("originator").map(String::as_str), Some("codex_cli_rs"));
         assert_eq!(headers.get("version").map(String::as_str), Some("0.144.1"));
     }

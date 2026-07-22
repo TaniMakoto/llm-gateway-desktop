@@ -1067,6 +1067,26 @@ function ProviderEditorModal({
   );
 }
 
+function SegmentedOption({ name, checked, disabled = false, onChange, children }: {
+  name: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <label className={cn(
+      "flex min-h-10 cursor-pointer select-none items-center justify-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors",
+      checked ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:bg-background/60 hover:text-foreground",
+      disabled && "pointer-events-none cursor-not-allowed opacity-40",
+    )}>
+      <input className="sr-only" type="radio" name={name} checked={checked} disabled={disabled} onChange={onChange} />
+      {checked && <Check className="h-3.5 w-3.5 shrink-0 text-emerald-500" />}
+      <span>{children}</span>
+    </label>
+  );
+}
+
 function ModelTestModal({
   ctx,
   gatewayRunning,
@@ -1081,7 +1101,7 @@ function ModelTestModal({
   const model = ctx.provider.models[ctx.modelIndex];
   const [prompt, setPrompt] = useState("用一句话介绍你自己。");
   const [viaGateway, setViaGateway] = useState<"direct" | "gateway">("direct");
-  const [proxyMode, setProxyMode] = useState<ProxyMode>("follow_global");
+  const [proxyMode, setProxyMode] = useState<ProxyMode>("bypass");
   const [customProxyUrl, setCustomProxyUrl] = useState("");
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<ModelTestResult | null>(null);
@@ -1169,54 +1189,36 @@ function ModelTestModal({
         </div>
 
         <div className="space-y-4">
-          <div className="rounded-lg border p-3">
-            <div className="mb-2 text-xs font-medium text-muted-foreground">路径</div>
-            <div className="flex flex-wrap gap-2 text-sm">
-              <label className={cn("switch-label", viaGateway === "direct" && "ring-2 ring-primary")}>
-                <input type="radio" name="viaGateway" checked={viaGateway === "direct"} onChange={() => setViaGateway("direct")} />
-                直连上游
-              </label>
-              <label
-                className={cn(
-                  "switch-label",
-                  viaGateway === "gateway" && "ring-2 ring-primary",
-                  !gatewayAllowed && "opacity-50",
-                )}
-                title={!gatewayAllowed ? (gatewayRunning ? "此别名需先保存配置" : "网关未启动") : ""}
-              >
-                <input type="radio" name="viaGateway" disabled={!gatewayAllowed} checked={viaGateway === "gateway"} onChange={() => setViaGateway("gateway")} />
-                通过本地网关
-              </label>
+          <div className="rounded-xl border bg-muted/20 p-4">
+            <div className="mb-3 text-sm font-medium">请求路径</div>
+            <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted p-1">
+              <SegmentedOption name="viaGateway" checked={viaGateway === "direct"} onChange={() => setViaGateway("direct")}>直连上游</SegmentedOption>
+              <SegmentedOption name="viaGateway" checked={viaGateway === "gateway"} disabled={!gatewayAllowed} onChange={() => setViaGateway("gateway")}>通过本地网关</SegmentedOption>
             </div>
             {!gatewayAllowed && (
-              <div className="mt-2 text-[11px] text-muted-foreground">
+              <div className="mt-2.5 text-[11px] leading-5 text-muted-foreground">
                 {gatewayRunning ? "此模型条目尚未保存到运行配置中，无法通过网关测试。" : "网关未启动，无法通过网关测试。"}
               </div>
             )}
           </div>
 
-          <div className={cn("rounded-lg border p-3", proxyDisabled && "opacity-60")}>
-            <div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground">
-              <Shield className="h-3.5 w-3.5" />代理
-              {proxyDisabled && <span className="text-[10px]">（通过网关时，代理由网关全局设置决定）</span>}
+          <div className={cn("rounded-xl border bg-muted/20 p-4", proxyDisabled && "opacity-60")}>
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <Shield className="h-4 w-4 text-muted-foreground" />
+              <span className="text-sm font-medium">出口方式</span>
+              {proxyDisabled && <span className="text-[11px] text-muted-foreground">通过网关时由网关全局设置决定</span>}
             </div>
-            <div className="flex flex-wrap gap-2 text-sm">
-              <label className={cn("switch-label", proxyMode === "follow_global" && "ring-2 ring-primary")}>
-                <input type="radio" name="proxyMode" disabled={proxyDisabled} checked={proxyMode === "follow_global"} onChange={() => setProxyMode("follow_global")} />
-                跟随全局
-              </label>
-              <label className={cn("switch-label", proxyMode === "bypass" && "ring-2 ring-primary")}>
-                <input type="radio" name="proxyMode" disabled={proxyDisabled} checked={proxyMode === "bypass"} onChange={() => setProxyMode("bypass")} />
-                强制直连
-              </label>
-              <label className={cn("switch-label", proxyMode === "custom" && "ring-2 ring-primary")}>
-                <input type="radio" name="proxyMode" disabled={proxyDisabled} checked={proxyMode === "custom"} onChange={() => setProxyMode("custom")} />
-                自定义
-              </label>
+            <div className="grid grid-cols-3 gap-1 rounded-lg bg-muted p-1">
+              <SegmentedOption name="proxyMode" checked={!proxyDisabled && proxyMode === "bypass"} disabled={proxyDisabled} onChange={() => setProxyMode("bypass")}>直接连接</SegmentedOption>
+              <SegmentedOption name="proxyMode" checked={!proxyDisabled && proxyMode === "follow_global"} disabled={proxyDisabled} onChange={() => setProxyMode("follow_global")}>跟随全局</SegmentedOption>
+              <SegmentedOption name="proxyMode" checked={!proxyDisabled && proxyMode === "custom"} disabled={proxyDisabled} onChange={() => setProxyMode("custom")}>临时代理</SegmentedOption>
             </div>
+            {!proxyDisabled && proxyMode === "bypass" && (
+              <p className="mt-2.5 text-[11px] leading-5 text-muted-foreground">本次测试强制直连上游，不使用全局设置或系统环境变量中的代理。</p>
+            )}
             {proxyMode === "custom" && !proxyDisabled && (
               <input
-                className="input mt-2 w-full font-mono"
+                className="input mt-3 w-full font-mono"
                 value={customProxyUrl}
                 onChange={(event) => setCustomProxyUrl(event.target.value)}
                 placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
