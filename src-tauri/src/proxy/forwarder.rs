@@ -3399,9 +3399,13 @@ mod tests {
     use std::time::Duration;
 
     fn test_provider_with_type(provider_type: Option<&str>) -> Provider {
+        test_provider_with_id("provider-1", provider_type)
+    }
+
+    fn test_provider_with_id(id: &str, provider_type: Option<&str>) -> Provider {
         Provider {
-            id: "provider-1".to_string(),
-            name: "Provider 1".to_string(),
+            id: id.to_string(),
+            name: id.to_string(),
             settings_config: json!({}),
             website_url: None,
             category: None,
@@ -3446,13 +3450,13 @@ mod tests {
 
     #[test]
     fn single_provider_success_is_not_failover() {
-        let providers = vec![test_provider("only", None)];
+        let providers = vec![test_provider_with_id("only", None)];
         assert!(!RequestForwarder::route_used_fallback(&providers, "only"));
     }
 
     #[test]
     fn primary_success_is_not_failover() {
-        let providers = vec![test_provider("primary", None), test_provider("backup", None)];
+        let providers = vec![test_provider_with_id("primary", None), test_provider_with_id("backup", None)];
         assert!(!RequestForwarder::route_used_fallback(
             &providers,
             "primary"
@@ -3461,7 +3465,7 @@ mod tests {
 
     #[test]
     fn backup_success_is_failover() {
-        let providers = vec![test_provider("primary", None), test_provider("backup", None)];
+        let providers = vec![test_provider_with_id("primary", None), test_provider_with_id("backup", None)];
         assert!(RequestForwarder::route_used_fallback(
             &providers,
             "backup"
