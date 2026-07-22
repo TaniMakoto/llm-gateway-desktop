@@ -3,6 +3,25 @@
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::UpdaterExt;
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartupPreferences {
+    pub launch_on_startup: bool,
+    pub start_hidden_on_autostart: bool,
+    pub minimize_to_tray_on_close: bool,
+}
+
+fn startup_preferences_from_settings(
+    settings: &crate::settings::AppSettings,
+    system_auto_launch_enabled: bool,
+) -> StartupPreferences {
+    StartupPreferences {
+        launch_on_startup: system_auto_launch_enabled,
+        start_hidden_on_autostart: settings.start_hidden_on_autostart,
+        minimize_to_tray_on_close: settings.minimize_to_tray_on_close,
+    }
+}
+
 /// 应用更新下载进度（通过 `update-download-progress` 事件发给前端）。
 #[derive(Clone, serde::Serialize)]
 struct UpdateDownloadProgress {
@@ -301,25 +320,89 @@ pub async fn set_app_config_dir_override(
     Ok(true)
 }
 
-/// 设置开机自启
+/// 设置开机自启，并同步设备级偏好。安装版与便携版行为一致。
 #[tauri::command]
-pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
-    if enabled {
-        crate::auto_launch::enable_auto_launch().map_err(|e| format!("启用开机自启失败: {e}"))?;
+pub async fn set_auto_launch(enabled: bool) -> Result<StartupPreferences, String> {
+    let previous_settings = crate::settings::get_settings();
+    let previous_system_enabled = crate::auto_launch::is_any_auto_launch_enabled()
+        .map_err(|e| format!("读取当前开机自启状态失败: {e}"))?;
+
+    let executable_path = if enabled {
+        crate::auto_launch::enable_auto_launch()
+            .map_err(|e| format!("启用开机自启失败: {e}"))?;
+        Some(
+            crate::auto_launch::current_executable_path_string()
+                .map_err(|e| format!("记录开机启动路径失败: {e}"))?,
+        )
     } else {
-        crate::auto_launch::disable_auto_launch().map_err(|e| format!("禁用开机自启失败: {e}"))?;
+        crate::auto_launch::disable_auto_launch()
+            .map_err(|e| format!("禁用开机自启失败: {e}"))?;
+        None
+    };
+
+    if let Err(error) = crate::settings::set_auto_launch_preference(enabled, executable_path) {
+        // 系统启动项已经改变但设置文件落盘失败时，尽力恢复原状态，避免半成功。
+        let rollback_result = if previous_system_enabled {
+            crate::auto_launch::enable_auto_launch()
+        } else {
+            crate::auto_launch::disable_auto_launch()
+        };
+        if let Err(rollback_error) = rollback_result {
+            log::error!("回滚系统开机启动项失败: {rollback_error}");
+        }
+        if let Err(rollback_error) = crate::settings::update_settings(previous_settings) {
+            log::error!("回滚开机自启本地设置失败: {rollback_error}");
+        }
+        return Err(format!("保存开机自启设置失败: {error}"));
     }
-    Ok(true)
+
+    let settings = crate::settings::get_settings();
+    Ok(startup_preferences_from_settings(&settings, enabled))
+}
+
+/// 设置开机自启拉起时是否隐藏到托盘。
+#[tauri::command]
+pub async fn set_start_hidden_on_autostart(
+    enabled: bool,
+) -> Result<StartupPreferences, String> {
+    crate::settings::set_start_hidden_on_autostart(enabled)
+        .map_err(|e| format!("保存后台启动设置失败: {e}"))?;
+    get_startup_preferences().await
+}
+
+/// 设置关闭主窗口时是否继续在托盘运行。
+#[tauri::command]
+pub async fn set_minimize_to_tray_on_close(
+    enabled: bool,
+) -> Result<StartupPreferences, String> {
+    crate::settings::set_minimize_to_tray_on_close(enabled)
+        .map_err(|e| format!("保存关闭行为设置失败: {e}"))?;
+    get_startup_preferences().await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::merge_settings_for_save;
+    use super::{merge_settings_for_save, startup_preferences_from_settings};
     use crate::settings::{
         AppSettings, CodexOfficialHistoryUnifyMigration, CodexProviderTemplateMigration,
         CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
         WebDavSyncSettings,
     };
+
+    #[test]
+    fn startup_preferences_use_system_auto_launch_as_source_of_truth() {
+        let settings = AppSettings {
+            launch_on_startup: true,
+            start_hidden_on_autostart: true,
+            minimize_to_tray_on_close: false,
+            ..AppSettings::default()
+        };
+
+        let preferences = startup_preferences_from_settings(&settings, false);
+        assert!(!preferences.launch_on_startup);
+        assert!(preferences.start_hidden_on_autostart);
+        assert!(!preferences.minimize_to_tray_on_close);
+    }
 
     #[test]
     fn save_settings_should_preserve_existing_webdav_when_payload_omits_it() {
@@ -620,10 +703,50 @@ mod tests {
     }
 }
 
-/// 获取开机自启状态
+/// 获取启动与后台运行偏好。开机自启以操作系统实际状态为准。
+#[tauri::command]
+pub async fn get_startup_preferences() -> Result<StartupPreferences, String> {
+    let settings = crate::settings::get_settings();
+    let system_enabled = match crate::auto_launch::is_any_auto_launch_enabled() {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            // 启动项查询失败不应连带禁用“关闭到托盘”等无关设置。
+            // UI 暂时回退到本地缓存；真正启用/禁用时仍会返回系统错误。
+            log::warn!("获取系统开机自启状态失败，暂用本地缓存: {error}");
+            return Ok(startup_preferences_from_settings(
+                &settings,
+                settings.launch_on_startup,
+            ));
+        }
+    };
+
+    // 用户可能在任务管理器/系统登录项中手动禁用。路径未变化时尊重系统状态，
+    // 同步本地缓存，避免 UI 下一次又显示为开启。
+    if settings.launch_on_startup != system_enabled {
+        let executable_path = if system_enabled {
+            // 发现系统中已有启动项但本地设置尚未记录时，顺便迁移成带
+            // --autostart 的当前格式，确保登录启动可以正确隐藏到托盘。
+            crate::auto_launch::enable_auto_launch()
+                .map_err(|e| format!("迁移现有开机启动项失败: {e}"))?;
+            Some(
+                crate::auto_launch::current_executable_path_string()
+                    .map_err(|e| format!("读取当前应用路径失败: {e}"))?,
+            )
+        } else {
+            None
+        };
+        crate::settings::set_auto_launch_preference(system_enabled, executable_path)
+            .map_err(|e| format!("同步开机自启状态失败: {e}"))?;
+    }
+
+    let settings = crate::settings::get_settings();
+    Ok(startup_preferences_from_settings(&settings, system_enabled))
+}
+
+/// 兼容旧前端调用。
 #[tauri::command]
 pub async fn get_auto_launch_status() -> Result<bool, String> {
-    crate::auto_launch::is_auto_launch_enabled().map_err(|e| format!("获取开机自启状态失败: {e}"))
+    Ok(get_startup_preferences().await?.launch_on_startup)
 }
 
 /// 获取整流器配置

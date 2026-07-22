@@ -108,6 +108,12 @@ interface GatewaySnapshot {
   status: ProxyStatus;
 }
 
+interface StartupPreferences {
+  launchOnStartup: boolean;
+  startHiddenOnAutostart: boolean;
+  minimizeToTrayOnClose: boolean;
+}
+
 interface ProxyTestResult {
   success: boolean;
   latencyMs: number;
@@ -198,6 +204,8 @@ function App() {
   const [status, setStatus] = useState<ProxyStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [startupPreferences, setStartupPreferences] = useState<StartupPreferences | null>(null);
+  const [startupSettingsBusy, setStartupSettingsBusy] = useState(false);
   const [showLocalKey, setShowLocalKey] = useState(false);
   const [providerEditor, setProviderEditor] = useState<GatewayProvider | null>(null);
   const [editingProviderId, setEditingProviderId] = useState<string | null>(null);
@@ -248,6 +256,40 @@ function App() {
     }
   };
 
+  const loadStartupPreferences = async () => {
+    try {
+      const preferences = await invoke<StartupPreferences>("get_startup_preferences");
+      setStartupPreferences(preferences);
+    } catch (error) {
+      console.warn("Failed to load startup preferences", error);
+    }
+  };
+
+  const updateStartupPreference = async (
+    command: "set_auto_launch" | "set_start_hidden_on_autostart" | "set_minimize_to_tray_on_close",
+    enabled: boolean,
+  ) => {
+    setStartupSettingsBusy(true);
+    try {
+      const preferences = await invoke<StartupPreferences>(command, { enabled });
+      setStartupPreferences(preferences);
+      if (command === "set_auto_launch") {
+        toast.success(
+          enabled
+            ? "已启用开机自启动；如需开机后直接提供 API，请同时开启自动启动网关"
+            : "已关闭开机自启动",
+        );
+      } else {
+        toast.success("启动与后台设置已保存");
+      }
+    } catch (error) {
+      toast.error(`保存启动设置失败：${String(error)}`);
+      await loadStartupPreferences();
+    } finally {
+      setStartupSettingsBusy(false);
+    }
+  };
+
   const refreshStatus = async () => {
     try {
       const snapshot = await invoke<GatewaySnapshot>("get_gateway_snapshot");
@@ -260,6 +302,7 @@ function App() {
   useEffect(() => {
     void loadSnapshot(true);
     void loadGlobalProxy();
+    void loadStartupPreferences();
     const timer = window.setInterval(() => void refreshStatus(), 2000);
     return () => window.clearInterval(timer);
   }, []);
@@ -749,8 +792,41 @@ function App() {
                     <button className="secondary-button" onClick={regenerateKey}><RotateCcw className="h-4 w-4" />重新生成</button>
                   </div>
                 </SettingRow>
-                <SettingRow title="随软件自动启动网关" description="启动桌面软件后自动监听本地端口，但不会修改或接管其他程序的配置。">
+                <SettingRow title="开机自启动" description="登录系统时自动启动应用。安装版和便携版均支持；便携版移动后，手动运行一次即可自动修复启动路径。">
+                  <label className="switch-label">
+                    <input
+                      type="checkbox"
+                      disabled={!startupPreferences || startupSettingsBusy}
+                      checked={startupPreferences?.launchOnStartup ?? false}
+                      onChange={(event) => void updateStartupPreference("set_auto_launch", event.target.checked)}
+                    />
+                    启用
+                  </label>
+                </SettingRow>
+                <SettingRow title="以最小化启动" description="仅在“开机自启动”开启时生效。登录后直接进入托盘，不弹出主窗口；手动双击软件仍会正常显示。" nested>
+                  <label className="switch-label">
+                    <input
+                      type="checkbox"
+                      disabled={!startupPreferences?.launchOnStartup || startupSettingsBusy}
+                      checked={startupPreferences?.startHiddenOnAutostart ?? false}
+                      onChange={(event) => void updateStartupPreference("set_start_hidden_on_autostart", event.target.checked)}
+                    />
+                    启用
+                  </label>
+                </SettingRow>
+                <SettingRow title="应用启动后自动启动网关" description="启动桌面软件后自动监听本地端口，但不会修改或接管其他程序的配置。">
                   <label className="switch-label"><input type="checkbox" checked={config.autoStart} onChange={(event) => setConfig({ ...config, autoStart: event.target.checked })} />启用</label>
+                </SettingRow>
+                <SettingRow title="关闭窗口后继续运行" description="点击右上角关闭按钮时隐藏到托盘；关闭后可从托盘菜单重新打开或彻底退出。">
+                  <label className="switch-label">
+                    <input
+                      type="checkbox"
+                      disabled={!startupPreferences || startupSettingsBusy}
+                      checked={startupPreferences?.minimizeToTrayOnClose ?? true}
+                      onChange={(event) => void updateStartupPreference("set_minimize_to_tray_on_close", event.target.checked)}
+                    />
+                    启用
+                  </label>
                 </SettingRow>
                 <SettingRow title="请求日志" description="记录模型、供应商、延迟、Token 和状态；默认不记录提示词正文。">
                   <label className="switch-label"><input type="checkbox" checked={config.enableLogging} onChange={(event) => setConfig({ ...config, enableLogging: event.target.checked })} />启用</label>
@@ -1397,8 +1473,8 @@ function Endpoint({ method, path, note }: { method: string; path: string; note: 
   return <div className="flex items-center gap-2 rounded-lg border px-3 py-2"><span className="w-10 text-[10px] font-bold text-primary">{method}</span><code className="min-w-0 flex-1 truncate text-xs">{path}</code><span className="text-[10px] text-muted-foreground">{note}</span></div>;
 }
 
-function SettingRow({ title, description, children }: { title: string; description: string; children: ReactNode }) {
-  return <div className="flex items-center justify-between gap-8 p-5"><div className="max-w-lg"><h3 className="text-sm font-medium">{title}</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p></div><div className="shrink-0">{children}</div></div>;
+function SettingRow({ title, description, children, nested = false }: { title: string; description: string; children: ReactNode; nested?: boolean }) {
+  return <div className={cn("flex items-center justify-between gap-8 p-5", nested && "bg-muted/20 pl-10")}><div className="max-w-lg"><h3 className="text-sm font-medium">{title}</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p></div><div className="shrink-0">{children}</div></div>;
 }
 
 function Field({ label, children }: { label: string; children: ReactNode }) {

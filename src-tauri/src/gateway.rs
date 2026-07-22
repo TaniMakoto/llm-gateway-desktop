@@ -1310,10 +1310,12 @@ pub fn create_gateway_tray_menu(
 pub fn handle_gateway_tray_menu_event(app: &tauri::AppHandle, id: &str) {
     match id {
         "gateway_show" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_skip_taskbar(false);
-                let _ = window.set_focus();
+            if !crate::lightweight::reveal_main_window(app)
+                && crate::lightweight::is_lightweight_mode()
+            {
+                if let Err(error) = crate::lightweight::exit_lightweight_mode(app) {
+                    log::error!("托盘唤醒主窗口失败: {error}");
+                }
             }
         }
         "gateway_start" => {

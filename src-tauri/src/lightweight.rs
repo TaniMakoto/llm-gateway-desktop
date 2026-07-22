@@ -4,6 +4,28 @@ use tauri::Manager;
 
 static LIGHTWEIGHT_MODE: AtomicBool = AtomicBool::new(false);
 
+/// 恢复并聚焦主窗口，同时恢复任务栏/Dock 状态。
+pub fn reveal_main_window(app: &tauri::AppHandle) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        return false;
+    };
+
+    #[cfg(target_os = "windows")]
+    let _ = window.set_skip_taskbar(false);
+
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+
+    #[cfg(target_os = "linux")]
+    crate::linux_fix::nudge_main_window(window.clone());
+
+    #[cfg(target_os = "macos")]
+    crate::tray::apply_tray_policy(app, true);
+
+    true
+}
+
 pub fn enter_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -33,22 +55,7 @@ pub fn enter_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
 pub fn exit_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
     use tauri::WebviewWindowBuilder;
 
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        #[cfg(target_os = "linux")]
-        {
-            crate::linux_fix::nudge_main_window(window.clone());
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let _ = window.set_skip_taskbar(false);
-        }
-        #[cfg(target_os = "macos")]
-        {
-            crate::tray::apply_tray_policy(app, true);
-        }
+    if reveal_main_window(app) {
         LIGHTWEIGHT_MODE.store(false, Ordering::Release);
         crate::tray::refresh_tray_menu(app);
         log::info!("退出轻量模式");
@@ -68,26 +75,7 @@ pub fn exit_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
         .build()
         .map_err(|e| format!("创建主窗口失败: {e}"))?;
 
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        #[cfg(target_os = "linux")]
-        {
-            crate::linux_fix::nudge_main_window(window.clone());
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.set_skip_taskbar(false);
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        crate::tray::apply_tray_policy(app, true);
-    }
+    let _ = reveal_main_window(app);
 
     LIGHTWEIGHT_MODE.store(false, Ordering::Release);
     crate::tray::refresh_tray_menu(app);

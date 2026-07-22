@@ -123,12 +123,12 @@ pub fn run() {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-                #[cfg(target_os = "linux")]
-                linux_fix::nudge_main_window(window.clone());
+            if !crate::lightweight::reveal_main_window(app)
+                && crate::lightweight::is_lightweight_mode()
+            {
+                if let Err(error) = crate::lightweight::exit_lightweight_mode(app) {
+                    log::error!("单实例唤醒时重建主窗口失败: {error}");
+                }
             }
         }));
     }
@@ -242,6 +242,12 @@ pub fn run() {
             // 放在日志系统初始化之后，确保 init 的日志能正常输出。
             usage_events::init(app.handle().clone());
 
+            // 安装版和便携版路径变化后修复系统启动项，并迁移 alpha.8 旧格式。
+            // 用户若在系统设置中手动禁用，程序只同步状态，不会偷偷重新开启。
+            if let Err(error) = crate::auto_launch::repair_auto_launch_path_if_needed() {
+                log::warn!("检查或修复开机启动项失败: {error}");
+            }
+
             // 初始化数据库
             let db_path = app_config_dir.join("llm-gateway.db");
             // This product uses a dedicated database and deliberately does not import
@@ -261,11 +267,8 @@ pub fn run() {
                         db_version: Some(version),
                         supported_version: Some(crate::database::SCHEMA_VERSION),
                     });
-                    // 主窗口默认 visible:false，恢复界面必须强制显示
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
+                    // 主窗口默认 visible:false，恢复界面必须强制显示。
+                    let _ = crate::lightweight::reveal_main_window(app.handle());
                     return Ok(());
                 }
                 Ok(None) => {}
@@ -436,33 +439,29 @@ pub fn run() {
                 }
             }
 
-            // 静默启动：根据设置决定是否显示主窗口
+            // 只在系统登录启动项携带 --autostart 拉起时隐藏窗口。
+            // 用户从桌面/开始菜单手动打开时始终显示，避免“点了却像没启动”。
             let settings = crate::settings::get_settings();
+            let launched_by_auto_start = crate::auto_launch::launched_by_auto_start();
+            let start_hidden = launched_by_auto_start && settings.start_hidden_on_autostart;
             if let Some(window) = app.get_webview_window("main") {
                 // 在窗口首次显示前同步装饰状态，避免前端加载后再切换导致标题栏闪烁
                 // 仅 Linux 生效：解决 Wayland 下系统窗口按钮不可用的问题
                 #[cfg(target_os = "linux")]
                 let _ = window.set_decorations(!settings.use_app_window_controls);
-                if settings.silent_startup {
-                    // 静默启动模式：保持窗口隐藏
+                if start_hidden {
                     let _ = window.hide();
                     #[cfg(target_os = "windows")]
                     let _ = window.set_skip_taskbar(true);
                     #[cfg(target_os = "macos")]
                     tray::apply_tray_policy(app.handle(), false);
-                    log::info!("静默启动模式：主窗口已隐藏");
+                    log::info!("开机自启后台运行：主窗口已隐藏到托盘");
                 } else {
-                    // 正常启动模式：显示窗口
-                    let _ = window.show();
-                    log::info!("正常启动模式：主窗口已显示");
-
-                    // Linux: 解决首次启动 UI 无响应问题（Tauri #10746 + wry #637）。
-                    // 启动时 webview 未获取焦点 + surface 尺寸协商失败，导致点击无效。
-                    // 这里做 set_focus + 伪 resize，等价于无视觉版本的"最大化-还原"。
-                    #[cfg(target_os = "linux")]
-                    {
-                        linux_fix::nudge_main_window(window.clone());
-                    }
+                    let _ = crate::lightweight::reveal_main_window(app.handle());
+                    log::info!(
+                        "主窗口已显示（启动来源: {}）",
+                        if launched_by_auto_start { "开机自启" } else { "手动启动" }
+                    );
                 }
             }
 
@@ -477,6 +476,11 @@ pub fn run() {
             gateway::fetch_gateway_provider_models,
             gateway::generate_gateway_api_key,
             gateway::test_gateway_model,
+            commands::get_startup_preferences,
+            commands::get_auto_launch_status,
+            commands::set_auto_launch,
+            commands::set_start_hidden_on_autostart,
+            commands::set_minimize_to_tray_on_close,
             commands::set_window_theme,
             commands::get_global_proxy_url,
             commands::set_global_proxy_url,
@@ -553,15 +557,8 @@ pub fn run() {
             match event {
                 // macOS 在 Dock 图标被点击并重新激活应用时会触发 Reopen 事件，这里手动恢复主窗口
                 RunEvent::Reopen { .. } => {
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        #[cfg(target_os = "windows")]
-                        {
-                            let _ = window.set_skip_taskbar(false);
-                        }
-                        let _ = window.unminimize();
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                        tray::apply_tray_policy(app_handle, true);
+                    if crate::lightweight::reveal_main_window(app_handle) {
+                        // 已恢复现有主窗口
                     } else if crate::lightweight::is_lightweight_mode() {
                         if let Err(e) = crate::lightweight::exit_lightweight_mode(app_handle) {
                             log::error!("退出轻量模式重建窗口失败: {e}");

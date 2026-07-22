@@ -351,12 +351,16 @@ pub struct AppSettings {
     /// 是否跳过 Claude Code 初次安装确认
     #[serde(default)]
     pub skip_claude_onboarding: bool,
-    /// 是否开机自启
+    /// 是否开机自启。系统中的实际状态仍由 auto-launch 查询。
     #[serde(default)]
     pub launch_on_startup: bool,
-    /// 静默启动（程序启动时不显示主窗口，仅托盘运行）
-    #[serde(default)]
-    pub silent_startup: bool,
+    /// 开机自启拉起时是否隐藏到托盘；手动双击启动始终显示主窗口。
+    /// `silentStartup` 是 alpha.8 以前的兼容字段名。
+    #[serde(default, alias = "silentStartup", alias = "silent_startup")]
+    pub start_hidden_on_autostart: bool,
+    /// 上次写入系统启动项的可执行文件路径，用于便携版移动后自动修复。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_launch_executable_path: Option<String>,
     /// 是否在主页面启用本地代理功能（默认关闭）
     #[serde(default)]
     pub enable_local_proxy: bool,
@@ -503,7 +507,8 @@ impl Default for AppSettings {
             enable_claude_plugin_integration: false,
             skip_claude_onboarding: false,
             launch_on_startup: false,
-            silent_startup: false,
+            start_hidden_on_autostart: false,
+            auto_launch_executable_path: None,
             enable_local_proxy: false,
             proxy_confirmed: None,
             usage_confirmed: None,
@@ -735,6 +740,27 @@ pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
     });
     *guard = new_settings;
     Ok(())
+}
+
+/// 更新系统启动项偏好及其已注册路径。
+pub fn set_auto_launch_preference(
+    enabled: bool,
+    executable_path: Option<String>,
+) -> Result<(), AppError> {
+    mutate_settings(|settings| {
+        settings.launch_on_startup = enabled;
+        settings.auto_launch_executable_path = if enabled { executable_path } else { None };
+    })
+}
+
+/// 设置“以最小化启动”（仅开机自启动时隐藏到托盘）。
+pub fn set_start_hidden_on_autostart(enabled: bool) -> Result<(), AppError> {
+    mutate_settings(|settings| settings.start_hidden_on_autostart = enabled)
+}
+
+/// 设置关闭主窗口时是否继续在托盘运行。
+pub fn set_minimize_to_tray_on_close(enabled: bool) -> Result<(), AppError> {
+    mutate_settings(|settings| settings.minimize_to_tray_on_close = enabled)
 }
 
 fn mutate_settings<F>(mutator: F) -> Result<(), AppError>
@@ -1117,6 +1143,26 @@ pub fn update_s3_sync_status(status: WebDavSyncStatus) -> Result<(), AppError> {
 mod tests {
     use super::*;
     use crate::app_config::AppType;
+
+    #[test]
+    fn startup_settings_default_to_hidden_only_for_autostart() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({}))
+            .expect("default app settings");
+
+        assert!(!settings.launch_on_startup);
+        assert!(!settings.start_hidden_on_autostart);
+        assert!(settings.minimize_to_tray_on_close);
+    }
+
+    #[test]
+    fn startup_settings_accept_legacy_silent_startup_field() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "silentStartup": true
+        }))
+        .expect("legacy app settings");
+
+        assert!(settings.start_hidden_on_autostart);
+    }
 
     #[test]
     fn visible_apps_old_settings_default_claude_desktop_visible() {
