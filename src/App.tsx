@@ -1314,7 +1314,7 @@ function Dashboard({ status, baseUrl, config, enabledAliases, onStart, onStop, o
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard icon={Activity} label="运行状态" value={status?.running ? "运行中" : "已停止"} detail={status?.running ? formatDuration(status.uptime_seconds) : "点击右上角启动"} active={status?.running} />
         <StatCard icon={Zap} label="请求总数" value={String(status?.total_requests ?? 0)} detail={`成功率 ${(status?.success_rate ?? 0).toFixed(1)}%`} />
-        <StatCard icon={RefreshCw} label="故障转移" value={String(status?.failover_count ?? 0)} detail={status?.current_provider || "暂无活跃供应商"} />
+        <StatCard icon={RefreshCw} label="备用切换" value={`${status?.failover_count ?? 0} 次`} detail={status?.current_provider ? `当前：${status.current_provider}` : "尚未发生请求"} />
         <StatCard icon={Database} label="模型别名" value={String(enabledAliases.length)} detail={`${config.providers.filter((provider) => provider.enabled).length} 个启用供应商`} />
       </div>
 
