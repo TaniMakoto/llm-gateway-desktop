@@ -6,7 +6,7 @@ use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
 /// OpenAI 流式响应数据结构
@@ -33,11 +33,32 @@ struct StreamChoice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
-    // OpenRouter/Kimi/其它 使用 reasoning，DeepSeek 使用 reasoning_content
-    #[serde(default, alias = "reasoning_content")]
-    reasoning: Option<String>,
+    // 不同 OpenAI-compatible 上游会把 reasoning 放在字符串、对象或 details 数组中。
+    // 使用 Value 宽容反序列化，避免对象形态导致整个 SSE chunk 被丢弃。
+    #[serde(default)]
+    reasoning: Option<Value>,
+    #[serde(default)]
+    reasoning_content: Option<Value>,
+    #[serde(default)]
+    reasoning_details: Option<Value>,
     #[serde(default)]
     tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+impl Delta {
+    fn reasoning_text(&self) -> Option<String> {
+        let mut object = Map::new();
+        if let Some(value) = &self.reasoning_content {
+            object.insert("reasoning_content".to_string(), value.clone());
+        }
+        if let Some(value) = &self.reasoning {
+            object.insert("reasoning".to_string(), value.clone());
+        }
+        if let Some(value) = &self.reasoning_details {
+            object.insert("reasoning_details".to_string(), value.clone());
+        }
+        super::codex_chat_common::extract_reasoning_field_text(&Value::Object(object))
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -267,7 +288,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                         }
 
                                         // 处理 reasoning（thinking）
-                                        if let Some(reasoning) = &choice.delta.reasoning {
+                                        if let Some(reasoning) = choice.delta.reasoning_text() {
                                             if current_non_tool_block_type != Some("thinking") {
                                                 if let Some(index) = current_non_tool_block_index.take() {
                                                     let event = json!({
@@ -748,6 +769,18 @@ mod tests {
         event.get("type").and_then(|v| v.as_str())
     }
 
+    fn thinking_deltas(events: &[Value]) -> Vec<&str> {
+        events
+            .iter()
+            .filter(|event| {
+                event_type(event) == Some("content_block_delta")
+                    && event.pointer("/delta/type").and_then(Value::as_str)
+                        == Some("thinking_delta")
+            })
+            .filter_map(|event| event.pointer("/delta/thinking").and_then(Value::as_str))
+            .collect()
+    }
+
     #[test]
     fn test_map_stop_reason_legacy_and_filtered_values() {
         assert_eq!(
@@ -758,6 +791,31 @@ mod tests {
             map_stop_reason(Some("content_filter")),
             Some("end_turn".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_accepts_reasoning_object() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl_reasoning_object\",\"model\":\"third-party-reasoner\",\"choices\":[{\"delta\":{\"reasoning\":{\"text\":\"分析中\"}}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_reasoning_object\",\"model\":\"third-party-reasoner\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = collect_anthropic_events(input).await;
+        assert_eq!(thinking_deltas(&events), vec!["分析中"]);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_extracts_text_from_reasoning_details_and_ignores_opaque_parts() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl_reasoning_details\",\"model\":\"openrouter/model\",\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"第一步\"},{\"type\":\"reasoning.encrypted\",\"data\":\"opaque-secret\"},{\"type\":\"reasoning.summary\",\"summary\":\"第二步\"}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_reasoning_details\",\"model\":\"openrouter/model\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = collect_anthropic_events(input).await;
+        assert_eq!(thinking_deltas(&events), vec!["第一步\n\n第二步"]);
+        assert!(!events.iter().any(|event| event.to_string().contains("opaque-secret")));
     }
 
     #[tokio::test]

@@ -235,6 +235,7 @@ pub fn normalize_anthropic_messages_for_provider(
     let mut changed =
         normalize_anthropic_tool_thinking_history_for_provider(body, provider, api_format);
     changed |= normalize_deepseek_thinking_disabled_strip_effort(body, provider);
+    changed |= apply_adaptive_thinking_display(body, provider);
     changed
 }
 
@@ -309,6 +310,17 @@ fn normalize_anthropic_tool_thinking_history(body: &mut Value) -> bool {
 }
 
 fn should_preserve_reasoning_content_for_openai_chat(provider: &Provider, body: &Value) -> bool {
+    match provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.reasoning_history_mode.as_deref())
+        .unwrap_or("auto")
+    {
+        "reasoning_content" => return true,
+        "disabled" => return false,
+        _ => {}
+    }
+
     if body
         .get("model")
         .and_then(|m| m.as_str())
@@ -334,6 +346,82 @@ fn should_preserve_reasoning_content_for_openai_chat(provider: &Provider, body: 
         .any(is_reasoning_vendor_identifier)
 }
 
+fn reasoning_request_mode(provider: &Provider) -> &str {
+    provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.reasoning_request_mode.as_deref())
+        .unwrap_or("auto")
+}
+
+fn apply_reasoning_request_mode(
+    result: &mut Value,
+    api_format: &str,
+    provider: &Provider,
+    requested_effort: Option<&str>,
+) {
+    match reasoning_request_mode(provider) {
+        "disabled" => match api_format {
+            "openai_chat" => {
+                if let Some(object) = result.as_object_mut() {
+                    object.remove("reasoning_effort");
+                }
+            }
+            "openai_responses" => {
+                if let Some(object) = result.as_object_mut() {
+                    object.remove("reasoning");
+                }
+            }
+            _ => {}
+        },
+        "force" => {
+            let Some(effort) = requested_effort else {
+                return;
+            };
+            match api_format {
+                "openai_chat" => result["reasoning_effort"] = json!(effort),
+                "openai_responses" => result["reasoning"] = json!({"effort": effort}),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_adaptive_thinking_display(body: &mut Value, provider: &Provider) -> bool {
+    let display = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.adaptive_thinking_display.as_deref())
+        .unwrap_or("auto");
+    if !matches!(display, "summarized" | "omitted") {
+        return false;
+    }
+
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    let thinking_type = body.pointer("/thinking/type").and_then(Value::as_str);
+    let adaptive = thinking_type == Some("adaptive")
+        || crate::proxy::thinking_optimizer::uses_adaptive_thinking(model);
+    if !adaptive {
+        return false;
+    }
+
+    if body.get("thinking").is_none() {
+        body["thinking"] = json!({"type": "adaptive"});
+    }
+    let Some(object) = body.get_mut("thinking").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if object.get("type").and_then(Value::as_str) != Some("adaptive") {
+        return false;
+    }
+    if object.get("display").and_then(Value::as_str) == Some(display) {
+        return false;
+    }
+    object.insert("display".to_string(), json!(display));
+    true
+}
+
 pub fn transform_claude_request_for_api_format(
     body: serde_json::Value,
     provider: &Provider,
@@ -342,6 +430,7 @@ pub fn transform_claude_request_for_api_format(
     shadow_store: Option<&super::gemini_shadow::GeminiShadowStore>,
 ) -> Result<serde_json::Value, ProxyError> {
     let is_codex_oauth = provider.is_codex_oauth();
+    let requested_effort = super::transform::resolve_reasoning_effort(&body);
 
     // Copilot 场景：优先从 metadata.user_id 提取 session ID 作为 cache key
     // 格式: "uuid_sessionId" → 提取 "_" 后面的部分作为 session 标识
@@ -400,12 +489,19 @@ pub fn transform_claude_request_for_api_format(
             // Codex OAuth (ChatGPT Plus/Pro 反代) 需要在请求体里强制 store: false
             // + include: ["reasoning.encrypted_content"]，由 transform 层统一处理。
             let codex_fast_mode = provider.codex_fast_mode_enabled();
-            super::transform_responses::anthropic_to_responses(
+            let mut result = super::transform_responses::anthropic_to_responses(
                 body,
                 cache_key,
                 is_codex_oauth,
                 codex_fast_mode,
-            )
+            )?;
+            apply_reasoning_request_mode(
+                &mut result,
+                "openai_responses",
+                provider,
+                requested_effort,
+            );
+            Ok(result)
         }
         "openai_chat" => {
             let preserve_reasoning_content =
@@ -426,6 +522,12 @@ pub fn transform_claude_request_for_api_format(
             // 不在 SSE 末尾吐 usage → 转换出的 Anthropic message_delta 全 0 →
             // 整笔 input/output/cache 漏记（与 Codex Responses→Chat 路径同源）。
             super::transform::inject_openai_stream_include_usage(&mut result);
+            apply_reasoning_request_mode(
+                &mut result,
+                "openai_chat",
+                provider,
+                requested_effort,
+            );
             Ok(result)
         }
         "gemini_native" => super::transform_gemini::anthropic_to_gemini_with_shadow(
@@ -1961,6 +2063,98 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_request_mode_force_maps_effort_for_custom_chat_model() {
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.example.com",
+                    "ANTHROPIC_API_KEY": "test-key"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                reasoning_request_mode: Some("force".to_string()),
+                ..Default::default()
+            },
+        );
+        let body = json!({
+            "model": "custom-reasoner",
+            "thinking": {"type": "enabled", "budget_tokens": 8000},
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64
+        });
+
+        let transformed =
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+                .unwrap();
+
+        assert_eq!(transformed["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn test_reasoning_request_mode_disabled_removes_auto_chat_effort() {
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.example.com",
+                    "ANTHROPIC_API_KEY": "test-key"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                reasoning_request_mode: Some("disabled".to_string()),
+                ..Default::default()
+            },
+        );
+        let body = json!({
+            "model": "gpt-5.4",
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64
+        });
+
+        let transformed =
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+                .unwrap();
+
+        assert!(transformed.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_reasoning_request_mode_force_maps_effort_for_custom_responses_model() {
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.example.com",
+                    "ANTHROPIC_API_KEY": "test-key"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                reasoning_request_mode: Some("force".to_string()),
+                ..Default::default()
+            },
+        );
+        let body = json!({
+            "model": "custom-reasoner",
+            "output_config": {"effort": "high"},
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64
+        });
+
+        let transformed = transform_claude_request_for_api_format(
+            body,
+            &provider,
+            "openai_responses",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(transformed["reasoning"]["effort"], "high");
+    }
+
+    #[test]
     fn test_transform_openai_chat_skips_reasoning_content_for_generic_provider() {
         let provider = create_provider_with_meta(
             json!({
@@ -1993,6 +2187,43 @@ mod tests {
         let msg = &transformed["messages"][0];
         assert!(msg.get("tool_calls").is_some());
         assert!(msg.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn test_reasoning_history_mode_can_force_reasoning_content_for_generic_provider() {
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.example.com",
+                    "ANTHROPIC_API_KEY": "test-key"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                reasoning_history_mode: Some("reasoning_content".to_string()),
+                ..Default::default()
+            },
+        );
+        let body = json!({
+            "model": "custom-reasoner",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "I should call the tool."},
+                    {"type": "tool_use", "id": "call_123", "name": "get_weather", "input": {"location": "Tokyo"}}
+                ]
+            }]
+        });
+
+        let transformed =
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+                .unwrap();
+
+        assert_eq!(
+            transformed["messages"][0]["reasoning_content"],
+            "I should call the tool."
+        );
     }
 
     #[test]
@@ -2190,6 +2421,62 @@ mod tests {
         assert!(!changed);
         assert!(body.get("system").is_none());
         assert_eq!(body["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn test_adaptive_thinking_display_summarized_is_injected_when_explicitly_configured() {
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                    "ANTHROPIC_API_KEY": "test-key"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("anthropic".to_string()),
+                adaptive_thinking_display: Some("summarized".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut body = json!({
+            "model": "claude-opus-4.8",
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(changed);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+    }
+
+    #[test]
+    fn test_adaptive_thinking_display_auto_does_not_modify_request() {
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                    "ANTHROPIC_API_KEY": "test-key"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("anthropic".to_string()),
+                adaptive_thinking_display: Some("auto".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut body = json!({
+            "model": "claude-opus-4.8",
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let original = body.clone();
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(!changed);
+        assert_eq!(body, original);
     }
 
     #[test]

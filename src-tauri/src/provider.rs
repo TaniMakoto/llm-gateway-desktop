@@ -440,6 +440,33 @@ pub struct ProviderMeta {
     /// - "openai_responses": OpenAI Responses API 格式，需要转换
     #[serde(rename = "apiFormat", skip_serializing_if = "Option::is_none")]
     pub api_format: Option<String>,
+    /// Claude -> OpenAI reasoning 请求映射策略：
+    /// - auto: 仅对已知支持 reasoning effort 的模型自动映射（默认）
+    /// - force: 只要客户端请求包含 thinking/effort，就强制映射
+    /// - disabled: 不向 OpenAI 上游发送 reasoning effort 字段
+    #[serde(
+        rename = "reasoningRequestMode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning_request_mode: Option<String>,
+    /// Claude -> OpenAI Chat 历史 thinking 回传策略：
+    /// - auto: 沿用供应商/模型启发式（默认）
+    /// - reasoning_content: 强制写入 assistant.reasoning_content
+    /// - disabled: 不回传非标准 reasoning_content 字段
+    #[serde(
+        rename = "reasoningHistoryMode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning_history_mode: Option<String>,
+    /// 原生 Anthropic adaptive thinking 的可见性：
+    /// - auto: 不改写请求（默认）
+    /// - summarized: 请求返回可读 thinking 摘要
+    /// - omitted: 明确不返回可读 thinking 摘要
+    #[serde(
+        rename = "adaptiveThinkingDisplay",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub adaptive_thinking_display: Option<String>,
     /// 通用认证绑定（provider_config / managed_account）
     ///
     /// 新代码应只写入该字段；githubAccountId 仅保留兼容读取。

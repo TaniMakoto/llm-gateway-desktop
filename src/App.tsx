@@ -66,6 +66,9 @@ interface GatewayProvider {
   customHeaders: Record<string, string>;
   impersonateCodexClient: boolean;
   codexClientVersion: string;
+  reasoningRequestMode: "auto" | "force" | "disabled";
+  reasoningHistoryMode: "auto" | "reasoning_content" | "disabled";
+  adaptiveThinkingDisplay: "auto" | "summarized" | "omitted";
   notes: string;
   models: ProviderModel[];
 }
@@ -379,6 +382,9 @@ function App() {
       customHeaders: {},
       impersonateCodexClient: false,
       codexClientVersion: "",
+      reasoningRequestMode: "auto",
+      reasoningHistoryMode: "auto",
+      adaptiveThinkingDisplay: "auto",
       notes: "",
       models: [],
     };
@@ -399,6 +405,9 @@ function App() {
       modelsFetchedAt: provider.modelsFetchedAt ?? null,
       impersonateCodexClient: provider.impersonateCodexClient ?? false,
       codexClientVersion: provider.codexClientVersion ?? "",
+      reasoningRequestMode: provider.reasoningRequestMode ?? "auto",
+      reasoningHistoryMode: provider.reasoningHistoryMode ?? "auto",
+      adaptiveThinkingDisplay: provider.adaptiveThinkingDisplay ?? "auto",
       models: provider.models ?? [],
     });
     setHeadersText(
@@ -1037,6 +1046,33 @@ function ProviderEditorModal({
             {provider.impersonateCodexClient && (
               <div className="mt-2"><Field label="Codex 版本（可选）"><input className="input w-full font-mono" value={provider.codexClientVersion} onChange={(event) => onChange({ ...provider, codexClientVersion: event.target.value })} placeholder="留空使用默认 0.144.1" /></Field></div>
             )}
+          </div>
+          <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
+            <div className="text-xs font-medium">推理兼容（高级）</div>
+            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">默认保持自动判断。只有第三方接口不返回思考、错误发送推理参数导致 400，或原生 Claude adaptive thinking 不展示摘要时才需要调整。</p>
+            <div className="mt-3 grid gap-3 sm:grid-cols-3">
+              <Field label="推理请求映射">
+                <select className="input w-full" value={provider.reasoningRequestMode} onChange={(event) => onChange({ ...provider, reasoningRequestMode: event.target.value as GatewayProvider["reasoningRequestMode"] })}>
+                  <option value="auto">自动</option>
+                  <option value="force">强制映射 effort</option>
+                  <option value="disabled">不发送 effort</option>
+                </select>
+              </Field>
+              <Field label="历史推理回传">
+                <select className="input w-full" value={provider.reasoningHistoryMode} onChange={(event) => onChange({ ...provider, reasoningHistoryMode: event.target.value as GatewayProvider["reasoningHistoryMode"] })}>
+                  <option value="auto">自动</option>
+                  <option value="reasoning_content">reasoning_content</option>
+                  <option value="disabled">关闭</option>
+                </select>
+              </Field>
+              <Field label="Adaptive 展示">
+                <select className="input w-full" value={provider.adaptiveThinkingDisplay} onChange={(event) => onChange({ ...provider, adaptiveThinkingDisplay: event.target.value as GatewayProvider["adaptiveThinkingDisplay"] })}>
+                  <option value="auto">自动（不改写）</option>
+                  <option value="summarized">显示摘要</option>
+                  <option value="omitted">不显示摘要</option>
+                </select>
+              </Field>
+            </div>
           </div>
           <div className="sm:col-span-2"><Field label="自定义请求头（每行一个 Header: Value）"><textarea className="input min-h-24 w-full resize-y font-mono text-xs" value={headersText} onChange={(event) => onHeadersText(event.target.value)} placeholder={"HTTP-Referer: https://example.com\nX-Title: My Gateway"} /></Field></div>
           <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">

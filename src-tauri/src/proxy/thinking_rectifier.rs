@@ -97,14 +97,6 @@ pub fn should_rectify_thinking_signature(
         return true;
     }
 
-    // 场景7: 非法请求（与 CCH 对齐，按 invalid request 统一兜底）
-    if lower.contains("非法请求")
-        || lower.contains("illegal request")
-        || lower.contains("invalid request")
-    {
-        return true;
-    }
-
     false
 }
 
@@ -358,6 +350,20 @@ mod tests {
             &enabled_config()
         ));
         assert!(!should_rectify_thinking_signature(None, &enabled_config()));
+    }
+
+    #[test]
+    fn test_generic_invalid_request_does_not_trigger_signature_rectifier() {
+        for message in [
+            "invalid request: malformed JSON",
+            "illegal request: unsupported parameter reasoning_effort",
+            "非法请求：工具参数格式错误",
+        ] {
+            assert!(
+                !should_rectify_thinking_signature(Some(message), &enabled_config()),
+                "generic request error must not trigger thinking rectification: {message}"
+            );
+        }
     }
 
     #[test]

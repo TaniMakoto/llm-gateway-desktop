@@ -97,6 +97,15 @@ pub struct GatewayProvider {
     pub impersonate_codex_client: bool,
     #[serde(default)]
     pub codex_client_version: String,
+    /// Claude -> OpenAI reasoning 请求参数映射：auto / force / disabled。
+    #[serde(default = "default_auto_mode")]
+    pub reasoning_request_mode: String,
+    /// Claude -> OpenAI Chat 历史 reasoning 回传：auto / reasoning_content / disabled。
+    #[serde(default = "default_auto_mode")]
+    pub reasoning_history_mode: String,
+    /// 原生 Anthropic adaptive thinking 展示：auto / summarized / omitted。
+    #[serde(default = "default_auto_mode")]
+    pub adaptive_thinking_display: String,
     #[serde(default)]
     pub notes: String,
     /// 该供应商下的模型条目，协议下沉到条目上。
@@ -154,6 +163,10 @@ fn default_true() -> bool {
 }
 
 fn default_auth_style() -> String {
+    "auto".to_string()
+}
+
+fn default_auto_mode() -> String {
     "auto".to_string()
 }
 
@@ -331,6 +344,9 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
             custom_headers: p.custom_headers,
             impersonate_codex_client: p.impersonate_codex_client,
             codex_client_version: p.codex_client_version,
+            reasoning_request_mode: default_auto_mode(),
+            reasoning_history_mode: default_auto_mode(),
+            adaptive_thinking_display: default_auto_mode(),
             notes: p.notes,
             models: provider_models.remove(&p.id).unwrap_or_default(),
         })
@@ -358,6 +374,14 @@ fn normalize_config(mut config: GatewayConfig) -> GatewayConfig {
         provider.auth_style = provider.auth_style.trim().to_ascii_lowercase();
         provider.custom_user_agent = provider.custom_user_agent.trim().to_string();
         provider.codex_client_version = provider.codex_client_version.trim().to_string();
+        provider.reasoning_request_mode =
+            provider.reasoning_request_mode.trim().to_ascii_lowercase();
+        provider.reasoning_history_mode =
+            provider.reasoning_history_mode.trim().to_ascii_lowercase();
+        provider.adaptive_thinking_display = provider
+            .adaptive_thinking_display
+            .trim()
+            .to_ascii_lowercase();
         provider.models_url = provider.models_url.trim().to_string();
         provider.notes = provider.notes.trim().to_string();
         provider.cached_models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -393,6 +417,34 @@ fn validate_config(config: &GatewayConfig) -> Result<(), String> {
 
     let mut provider_ids = HashSet::new();
     for provider in &config.providers {
+        if !matches!(
+            provider.reasoning_request_mode.as_str(),
+            "auto" | "force" | "disabled"
+        ) {
+            return Err(format!(
+                "供应商 {} 的推理请求模式无效: {}",
+                provider.name, provider.reasoning_request_mode
+            ));
+        }
+        if !matches!(
+            provider.reasoning_history_mode.as_str(),
+            "auto" | "reasoning_content" | "disabled"
+        ) {
+            return Err(format!(
+                "供应商 {} 的推理历史模式无效: {}",
+                provider.name, provider.reasoning_history_mode
+            ));
+        }
+        if !matches!(
+            provider.adaptive_thinking_display.as_str(),
+            "auto" | "summarized" | "omitted"
+        ) {
+            return Err(format!(
+                "供应商 {} 的 adaptive thinking 展示模式无效: {}",
+                provider.name, provider.adaptive_thinking_display
+            ));
+        }
+
         if provider.id.trim().is_empty() || provider.name.trim().is_empty() {
             return Err("供应商 ID 和名称不能为空".to_string());
         }
@@ -500,6 +552,10 @@ fn provider_meta(
 ) -> ProviderMeta {
     let mut meta = ProviderMeta::default();
     meta.api_format = Some(format.as_wire_name().to_string());
+    meta.reasoning_request_mode = Some(provider.reasoning_request_mode.clone());
+    meta.reasoning_history_mode = Some(provider.reasoning_history_mode.clone());
+    meta.adaptive_thinking_display =
+        Some(provider.adaptive_thinking_display.clone());
     meta.api_key_field = match provider.auth_style.as_str() {
         "x-api-key" => Some("ANTHROPIC_API_KEY".to_string()),
         "bearer" => Some("ANTHROPIC_AUTH_TOKEN".to_string()),
@@ -1312,6 +1368,9 @@ mod tests {
             custom_headers: HashMap::new(),
             impersonate_codex_client: false,
             codex_client_version: String::new(),
+            reasoning_request_mode: default_auto_mode(),
+            reasoning_history_mode: default_auto_mode(),
+            adaptive_thinking_display: default_auto_mode(),
             notes: String::new(),
             models: vec![GatewayProviderModel {
                 alias: "local".to_string(),
@@ -1395,6 +1454,29 @@ mod tests {
         let meta = provider_meta(&p, GatewayApiFormat::OpenaiResponses);
         assert!(meta.custom_user_agent.is_none());
         assert!(meta.local_proxy_request_overrides.is_none());
+        assert_eq!(meta.reasoning_request_mode.as_deref(), Some("auto"));
+        assert_eq!(meta.reasoning_history_mode.as_deref(), Some("auto"));
+        assert_eq!(meta.adaptive_thinking_display.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn provider_reasoning_modes_are_materialized_into_internal_meta() {
+        let mut p = provider_with_format("reasoner", GatewayApiFormat::OpenaiChat);
+        p.reasoning_request_mode = "force".to_string();
+        p.reasoning_history_mode = "reasoning_content".to_string();
+        p.adaptive_thinking_display = "summarized".to_string();
+
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiChat);
+
+        assert_eq!(meta.reasoning_request_mode.as_deref(), Some("force"));
+        assert_eq!(
+            meta.reasoning_history_mode.as_deref(),
+            Some("reasoning_content")
+        );
+        assert_eq!(
+            meta.adaptive_thinking_display.as_deref(),
+            Some("summarized")
+        );
     }
 
     #[test]
@@ -1508,5 +1590,29 @@ mod tests {
             config.providers[0].models[0].api_format,
             GatewayApiFormat::OpenaiChat
         );
+        assert_eq!(config.providers[0].reasoning_request_mode, "auto");
+        assert_eq!(config.providers[0].reasoning_history_mode, "auto");
+        assert_eq!(config.providers[0].adaptive_thinking_display, "auto");
+    }
+
+    #[test]
+    fn current_config_without_reasoning_fields_uses_backward_compatible_defaults() {
+        let mut provider = serde_json::to_value(provider_with_format(
+            "p1",
+            GatewayApiFormat::OpenaiChat,
+        ))
+        .expect("serialize provider");
+        let object = provider.as_object_mut().expect("provider object");
+        object.remove("reasoningRequestMode");
+        object.remove("reasoningHistoryMode");
+        object.remove("adaptiveThinkingDisplay");
+
+        let mut config = serde_json::to_value(GatewayConfig::default()).expect("serialize config");
+        config["providers"] = json!([provider]);
+
+        let parsed = parse_config_with_migration(&config.to_string()).expect("parse config");
+        assert_eq!(parsed.providers[0].reasoning_request_mode, "auto");
+        assert_eq!(parsed.providers[0].reasoning_history_mode, "auto");
+        assert_eq!(parsed.providers[0].adaptive_thinking_display, "auto");
     }
 }
