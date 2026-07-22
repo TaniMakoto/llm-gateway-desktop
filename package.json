@@ -1,6 +1,6 @@
 {
   "name": "llm-gateway-desktop",
-  "version": "0.1.0-alpha.6",
+  "version": "0.1.0",
   "description": "A local desktop gateway for routing and translating OpenAI- and Anthropic-compatible LLM APIs.",
   "type": "module",
   "scripts": {

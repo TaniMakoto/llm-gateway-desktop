@@ -1,6 +1,6 @@
 [package]
 name = "llm-gateway-desktop"
-version = "0.1.0-alpha.6"
+version = "0.1.0"
 description = "Local multi-provider LLM API gateway"
 authors = ["LLM Gateway Desktop contributors"]
 license = "MIT"

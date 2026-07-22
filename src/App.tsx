@@ -593,7 +593,7 @@ function App() {
           </div>
           <span>LLM Gateway Desktop</span>
           <span className="rounded bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
-            0.1.0-alpha.6
+            0.1.0
           </span>
         </div>
         <div className="no-drag flex items-center">
