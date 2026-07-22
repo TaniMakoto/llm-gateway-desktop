@@ -242,6 +242,7 @@ impl RequestContext {
             non_streaming_timeout,
             state.status.clone(),
             state.current_providers.clone(),
+            state.active_provider_counts.clone(),
             state.gemini_shadow.clone(),
             state.codex_chat_history.clone(),
             state.failover_manager.clone(),

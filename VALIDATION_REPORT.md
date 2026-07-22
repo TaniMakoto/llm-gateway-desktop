@@ -1,7 +1,7 @@
 # Source Validation Report
 
 Project: LLM Gateway Desktop 0.1.0 alpha  
-Validation date: 2026-07-20
+Validation date: 2026-07-22
 
 ## Completed in this environment
 
@@ -16,6 +16,9 @@ Validation date: 2026-07-20
 - Model-discovery authentication supports Bearer and `x-api-key` plus `anthropic-version`.
 - All constructors for the expanded Rust model/provider structs were updated.
 - Public-source scan finds no private credentials.
+- Dashboard routing status tracks concurrent active upstreams and falls back to the last successful upstream while idle.
+- Provider display names are resolved from stable IDs during status polling, so renames refresh without another request.
+- Active-request counters are covered by a request-switch/drop regression test in the Rust test suite.
 
 ## Not executed here
 

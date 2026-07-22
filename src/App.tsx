@@ -101,6 +101,14 @@ interface ProxyStatus {
   current_provider?: string | null;
   last_error?: string | null;
   failover_count: number;
+  active_providers?: ActiveProvider[];
+}
+
+interface ActiveProvider {
+  app_type: string;
+  provider_name: string;
+  provider_id: string;
+  request_count: number;
 }
 
 interface GatewaySnapshot {
@@ -1416,6 +1424,7 @@ function Dashboard({ status, baseUrl, config, enabledAliases, onStart, onStop, o
   const sampleAlias = enabledAliases[0] || "local-model";
   const sample = `curl ${baseUrl}/v1/chat/completions \\\n  -H "Authorization: Bearer ${config.localApiKey || "LOCAL_API_KEY"}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${sampleAlias}","messages":[{"role":"user","content":"Hello"}]}'`;
   const hasModels = config.providers.some((p) => p.enabled && p.models.some((m) => m.enabled));
+  const routingStatus = formatRoutingStatus(status);
   return (
     <section className="mx-auto max-w-5xl">
       <div className="mb-6 flex items-start justify-between gap-4">
@@ -1426,7 +1435,7 @@ function Dashboard({ status, baseUrl, config, enabledAliases, onStart, onStop, o
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard icon={Activity} label="运行状态" value={status?.running ? "运行中" : "已停止"} detail={status?.running ? formatDuration(status.uptime_seconds) : "点击右上角启动"} active={status?.running} />
         <StatCard icon={Zap} label="请求总数" value={String(status?.total_requests ?? 0)} detail={`成功率 ${(status?.success_rate ?? 0).toFixed(1)}%`} />
-        <StatCard icon={RefreshCw} label="备用切换" value={`${status?.failover_count ?? 0} 次`} detail={status?.current_provider ? `当前：${status.current_provider}` : "尚未发生请求"} />
+        <StatCard icon={RefreshCw} label="上游路由" value={`${status?.failover_count ?? 0} 次切换`} detail={routingStatus.detail} detailTitle={routingStatus.title} />
         <StatCard icon={Database} label="模型别名" value={String(enabledAliases.length)} detail={`${config.providers.filter((provider) => provider.enabled).length} 个启用供应商`} />
       </div>
 
@@ -1461,8 +1470,48 @@ function EmptyState({ icon: Icon, title, description, action, onAction, disabled
   return <div className="panel flex min-h-80 flex-col items-center justify-center p-8 text-center"><div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-muted"><Icon className="h-7 w-7 text-muted-foreground" /></div><h3 className="font-semibold">{title}</h3><p className="mt-1 max-w-sm text-sm text-muted-foreground">{description}</p><button className="primary-button mt-5" disabled={disabled} onClick={onAction}><Plus className="h-4 w-4" />{action}</button></div>;
 }
 
-function StatCard({ icon: Icon, label, value, detail, active }: { icon: typeof Activity; label: string; value: string; detail: string; active?: boolean }) {
-  return <div className="panel p-4"><div className="flex items-center justify-between"><span className="text-xs text-muted-foreground">{label}</span><Icon className={cn("h-4 w-4", active ? "text-emerald-500" : "text-muted-foreground")} /></div><div className="mt-3 text-2xl font-semibold">{value}</div><div className="mt-1 truncate text-[11px] text-muted-foreground">{detail}</div></div>;
+function StatCard({ icon: Icon, label, value, detail, detailTitle, active }: { icon: typeof Activity; label: string; value: string; detail: string; detailTitle?: string; active?: boolean }) {
+  return <div className="panel p-4"><div className="flex items-center justify-between"><span className="text-xs text-muted-foreground">{label}</span><Icon className={cn("h-4 w-4", active ? "text-emerald-500" : "text-muted-foreground")} /></div><div className="mt-3 text-2xl font-semibold">{value}</div><div className="mt-1 truncate text-[11px] text-muted-foreground" title={detailTitle ?? detail}>{detail}</div></div>;
+}
+
+function formatRoutingStatus(status: ProxyStatus | null): { detail: string; title: string } {
+  const activeProviderMap = new Map<string, ActiveProvider>();
+  for (const provider of status?.active_providers ?? []) {
+    if (provider.request_count <= 0) continue;
+    const key = `${provider.provider_id}\u0000${provider.provider_name}`;
+    const existing = activeProviderMap.get(key);
+    if (existing) {
+      existing.request_count += provider.request_count;
+    } else {
+      activeProviderMap.set(key, { ...provider });
+    }
+  }
+  const activeProviders = Array.from(activeProviderMap.values());
+  const activeRequestCount = activeProviders.reduce((total, provider) => total + provider.request_count, 0);
+
+  if (activeProviders.length === 1) {
+    const provider = activeProviders[0];
+    const detail = activeRequestCount > 1
+      ? `当前：${provider.provider_name} · ${activeRequestCount} 个请求`
+      : `当前：${provider.provider_name}`;
+    return { detail, title: detail };
+  }
+
+  if (activeProviders.length > 1) {
+    return {
+      detail: `当前：${activeProviders.length} 个上游 · ${activeRequestCount} 个请求`,
+      title: activeProviders
+        .map((provider) => `${provider.provider_name}：${provider.request_count} 个请求`)
+        .join("\n"),
+    };
+  }
+
+  if (status?.current_provider) {
+    const detail = `最近：${status.current_provider}`;
+    return { detail, title: detail };
+  }
+
+  return { detail: "暂无请求", title: "暂无请求" };
 }
 
 function InfoLine({ label, value, onCopy }: { label: string; value: string; onCopy: () => void }) {

@@ -16,6 +16,12 @@ All notable changes will be documented in this file.
 - OpenAI- and Anthropic-style upstream model discovery
 - Cached model suggestions in the route editor
 
+### Fixed
+
+- Dashboard upstream routing status now distinguishes active requests from the last successful upstream
+- Concurrent requests are aggregated by actual upstream, with per-upstream request counts available on hover
+- Renaming a provider now refreshes the dashboard status from its stable provider ID instead of retaining the old name
+
 ### Known limitations
 
 - Early alpha; full cross-platform builds and real-provider compatibility require additional validation

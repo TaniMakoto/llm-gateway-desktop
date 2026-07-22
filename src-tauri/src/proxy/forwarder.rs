@@ -86,15 +86,63 @@ pub struct ForwardError {
 /// 不需要每条出口路径都手动调用。
 pub(crate) struct ActiveConnectionGuard {
     status: Arc<RwLock<ProxyStatus>>,
+    active_provider_counts:
+        Arc<RwLock<std::collections::HashMap<(String, String), (usize, String)>>>,
+    active_provider: Option<(String, String)>,
 }
 
 impl ActiveConnectionGuard {
-    pub(crate) async fn acquire(status: Arc<RwLock<ProxyStatus>>) -> Self {
+    pub(crate) async fn acquire(
+        status: Arc<RwLock<ProxyStatus>>,
+        active_provider_counts: Arc<
+            RwLock<std::collections::HashMap<(String, String), (usize, String)>>,
+        >,
+    ) -> Self {
         {
             let mut s = status.write().await;
             s.active_connections = s.active_connections.saturating_add(1);
         }
-        Self { status }
+        Self {
+            status,
+            active_provider_counts,
+            active_provider: None,
+        }
+    }
+
+    /// 将当前客户端请求绑定到实际正在尝试的 Provider。
+    ///
+    /// 故障转移到下一家时，会原子地从旧 Provider 计数迁移到新 Provider；
+    /// 成功后 guard 随响应流存活，直到响应真正结束才释放计数。
+    pub(crate) async fn switch_provider(
+        &mut self,
+        app_type: &str,
+        provider_id: &str,
+        provider_name: &str,
+    ) {
+        let next = (app_type.to_string(), provider_id.to_string());
+        if self.active_provider.as_ref() == Some(&next) {
+            return;
+        }
+
+        let mut counts = self.active_provider_counts.write().await;
+        if let Some(previous) = self.active_provider.take() {
+            let should_remove = if let Some((count, _)) = counts.get_mut(&previous) {
+                *count = count.saturating_sub(1);
+                *count == 0
+            } else {
+                false
+            };
+            if should_remove {
+                counts.remove(&previous);
+            }
+        }
+
+        let entry = counts
+            .entry(next.clone())
+            .or_insert_with(|| (0, provider_name.to_string()));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = provider_name.to_string();
+        self.active_provider = Some(next);
     }
 }
 
@@ -102,10 +150,26 @@ impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
         // Drop 不能 await：把减量操作调度到 tokio runtime
         let status = self.status.clone();
+        let active_provider_counts = self.active_provider_counts.clone();
+        let active_provider = self.active_provider.take();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let mut s = status.write().await;
-                s.active_connections = s.active_connections.saturating_sub(1);
+                {
+                    let mut s = status.write().await;
+                    s.active_connections = s.active_connections.saturating_sub(1);
+                }
+                if let Some(active_provider) = active_provider {
+                    let mut counts = active_provider_counts.write().await;
+                    let should_remove = if let Some((count, _)) = counts.get_mut(&active_provider) {
+                        *count = count.saturating_sub(1);
+                        *count == 0
+                    } else {
+                        false
+                    };
+                    if should_remove {
+                        counts.remove(&active_provider);
+                    }
+                }
             });
         }
         // 没有 runtime 时静默丢失计数（仅 UI 展示用，可接受最终一致性）
@@ -117,6 +181,8 @@ pub struct RequestForwarder {
     router: Arc<ProviderRouter>,
     status: Arc<RwLock<ProxyStatus>>,
     current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
+    active_provider_counts:
+        Arc<RwLock<std::collections::HashMap<(String, String), (usize, String)>>>,
     gemini_shadow: Arc<GeminiShadowStore>,
     codex_chat_history: Arc<CodexChatHistoryStore>,
     /// 故障转移切换管理器
@@ -211,6 +277,9 @@ impl RequestForwarder {
         non_streaming_timeout: u64,
         status: Arc<RwLock<ProxyStatus>>,
         current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
+        active_provider_counts: Arc<
+            RwLock<std::collections::HashMap<(String, String), (usize, String)>>,
+        >,
         gemini_shadow: Arc<GeminiShadowStore>,
         codex_chat_history: Arc<CodexChatHistoryStore>,
         failover_manager: Arc<FailoverSwitchManager>,
@@ -232,6 +301,7 @@ impl RequestForwarder {
             router,
             status,
             current_providers,
+            active_provider_counts,
             gemini_shadow,
             codex_chat_history,
             failover_manager,
@@ -309,6 +379,9 @@ impl RequestForwarder {
             let mut status = self.status.write().await;
             status.success_requests += 1;
             status.last_error = None;
+            status.current_provider = Some(provider.name.clone());
+            status.current_provider_id = Some(provider.id.clone());
+            status.current_provider_app_type = Some(app_type.to_string());
             if route_used_fallback {
                 status.failover_count += 1;
             }
@@ -418,7 +491,11 @@ impl RequestForwarder {
         extensions: Extensions,
         providers: Vec<Provider>,
     ) -> Result<ForwardResult, ForwardError> {
-        let guard = ActiveConnectionGuard::acquire(self.status.clone()).await;
+        let mut guard = ActiveConnectionGuard::acquire(
+            self.status.clone(),
+            self.active_provider_counts.clone(),
+        )
+        .await;
         {
             let mut s = self.status.write().await;
             s.total_requests = s.total_requests.saturating_add(1);
@@ -426,7 +503,14 @@ impl RequestForwarder {
         }
         let result = self
             .forward_with_retry_inner(
-                app_type, method, endpoint, body, headers, extensions, providers,
+                app_type,
+                method,
+                endpoint,
+                body,
+                headers,
+                extensions,
+                providers,
+                &mut guard,
             )
             .await;
         // 把 guard 注入到 Ok 结果，让它随响应一起流转到 response_processor，
@@ -457,6 +541,7 @@ impl RequestForwarder {
         headers: axum::http::HeaderMap,
         extensions: Extensions,
         providers: Vec<Provider>,
+        connection_guard: &mut ActiveConnectionGuard,
     ) -> Result<ForwardResult, ForwardError> {
         // 获取适配器
         let adapter = get_adapter(app_type);
@@ -529,16 +614,11 @@ impl RequestForwarder {
 
             attempted_providers += 1;
 
-            // 更新状态中的当前 Provider 信息（per-attempt 维度的标识）
-            //
-            // total_requests / last_request_at / active_connections 已由
-            // forward_with_retry wrapper 在客户端请求维度统一处理，这里只刷
-            // 新「正在尝试哪个 provider」的展示字段。
-            {
-                let mut status = self.status.write().await;
-                status.current_provider = Some(provider.name.clone());
-                status.current_provider_id = Some(provider.id.clone());
-            }
+            // 将该客户端请求绑定到实际正在尝试的 Provider。若后续发生故障转移，
+            // guard 会把计数迁移到下一家；成功后计数持续到响应流真正结束。
+            connection_guard
+                .switch_provider(app_type_str, &provider.id, &provider.name)
+                .await;
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
             match self
@@ -3432,6 +3512,7 @@ mod tests {
             router: Arc::new(ProviderRouter::new(db.clone())),
             status: Arc::new(RwLock::new(ProxyStatus::default())),
             current_providers: Arc::new(RwLock::new(HashMap::new())),
+            active_provider_counts: Arc::new(RwLock::new(HashMap::new())),
             gemini_shadow: Arc::new(GeminiShadowStore::new()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
@@ -3470,6 +3551,51 @@ mod tests {
             &providers,
             "backup"
         ));
+    }
+
+    #[tokio::test]
+    async fn active_connection_guard_tracks_provider_switch_and_drop() {
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        let counts = Arc::new(RwLock::new(HashMap::new()));
+        let mut guard = ActiveConnectionGuard::acquire(status.clone(), counts.clone()).await;
+
+        guard
+            .switch_provider("codex", "primary", "Primary · openai_responses")
+            .await;
+        assert_eq!(status.read().await.active_connections, 1);
+        assert_eq!(
+            counts
+                .read()
+                .await
+                .get(&("codex".to_string(), "primary".to_string()))
+                .map(|entry| entry.0),
+            Some(1)
+        );
+
+        guard
+            .switch_provider("codex", "backup", "Backup · anthropic")
+            .await;
+        let snapshot = counts.read().await;
+        assert!(!snapshot.contains_key(&("codex".to_string(), "primary".to_string())));
+        assert_eq!(
+            snapshot
+                .get(&("codex".to_string(), "backup".to_string()))
+                .map(|entry| entry.0),
+            Some(1)
+        );
+        drop(snapshot);
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if status.read().await.active_connections == 0 && counts.read().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guard drop should release active request counters");
     }
 
     #[test]

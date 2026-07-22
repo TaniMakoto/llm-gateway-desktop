@@ -38,6 +38,9 @@ pub struct ProxyState {
     pub start_time: Arc<RwLock<Option<std::time::Instant>>>,
     /// 每个应用类型当前使用的 provider (app_type -> (provider_id, provider_name))
     pub current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
+    /// 正在处理请求的实际上游 ((app_type, provider_id) -> (request_count, fallback_name))
+    pub active_provider_counts:
+        Arc<RwLock<std::collections::HashMap<(String, String), (usize, String)>>>,
     /// 共享的 ProviderRouter（持有熔断器状态，跨请求保持）
     pub provider_router: Arc<ProviderRouter>,
     /// Gemini Native shadow state，用于 thoughtSignature / tool call 回放
@@ -76,6 +79,7 @@ impl ProxyServer {
             status: Arc::new(RwLock::new(ProxyStatus::default())),
             start_time: Arc::new(RwLock::new(None)),
             current_providers: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            active_provider_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             provider_router,
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
@@ -272,6 +276,51 @@ impl ProxyServer {
                 provider_name: provider_name.clone(),
             })
             .collect();
+
+        // 活跃请求按实际上游聚合。名称优先从数据库实时解析，因此供应商改名后
+        // 无需等待下一次请求，状态卡也能在下一轮轮询中立即显示新名称。
+        let active_provider_counts = self.state.active_provider_counts.read().await;
+        status.active_providers = active_provider_counts
+            .iter()
+            .filter_map(
+                |((app_type, provider_id), (request_count, fallback_name))| {
+                    if *request_count == 0 {
+                        return None;
+                    }
+                    let provider_name = self
+                        .state
+                        .db
+                        .get_provider_by_id(provider_id, app_type)
+                        .ok()
+                        .flatten()
+                        .map(|provider| provider.name)
+                        .unwrap_or_else(|| fallback_name.clone());
+                    Some(ActiveProvider {
+                        app_type: app_type.clone(),
+                        provider_name,
+                        provider_id: provider_id.clone(),
+                        request_count: *request_count,
+                    })
+                },
+            )
+            .collect();
+        status.active_providers.sort_by(|a, b| {
+            a.provider_name
+                .cmp(&b.provider_name)
+                .then_with(|| a.app_type.cmp(&b.app_type))
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+        });
+
+        // current_provider 现在表示“最近一次成功使用”。同样按稳定 ID 动态解析名称，
+        // 修复配置改名后状态中仍长期保留旧字符串的问题。
+        if let (Some(provider_id), Some(app_type)) = (
+            status.current_provider_id.clone(),
+            status.current_provider_app_type.clone(),
+        ) {
+            if let Ok(Some(provider)) = self.state.db.get_provider_by_id(&provider_id, &app_type) {
+                status.current_provider = Some(provider.name);
+            }
+        }
 
         status
     }

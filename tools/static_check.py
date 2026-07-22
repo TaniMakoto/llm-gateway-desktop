@@ -29,9 +29,12 @@ RUST_FILES = [
     "src-tauri/src/database/mod.rs",
     "src-tauri/src/database/backup.rs",
     "src-tauri/src/proxy/server.rs",
+    "src-tauri/src/proxy/types.rs",
+    "src-tauri/src/proxy/forwarder.rs",
     "src-tauri/src/proxy/handlers.rs",
     "src-tauri/src/proxy/handler_context.rs",
     "src-tauri/src/proxy/model_mapper.rs",
+    "src-tauri/src/proxy/response_processor.rs",
     "src-tauri/src/proxy/providers/codex.rs",
 ]
 

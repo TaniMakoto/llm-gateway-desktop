@@ -76,10 +76,13 @@ pub struct ProxyStatus {
     pub success_rate: f32,
     /// 运行时间（秒）
     pub uptime_seconds: u64,
-    /// 当前使用的Provider名称
+    /// 最近一次成功使用的 Provider 名称
     pub current_provider: Option<String>,
-    /// 当前Provider的ID
+    /// 最近一次成功使用的 Provider ID
     pub current_provider_id: Option<String>,
+    /// 最近一次成功使用的 Provider 所属应用类型
+    #[serde(default)]
+    pub current_provider_app_type: Option<String>,
     /// 最后一次请求时间
     pub last_request_at: Option<String>,
     /// 最后一次错误信息
@@ -89,6 +92,18 @@ pub struct ProxyStatus {
     /// 当前活跃的代理目标列表
     #[serde(default)]
     pub active_targets: Vec<ActiveTarget>,
+    /// 当前正在处理请求的实际上游（按 Provider 聚合）
+    #[serde(default)]
+    pub active_providers: Vec<ActiveProvider>,
+}
+
+/// 当前正在处理请求的实际上游信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveProvider {
+    pub app_type: String,
+    pub provider_name: String,
+    pub provider_id: String,
+    pub request_count: usize,
 }
 
 /// 活跃的代理目标信息
