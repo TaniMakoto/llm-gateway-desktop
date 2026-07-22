@@ -1,9 +1,11 @@
 //! Unified local LLM gateway configuration and routing.
 //!
-//! The gateway deliberately reuses LLM Gateway Desktop's mature proxy/transform stack.
-//! A single generic upstream is materialized as a generated `claude` provider
-//! and a generated `codex` provider, while model aliases select an ordered
-//! provider chain per request.
+//! 数据模型：一个 `GatewayProvider` 记录一个上游端点（Base URL + API Key），
+//! 内含一组 `GatewayProviderModel`，每条模型条目独立声明协议（api_format）、
+//! 上游真实模型名与对外的本地别名。
+//!
+//! 路由由所有供应商下的 model 条目按 alias 聚合派生：同 alias 的多条目构成
+//! 一条 failover 链，顺序 = 供应商顺序 + 供应商内条目顺序。
 
 use crate::database::Database;
 use crate::error::AppError;
@@ -14,7 +16,8 @@ use crate::store::AppState;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 use tauri::menu::{Menu, MenuBuilder, MenuItem};
 use tauri::Manager;
@@ -22,7 +25,7 @@ use tauri::Manager;
 const CONFIG_KEY: &str = "unified_gateway_config_v1";
 const GENERATED_CATEGORY: &str = "unified_gateway";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayApiFormat {
     OpenaiChat,
@@ -35,6 +38,14 @@ impl GatewayApiFormat {
         match self {
             Self::OpenaiChat => "openai_chat",
             Self::OpenaiResponses => "openai_responses",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    fn generated_suffix(&self) -> &'static str {
+        match self {
+            Self::OpenaiChat => "chat",
+            Self::OpenaiResponses => "responses",
             Self::Anthropic => "anthropic",
         }
     }
@@ -52,58 +63,45 @@ pub struct GatewayCachedModel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GatewayProviderModel {
+    pub alias: String,
+    pub upstream_model: String,
+    pub api_format: GatewayApiFormat,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GatewayProvider {
     pub id: String,
     pub name: String,
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
-    pub api_format: GatewayApiFormat,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_auth_style")]
     pub auth_style: String,
-    /// Optional public HTTP User-Agent override for upstream compatibility.
     #[serde(default)]
     pub custom_user_agent: String,
-    /// Optional exact model-list endpoint. Empty means derive `/v1/models`.
     #[serde(default)]
     pub models_url: String,
-    /// Last successfully fetched upstream model list, used by the route editor.
     #[serde(default)]
     pub cached_models: Vec<GatewayCachedModel>,
     #[serde(default)]
     pub models_fetched_at: Option<String>,
     #[serde(default)]
     pub custom_headers: HashMap<String, String>,
-    /// 以官方 Codex CLI 客户端身份转发（发送 codex_cli_rs 的 User-Agent 与
-    /// 成对的 originator/version），用于要求 Codex 客户端指纹的上游兼容。
     #[serde(default)]
     pub impersonate_codex_client: bool,
-    /// Codex 客户端伪装使用的版本号。留空则使用内置默认值。
     #[serde(default)]
     pub codex_client_version: String,
     #[serde(default)]
     pub notes: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GatewayRouteTarget {
-    pub provider_id: String,
-    pub upstream_model: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GatewayRoute {
-    pub alias: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+    /// 该供应商下的模型条目，协议下沉到条目上。
     #[serde(default)]
-    pub targets: Vec<GatewayRouteTarget>,
+    pub models: Vec<GatewayProviderModel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,8 +119,6 @@ pub struct GatewayConfig {
     pub enable_logging: bool,
     #[serde(default)]
     pub providers: Vec<GatewayProvider>,
-    #[serde(default)]
-    pub routes: Vec<GatewayRoute>,
 }
 
 impl Default for GatewayConfig {
@@ -135,7 +131,6 @@ impl Default for GatewayConfig {
             auto_start: false,
             enable_logging: true,
             providers: Vec::new(),
-            routes: Vec::new(),
         }
     }
 }
@@ -168,12 +163,189 @@ pub fn generate_local_key() -> String {
 
 pub fn load_config(db: &Database) -> Result<GatewayConfig, AppError> {
     match db.get_setting(CONFIG_KEY)? {
-        Some(raw) => serde_json::from_str(&raw)
+        Some(raw) => parse_config_with_migration(&raw)
             .map_err(|e| AppError::Config(format!("统一网关配置解析失败: {e}"))),
         None => Ok(GatewayConfig::default()),
     }
 }
 
+/// 先按新结构解析；失败或未含 `models` 时，按旧结构（providers 顶层带 apiFormat +
+/// 顶层 routes[].targets[]）解析并转换为新结构。
+fn parse_config_with_migration(raw: &str) -> Result<GatewayConfig, String> {
+    let value: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+
+    let has_new_models = value
+        .get("providers")
+        .and_then(|p| p.as_array())
+        .map(|arr| arr.iter().any(|p| p.get("models").is_some()))
+        .unwrap_or(false);
+    let has_legacy_top_routes = value.get("routes").is_some();
+    let has_legacy_provider_api_format = value
+        .get("providers")
+        .and_then(|p| p.as_array())
+        .map(|arr| arr.iter().any(|p| p.get("apiFormat").is_some()))
+        .unwrap_or(false);
+
+    if has_new_models && !has_legacy_top_routes {
+        return serde_json::from_value(value).map_err(|e| e.to_string());
+    }
+
+    if has_legacy_top_routes || has_legacy_provider_api_format {
+        return migrate_legacy_config(&value).map_err(|e| e.to_string());
+    }
+
+    // 空 providers 或既无新字段也无旧字段：交给默认反序列化。
+    serde_json::from_value(value).map_err(|e| e.to_string())
+}
+
+fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyTarget {
+        provider_id: String,
+        #[serde(default)]
+        upstream_model: String,
+        #[serde(default = "default_true")]
+        enabled: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyRoute {
+        #[serde(default)]
+        alias: String,
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default)]
+        targets: Vec<LegacyTarget>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyProvider {
+        id: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        base_url: String,
+        #[serde(default)]
+        api_key: String,
+        #[serde(default)]
+        api_format: Option<GatewayApiFormat>,
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default = "default_auth_style")]
+        auth_style: String,
+        #[serde(default)]
+        custom_user_agent: String,
+        #[serde(default)]
+        models_url: String,
+        #[serde(default)]
+        cached_models: Vec<GatewayCachedModel>,
+        #[serde(default)]
+        models_fetched_at: Option<String>,
+        #[serde(default)]
+        custom_headers: HashMap<String, String>,
+        #[serde(default)]
+        impersonate_codex_client: bool,
+        #[serde(default)]
+        codex_client_version: String,
+        #[serde(default)]
+        notes: String,
+        #[serde(default)]
+        models: Vec<GatewayProviderModel>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyConfig {
+        listen_address: String,
+        listen_port: u16,
+        #[serde(default = "default_true")]
+        require_auth: bool,
+        #[serde(default = "generate_local_key")]
+        local_api_key: String,
+        #[serde(default)]
+        auto_start: bool,
+        #[serde(default = "default_true")]
+        enable_logging: bool,
+        #[serde(default)]
+        providers: Vec<LegacyProvider>,
+        #[serde(default)]
+        routes: Vec<LegacyRoute>,
+    }
+
+    let legacy: LegacyConfig =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+
+    let default_format_by_provider: HashMap<String, GatewayApiFormat> = legacy
+        .providers
+        .iter()
+        .map(|p| (p.id.clone(), p.api_format.unwrap_or(GatewayApiFormat::OpenaiChat)))
+        .collect();
+
+    let mut provider_models: HashMap<String, Vec<GatewayProviderModel>> = HashMap::new();
+
+    for provider in &legacy.providers {
+        provider_models.insert(provider.id.clone(), provider.models.clone());
+    }
+
+    for route in legacy.routes {
+        if route.alias.trim().is_empty() {
+            continue;
+        }
+        for target in route.targets {
+            if target.upstream_model.trim().is_empty() {
+                continue;
+            }
+            let format = default_format_by_provider
+                .get(&target.provider_id)
+                .copied()
+                .unwrap_or(GatewayApiFormat::OpenaiChat);
+            provider_models
+                .entry(target.provider_id.clone())
+                .or_default()
+                .push(GatewayProviderModel {
+                    alias: route.alias.clone(),
+                    upstream_model: target.upstream_model.clone(),
+                    api_format: format,
+                    enabled: route.enabled && target.enabled,
+                });
+        }
+    }
+
+    let providers = legacy
+        .providers
+        .into_iter()
+        .map(|p| GatewayProvider {
+            id: p.id.clone(),
+            name: p.name,
+            base_url: p.base_url,
+            api_key: p.api_key,
+            enabled: p.enabled,
+            auth_style: p.auth_style,
+            custom_user_agent: p.custom_user_agent,
+            models_url: p.models_url,
+            cached_models: p.cached_models,
+            models_fetched_at: p.models_fetched_at,
+            custom_headers: p.custom_headers,
+            impersonate_codex_client: p.impersonate_codex_client,
+            codex_client_version: p.codex_client_version,
+            notes: p.notes,
+            models: provider_models.remove(&p.id).unwrap_or_default(),
+        })
+        .collect();
+
+    Ok(GatewayConfig {
+        listen_address: legacy.listen_address,
+        listen_port: legacy.listen_port,
+        require_auth: legacy.require_auth,
+        local_api_key: legacy.local_api_key,
+        auto_start: legacy.auto_start,
+        enable_logging: legacy.enable_logging,
+        providers,
+    })
+}
 
 fn normalize_config(mut config: GatewayConfig) -> GatewayConfig {
     config.listen_address = config.listen_address.trim().to_string();
@@ -196,12 +368,9 @@ fn normalize_config(mut config: GatewayConfig) -> GatewayConfig {
             .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
             .filter(|(key, _)| !key.is_empty())
             .collect();
-    }
-    for route in &mut config.routes {
-        route.alias = route.alias.trim().to_string();
-        for target in &mut route.targets {
-            target.provider_id = target.provider_id.trim().to_string();
-            target.upstream_model = target.upstream_model.trim().to_string();
+        for model in &mut provider.models {
+            model.alias = model.alias.trim().to_string();
+            model.upstream_model = model.upstream_model.trim().to_string();
         }
     }
     config
@@ -226,6 +395,12 @@ fn validate_config(config: &GatewayConfig) -> Result<(), String> {
     for provider in &config.providers {
         if provider.id.trim().is_empty() || provider.name.trim().is_empty() {
             return Err("供应商 ID 和名称不能为空".to_string());
+        }
+        if provider.id.contains("::") {
+            return Err(format!(
+                "供应商 ID {} 不能包含 :: 分隔符（保留给内部路由使用）",
+                provider.id
+            ));
         }
         if !provider_ids.insert(provider.id.clone()) {
             return Err(format!("供应商 ID 重复: {}", provider.id));
@@ -273,46 +448,23 @@ fn validate_config(config: &GatewayConfig) -> Result<(), String> {
         if !matches!(provider.auth_style.as_str(), "auto" | "bearer" | "x-api-key") {
             return Err(format!("供应商 {} 的鉴权方式无效", provider.name));
         }
-    }
 
-    let mut aliases = HashSet::new();
-    for route in &config.routes {
-        let alias = route.alias.trim();
-        if alias.is_empty() {
-            return Err("模型别名不能为空".to_string());
-        }
-        if !aliases.insert(alias.to_string()) {
-            return Err(format!("模型别名重复: {alias}"));
-        }
-        let mut route_provider_ids = HashSet::new();
-        if route.enabled
-            && !route.targets.iter().any(|target| {
-                target.enabled
-                    && config
-                        .providers
-                        .iter()
-                        .any(|provider| provider.id == target.provider_id && provider.enabled)
-            })
-        {
-            return Err(format!(
-                "模型别名 {alias} 至少需要一个启用且可用的供应商目标"
-            ));
-        }
-        for target in &route.targets {
-            if !provider_ids.contains(&target.provider_id) {
+        let mut alias_seen = HashSet::new();
+        for model in &provider.models {
+            if model.alias.trim().is_empty() {
+                return Err(format!("供应商 {} 存在空的本地别名", provider.name));
+            }
+            if model.upstream_model.trim().is_empty() {
                 return Err(format!(
-                    "模型别名 {alias} 引用了不存在的供应商 {}",
-                    target.provider_id
+                    "供应商 {} 的模型 {} 缺少上游模型名",
+                    provider.name, model.alias
                 ));
             }
-            if !route_provider_ids.insert(target.provider_id.as_str()) {
+            if !alias_seen.insert(model.alias.clone()) {
                 return Err(format!(
-                    "模型别名 {alias} 不能重复引用同一个供应商 {}",
-                    target.provider_id
+                    "供应商 {} 内本地别名重复: {}（同供应商同别名请合并到一条）",
+                    provider.name, model.alias
                 ));
-            }
-            if target.upstream_model.trim().is_empty() {
-                return Err(format!("模型别名 {alias} 存在空的上游模型名"));
             }
         }
     }
@@ -320,40 +472,44 @@ fn validate_config(config: &GatewayConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn provider_model_map(config: &GatewayConfig, provider_id: &str) -> Map<String, Value> {
+/// 返回给定 (provider, api_format) 组合下的 `alias → upstream_model` 精确映射。
+fn provider_model_map(
+    provider: &GatewayProvider,
+    format: GatewayApiFormat,
+) -> Map<String, Value> {
     let mut map = Map::new();
-    for route in config.routes.iter().filter(|route| route.enabled) {
-        if let Some(target) = route
-            .targets
-            .iter()
-            .find(|target| target.enabled && target.provider_id == provider_id)
-        {
-            map.insert(
-                route.alias.trim().to_string(),
-                Value::String(target.upstream_model.trim().to_string()),
-            );
+    for model in &provider.models {
+        if !model.enabled || model.api_format != format {
+            continue;
         }
+        map.insert(
+            model.alias.trim().to_string(),
+            Value::String(model.upstream_model.trim().to_string()),
+        );
     }
     map
 }
 
-fn provider_meta(provider: &GatewayProvider) -> ProviderMeta {
+fn generated_provider_id(provider_id: &str, format: GatewayApiFormat) -> String {
+    format!("{}::{}", provider_id, format.generated_suffix())
+}
+
+fn provider_meta(
+    provider: &GatewayProvider,
+    format: GatewayApiFormat,
+) -> ProviderMeta {
     let mut meta = ProviderMeta::default();
-    meta.api_format = Some(provider.api_format.as_wire_name().to_string());
+    meta.api_format = Some(format.as_wire_name().to_string());
     meta.api_key_field = match provider.auth_style.as_str() {
         "x-api-key" => Some("ANTHROPIC_API_KEY".to_string()),
         "bearer" => Some("ANTHROPIC_AUTH_TOKEN".to_string()),
-        _ if provider.api_format == GatewayApiFormat::Anthropic => {
-            Some("ANTHROPIC_API_KEY".to_string())
-        }
+        _ if format == GatewayApiFormat::Anthropic => Some("ANTHROPIC_API_KEY".to_string()),
         _ => Some("ANTHROPIC_AUTH_TOKEN".to_string()),
     };
     if !provider.custom_user_agent.trim().is_empty() {
         meta.custom_user_agent = Some(provider.custom_user_agent.trim().to_string());
     }
 
-    // Codex 客户端身份伪装：把开关翻译成既有的 custom_user_agent + override headers，
-    // 复用已验证的注入链路（forwarder 无需改动）。originator/version 必须成对发送。
     let mut override_headers = provider.custom_headers.clone();
     if provider.impersonate_codex_client {
         use crate::proxy::providers::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
@@ -362,11 +518,9 @@ fn provider_meta(provider: &GatewayProvider) -> ProviderMeta {
         } else {
             provider.codex_client_version.trim()
         };
-        // 自定义 UA 优先：仅当用户未显式设置时才合成 codex_cli_rs/<version>。
         if meta.custom_user_agent.is_none() {
             meta.custom_user_agent = Some(format!("{CODEX_OAUTH_ORIGINATOR}/{version}"));
         }
-        // 身份对在 clone 之后插入，确保成对匹配，优先于用户可能手填的同名头。
         override_headers.insert("originator".to_string(), CODEX_OAUTH_ORIGINATOR.to_string());
         override_headers.insert("version".to_string(), version.to_string());
     }
@@ -380,14 +534,14 @@ fn provider_meta(provider: &GatewayProvider) -> ProviderMeta {
 }
 
 fn materialize_provider(
-    config: &GatewayConfig,
     provider: &GatewayProvider,
+    format: GatewayApiFormat,
     app_type: &str,
     sort_index: usize,
 ) -> Provider {
-    let exact_model_map = provider_model_map(config, &provider.id);
+    let exact_model_map = provider_model_map(provider, format);
     let auth_is_x_api_key = matches!(provider.auth_style.as_str(), "x-api-key")
-        || (provider.auth_style == "auto" && provider.api_format == GatewayApiFormat::Anthropic);
+        || (provider.auth_style == "auto" && format == GatewayApiFormat::Anthropic);
 
     let settings_config = if app_type == "claude" {
         let mut env = Map::new();
@@ -403,29 +557,29 @@ fn materialize_provider(
         env.insert(key_name.to_string(), Value::String(provider.api_key.clone()));
         json!({
             "env": env,
-            "apiFormat": provider.api_format.as_wire_name(),
+            "apiFormat": format.as_wire_name(),
             "gateway_model_map": exact_model_map,
         })
     } else {
         json!({
             "base_url": provider.base_url.trim_end_matches('/'),
             "apiKey": provider.api_key.clone(),
-            "apiFormat": provider.api_format.as_wire_name(),
+            "apiFormat": format.as_wire_name(),
             "gateway_model_map": exact_model_map,
         })
     };
 
     Provider {
-        id: provider.id.clone(),
-        name: provider.name.clone(),
+        id: generated_provider_id(&provider.id, format),
+        name: format!("{} · {}", provider.name, format.as_wire_name()),
         settings_config,
         website_url: None,
         category: Some(GENERATED_CATEGORY.to_string()),
         created_at: Some(chrono::Utc::now().timestamp_millis()),
         sort_index: Some(sort_index),
         notes: (!provider.notes.trim().is_empty()).then(|| provider.notes.clone()),
-        meta: Some(provider_meta(provider)),
-        icon: Some(match provider.api_format {
+        meta: Some(provider_meta(provider, format)),
+        icon: Some(match format {
             GatewayApiFormat::Anthropic => "anthropic".to_string(),
             _ => "openai".to_string(),
         }),
@@ -434,11 +588,34 @@ fn materialize_provider(
     }
 }
 
+/// 收集所有 (provider, format) 组合。保留原始供应商顺序，供应商内 formats
+/// 按其首次出现顺序排列，用作路由 failover 的稳定顺序。
+fn iter_materialized_combos(
+    config: &GatewayConfig,
+) -> Vec<(usize, &GatewayProvider, GatewayApiFormat)> {
+    let mut result = Vec::new();
+    for (idx, provider) in config.providers.iter().enumerate() {
+        let mut seen: Vec<GatewayApiFormat> = Vec::new();
+        for model in &provider.models {
+            if !model.enabled {
+                continue;
+            }
+            if !seen.contains(&model.api_format) {
+                seen.push(model.api_format);
+            }
+        }
+        for format in seen {
+            result.push((idx, provider, format));
+        }
+    }
+    result
+}
+
 fn sync_generated_providers(db: &Database, config: &GatewayConfig) -> Result<(), AppError> {
-    let wanted: HashSet<String> = config
-        .providers
+    let combos = iter_materialized_combos(config);
+    let wanted: HashSet<String> = combos
         .iter()
-        .map(|provider| provider.id.clone())
+        .map(|(_, provider, format)| generated_provider_id(&provider.id, *format))
         .collect();
 
     for app_type in ["claude", "codex"] {
@@ -451,10 +628,10 @@ fn sync_generated_providers(db: &Database, config: &GatewayConfig) -> Result<(),
             }
         }
 
-        for (index, provider) in config.providers.iter().enumerate() {
+        for (index, (_, provider, format)) in combos.iter().enumerate() {
             db.save_provider(
                 app_type,
-                &materialize_provider(config, provider, app_type, index),
+                &materialize_provider(provider, *format, app_type, index),
             )?;
         }
     }
@@ -468,32 +645,44 @@ pub fn resolve_route_providers(
     alias: &str,
 ) -> Result<Option<Vec<Provider>>, AppError> {
     let config = load_config(db)?;
-    let Some(route) = config
-        .routes
-        .iter()
-        .find(|route| route.enabled && route.alias == alias)
-    else {
+    let alias = alias.trim();
+    if alias.is_empty() {
         return Ok(None);
-    };
+    }
 
-    let configured: HashMap<&str, &GatewayProvider> = config
-        .providers
-        .iter()
-        .filter(|provider| provider.enabled)
-        .map(|provider| (provider.id.as_str(), provider))
-        .collect();
-
-    let mut result = Vec::new();
-    for target in route.targets.iter().filter(|target| target.enabled) {
-        if !configured.contains_key(target.provider_id.as_str()) {
-            continue;
+    let mut matched_ids: Vec<String> = Vec::new();
+    let mut any_alias_defined = false;
+    for provider in &config.providers {
+        let mut formats_for_alias: Vec<GatewayApiFormat> = Vec::new();
+        for model in &provider.models {
+            if model.alias == alias {
+                any_alias_defined = true;
+            }
+            if !model.enabled || model.alias != alias {
+                continue;
+            }
+            if !provider.enabled {
+                continue;
+            }
+            if !formats_for_alias.contains(&model.api_format) {
+                formats_for_alias.push(model.api_format);
+            }
         }
-
-        if let Some(provider) = db.get_provider_by_id(&target.provider_id, app_type)? {
-            result.push(provider);
+        for format in formats_for_alias {
+            matched_ids.push(generated_provider_id(&provider.id, format));
         }
     }
 
+    if !any_alias_defined {
+        return Ok(None);
+    }
+
+    let mut result = Vec::new();
+    for id in matched_ids {
+        if let Some(provider) = db.get_provider_by_id(&id, app_type)? {
+            result.push(provider);
+        }
+    }
     Ok(Some(result))
 }
 
@@ -519,7 +708,8 @@ pub fn validate_local_auth(db: &Database, headers: &HeaderMap) -> Result<(), cra
         .and_then(|value| value.to_str().ok())
         .map(str::trim);
 
-    if bearer == Some(expected) || x_api_key == Some(expected) {
+    let candidate = bearer.or(x_api_key).unwrap_or("");
+    if !candidate.is_empty() && candidate == expected {
         Ok(())
     } else {
         Err(crate::proxy::ProxyError::AuthError(
@@ -531,13 +721,24 @@ pub fn validate_local_auth(db: &Database, headers: &HeaderMap) -> Result<(), cra
 pub fn openai_models_response(db: &Database) -> Result<Value, AppError> {
     let config = load_config(db)?;
     let created = chrono::Utc::now().timestamp();
-    let data: Vec<Value> = config
-        .routes
-        .iter()
-        .filter(|route| route.enabled)
-        .map(|route| {
+    // 用 BTreeMap 去重并稳定排序
+    let mut aliases: BTreeMap<String, ()> = BTreeMap::new();
+    for provider in &config.providers {
+        if !provider.enabled {
+            continue;
+        }
+        for model in &provider.models {
+            if !model.enabled {
+                continue;
+            }
+            aliases.insert(model.alias.clone(), ());
+        }
+    }
+    let data: Vec<Value> = aliases
+        .into_keys()
+        .map(|alias| {
             json!({
-                "id": route.alias.clone(),
+                "id": alias,
                 "object": "model",
                 "created": created,
                 "owned_by": "local-gateway"
@@ -565,8 +766,6 @@ pub(crate) async fn apply_runtime_config(state: &AppState, config: &GatewayConfi
     proxy_config.enable_logging = config.enable_logging;
     state.proxy_service.update_config(&proxy_config).await?;
 
-    // Route order is managed by the gateway itself, so allow the inherited
-    // forwarder to attempt every target in the selected route chain.
     for app_type in ["claude", "codex"] {
         if let Ok(mut app_config) = state.db.get_proxy_config_for_app(app_type).await {
             app_config.auto_failover_enabled = true;
@@ -613,12 +812,22 @@ pub async fn stop_gateway(state: tauri::State<'_, AppState>) -> Result<(), Strin
     state.proxy_service.stop().await
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchProviderModelsRequest {
+    pub provider: GatewayProvider,
+    #[serde(default)]
+    pub api_format: Option<GatewayApiFormat>,
+}
+
 #[tauri::command]
 pub async fn fetch_gateway_provider_models(
-    provider: GatewayProvider,
+    request: FetchProviderModelsRequest,
 ) -> Result<GatewayModelFetchResult, String> {
+    let provider = request.provider;
     let user_agent = crate::provider::parse_custom_user_agent(Some(&provider.custom_user_agent))
         .map_err(|e| format!("User-Agent 无效: {e}"))?;
+    let format = request.api_format.unwrap_or(GatewayApiFormat::OpenaiChat);
     let models = model_fetch::fetch_models_with_options(
         provider.base_url.trim(),
         provider.api_key.trim(),
@@ -626,7 +835,7 @@ pub async fn fetch_gateway_provider_models(
         (!provider.models_url.trim().is_empty()).then_some(provider.models_url.trim()),
         user_agent,
         provider.auth_style.trim(),
-        provider.api_format.as_wire_name(),
+        format.as_wire_name(),
         &provider.custom_headers,
     )
     .await?
@@ -649,7 +858,375 @@ pub fn generate_gateway_api_key() -> String {
     generate_local_key()
 }
 
+// ============================================================================
+// 单模型测试对话
+// ============================================================================
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayTestProxyMode {
+    /// 沿用当前进程内的全局代理设置（即共享 http_client）
+    FollowGlobal,
+    /// 忽略全局代理，本次测试强制直连
+    Bypass,
+    /// 使用弹窗内临时输入的代理地址
+    Custom,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelTestRequest {
+    pub provider: GatewayProvider,
+    pub upstream_model: String,
+    #[serde(default)]
+    pub alias: String,
+    pub api_format: GatewayApiFormat,
+    pub prompt: String,
+    #[serde(default)]
+    pub via_gateway: bool,
+    pub proxy_mode: GatewayTestProxyMode,
+    #[serde(default)]
+    pub custom_proxy_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelTestResult {
+    pub ok: bool,
+    pub status: u16,
+    pub latency_ms: u64,
+    pub reply_text: String,
+    pub raw_body_preview: String,
+    pub error: Option<String>,
+    pub path_used: String,
+    pub proxy_effective: Option<String>,
+}
+
+const TEST_RAW_PREVIEW_MAX: usize = 2 * 1024;
+
+fn truncate_preview(s: &str) -> String {
+    if s.len() <= TEST_RAW_PREVIEW_MAX {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..TEST_RAW_PREVIEW_MAX])
+    }
+}
+
+fn extract_reply_text(format: GatewayApiFormat, body: &Value) -> String {
+    match format {
+        GatewayApiFormat::OpenaiChat => body
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        GatewayApiFormat::OpenaiResponses => {
+            if let Some(text) = body.get("output_text").and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    return text.to_string();
+                }
+            }
+            let mut out = String::new();
+            if let Some(outputs) = body.get("output").and_then(|v| v.as_array()) {
+                for item in outputs {
+                    if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
+                        for part in parts {
+                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                out.push_str(text);
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        }
+        GatewayApiFormat::Anthropic => {
+            let mut out = String::new();
+            if let Some(parts) = body.get("content").and_then(|v| v.as_array()) {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                        out.push_str(text);
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+fn build_test_client(
+    mode: GatewayTestProxyMode,
+    custom_proxy_url: &str,
+) -> Result<(reqwest::Client, Option<String>), String> {
+    match mode {
+        GatewayTestProxyMode::FollowGlobal => {
+            let url = crate::proxy::http_client::get_current_proxy_url();
+            Ok((crate::proxy::http_client::get(), url))
+        }
+        GatewayTestProxyMode::Bypass => {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(15))
+                .build()
+                .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
+            Ok((client, None))
+        }
+        GatewayTestProxyMode::Custom => {
+            let trimmed = custom_proxy_url.trim();
+            if trimmed.is_empty() {
+                return Err("自定义代理 URL 不能为空".to_string());
+            }
+            crate::proxy::http_client::validate_proxy(Some(trimmed))?;
+            let proxy = reqwest::Proxy::all(trimmed)
+                .map_err(|e| format!("代理配置无效: {e}"))?;
+            let client = reqwest::Client::builder()
+                .proxy(proxy)
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(15))
+                .build()
+                .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
+            Ok((client, Some(trimmed.to_string())))
+        }
+    }
+}
+
+fn build_test_payload(format: GatewayApiFormat, model: &str, prompt: &str) -> Value {
+    match format {
+        GatewayApiFormat::OpenaiChat => json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 256,
+            "stream": false,
+        }),
+        GatewayApiFormat::OpenaiResponses => json!({
+            "model": model,
+            "input": prompt,
+            "stream": false,
+        }),
+        GatewayApiFormat::Anthropic => json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 256,
+        }),
+    }
+}
+
+fn endpoint_path(format: GatewayApiFormat) -> &'static str {
+    match format {
+        GatewayApiFormat::OpenaiChat => "/v1/chat/completions",
+        GatewayApiFormat::OpenaiResponses => "/v1/responses",
+        GatewayApiFormat::Anthropic => "/v1/messages",
+    }
+}
+
+fn join_url(base: &str, path: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    // 若 base 已经包含 /v1，则用 path 去掉前导 /v1 以避免重复
+    if base.ends_with("/v1") {
+        format!("{}{}", base, &path[3..])
+    } else {
+        format!("{}{}", base, path)
+    }
+}
+
+async fn run_direct_test(
+    request: &GatewayModelTestRequest,
+    client: &reqwest::Client,
+) -> Result<(u16, String), String> {
+    let url = join_url(&request.provider.base_url, endpoint_path(request.api_format));
+    let payload = build_test_payload(request.api_format, &request.upstream_model, &request.prompt);
+
+    let mut req = client.post(&url).json(&payload);
+
+    let auth_style = request.provider.auth_style.trim().to_ascii_lowercase();
+    let use_x_api_key = auth_style == "x-api-key"
+        || (auth_style == "auto" && request.api_format == GatewayApiFormat::Anthropic);
+    let key = request.provider.api_key.trim();
+    if !key.is_empty() {
+        if use_x_api_key {
+            req = req.header("x-api-key", key);
+            if request.api_format == GatewayApiFormat::Anthropic {
+                req = req.header("anthropic-version", "2023-06-01");
+            }
+        } else {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+    } else if request.api_format == GatewayApiFormat::Anthropic {
+        req = req.header("anthropic-version", "2023-06-01");
+    }
+
+    // 自定义 UA / Codex 伪装
+    let ua = if request.provider.impersonate_codex_client
+        && request.provider.custom_user_agent.trim().is_empty()
+    {
+        use crate::proxy::providers::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
+        let ver = if request.provider.codex_client_version.trim().is_empty() {
+            CODEX_OAUTH_CLIENT_VERSION
+        } else {
+            request.provider.codex_client_version.trim()
+        };
+        Some(format!("{CODEX_OAUTH_ORIGINATOR}/{ver}"))
+    } else if !request.provider.custom_user_agent.trim().is_empty() {
+        Some(request.provider.custom_user_agent.trim().to_string())
+    } else {
+        None
+    };
+    if let Some(ua) = ua {
+        req = req.header("User-Agent", ua);
+    }
+    if request.provider.impersonate_codex_client {
+        use crate::proxy::providers::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
+        let ver = if request.provider.codex_client_version.trim().is_empty() {
+            CODEX_OAUTH_CLIENT_VERSION
+        } else {
+            request.provider.codex_client_version.trim()
+        };
+        req = req.header("originator", CODEX_OAUTH_ORIGINATOR);
+        req = req.header("version", ver);
+    }
+
+    // 自定义头（禁保留头）
+    for (name, value) in &request.provider.custom_headers {
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "authorization" | "x-api-key" | "host" | "content-length" | "user-agent"
+        ) {
+            continue;
+        }
+        req = req.header(name.as_str(), value.as_str());
+    }
+
+    let response = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
+    let status = response.status().as_u16();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("读取响应失败: {e}"))?;
+    Ok((status, text))
+}
+
+async fn run_gateway_test(
+    state: &AppState,
+    request: &GatewayModelTestRequest,
+    client: &reqwest::Client,
+) -> Result<(u16, String), String> {
+    let config = load_config(&state.db).map_err(|e| e.to_string())?;
+    let alias = if request.alias.trim().is_empty() {
+        request.upstream_model.trim()
+    } else {
+        request.alias.trim()
+    };
+    if alias.is_empty() {
+        return Err("通过网关测试需要一个已保存的本地别名".to_string());
+    }
+    let address = if config.listen_address == "0.0.0.0" || config.listen_address == "::" {
+        "127.0.0.1".to_string()
+    } else if config.listen_address.contains(':') && !config.listen_address.starts_with('[') {
+        format!("[{}]", config.listen_address)
+    } else {
+        config.listen_address.clone()
+    };
+    let base = format!("http://{}:{}", address, config.listen_port);
+    let url = format!("{}{}", base, endpoint_path(request.api_format));
+    let payload = build_test_payload(request.api_format, alias, &request.prompt);
+
+    let mut req = client.post(&url).json(&payload);
+    let local_key = config.local_api_key.trim();
+    if config.require_auth && !local_key.is_empty() {
+        if request.api_format == GatewayApiFormat::Anthropic {
+            req = req.header("x-api-key", local_key);
+            req = req.header("anthropic-version", "2023-06-01");
+        } else {
+            req = req.header("Authorization", format!("Bearer {}", local_key));
+        }
+    } else if request.api_format == GatewayApiFormat::Anthropic {
+        req = req.header("anthropic-version", "2023-06-01");
+    }
+
+    let response = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
+    let status = response.status().as_u16();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("读取响应失败: {e}"))?;
+    Ok((status, text))
+}
+
+#[tauri::command]
+pub async fn test_gateway_model(
+    state: tauri::State<'_, AppState>,
+    request: GatewayModelTestRequest,
+) -> Result<GatewayModelTestResult, String> {
+    if request.upstream_model.trim().is_empty() {
+        return Err("上游模型名不能为空".to_string());
+    }
+    if request.provider.base_url.trim().is_empty() {
+        return Err("Base URL 不能为空".to_string());
+    }
+    if request.prompt.trim().is_empty() {
+        return Err("测试消息不能为空".to_string());
+    }
+
+    // 通过网关路径下，代理由网关自身的全局代理决定；前端也会禁用代理开关。
+    // 后端为兼容仍尊重 mode 构建的客户端（用来复用请求发送），但记录 proxy_effective 为
+    // 空以避免误导用户。
+    let (client, proxy_effective) = if request.via_gateway {
+        (crate::proxy::http_client::get(), None)
+    } else {
+        build_test_client(request.proxy_mode, &request.custom_proxy_url)?
+    };
+
+    let start = Instant::now();
+    let path_used = if request.via_gateway { "gateway" } else { "direct" };
+
+    let result = if request.via_gateway {
+        run_gateway_test(&state, &request, &client).await
+    } else {
+        run_direct_test(&request, &client).await
+    };
+
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok((status, text)) => {
+            let ok = (200..300).contains(&status);
+            let body: Option<Value> = serde_json::from_str(&text).ok();
+            let reply_text = body
+                .as_ref()
+                .map(|b| extract_reply_text(request.api_format, b))
+                .unwrap_or_default();
+            let raw_body_preview = truncate_preview(&text);
+            Ok(GatewayModelTestResult {
+                ok,
+                status,
+                latency_ms,
+                reply_text,
+                raw_body_preview,
+                error: None,
+                path_used: path_used.to_string(),
+                proxy_effective: proxy_effective
+                    .as_ref()
+                    .map(|u| crate::proxy::http_client::mask_url(u)),
+            })
+        }
+        Err(err) => Ok(GatewayModelTestResult {
+            ok: false,
+            status: 0,
+            latency_ms,
+            reply_text: String::new(),
+            raw_body_preview: String::new(),
+            error: Some(err),
+            path_used: path_used.to_string(),
+            proxy_effective: proxy_effective
+                .as_ref()
+                .map(|u| crate::proxy::http_client::mask_url(u)),
+        }),
+    }
+}
 
 pub fn create_gateway_tray_menu(
     app: &tauri::AppHandle,
@@ -714,13 +1291,12 @@ pub fn handle_gateway_tray_menu_event(app: &tauri::AppHandle, id: &str) {
 mod tests {
     use super::*;
 
-    fn provider(id: &str, format: GatewayApiFormat) -> GatewayProvider {
+    fn provider_with_format(id: &str, format: GatewayApiFormat) -> GatewayProvider {
         GatewayProvider {
             id: id.to_string(),
             name: id.to_string(),
             base_url: "https://example.com/v1".to_string(),
             api_key: "test-key".to_string(),
-            api_format: format,
             enabled: true,
             auth_style: "auto".to_string(),
             custom_user_agent: String::new(),
@@ -731,6 +1307,12 @@ mod tests {
             impersonate_codex_client: false,
             codex_client_version: String::new(),
             notes: String::new(),
+            models: vec![GatewayProviderModel {
+                alias: "local".to_string(),
+                upstream_model: "model-a".to_string(),
+                api_format: format,
+                enabled: true,
+            }],
         }
     }
 
@@ -752,9 +1334,9 @@ mod tests {
 
     #[test]
     fn impersonate_codex_client_synthesizes_three_headers() {
-        let mut p = provider("codex", GatewayApiFormat::OpenaiResponses);
+        let mut p = provider_with_format("codex", GatewayApiFormat::OpenaiResponses);
         p.impersonate_codex_client = true;
-        let meta = provider_meta(&p);
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiResponses);
         assert_eq!(
             meta.custom_user_agent.as_deref(),
             Some("codex_cli_rs/0.144.1")
@@ -766,12 +1348,11 @@ mod tests {
 
     #[test]
     fn custom_user_agent_beats_spoofed_ua() {
-        let mut p = provider("codex", GatewayApiFormat::OpenaiResponses);
+        let mut p = provider_with_format("codex", GatewayApiFormat::OpenaiResponses);
         p.impersonate_codex_client = true;
         p.custom_user_agent = "MyClient/9.9".to_string();
-        let meta = provider_meta(&p);
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiResponses);
         assert_eq!(meta.custom_user_agent.as_deref(), Some("MyClient/9.9"));
-        // 身份对仍独立注入
         let headers = override_headers(&meta);
         assert_eq!(headers.get("originator").map(String::as_str), Some("codex_cli_rs"));
         assert_eq!(headers.get("version").map(String::as_str), Some("0.144.1"));
@@ -779,10 +1360,10 @@ mod tests {
 
     #[test]
     fn custom_version_override_applied() {
-        let mut p = provider("codex", GatewayApiFormat::OpenaiResponses);
+        let mut p = provider_with_format("codex", GatewayApiFormat::OpenaiResponses);
         p.impersonate_codex_client = true;
         p.codex_client_version = "0.150.0".to_string();
-        let meta = provider_meta(&p);
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiResponses);
         assert_eq!(
             meta.custom_user_agent.as_deref(),
             Some("codex_cli_rs/0.150.0")
@@ -794,19 +1375,19 @@ mod tests {
 
     #[test]
     fn toggle_off_injects_nothing() {
-        let p = provider("codex", GatewayApiFormat::OpenaiResponses);
-        let meta = provider_meta(&p);
+        let p = provider_with_format("codex", GatewayApiFormat::OpenaiResponses);
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiResponses);
         assert!(meta.custom_user_agent.is_none());
         assert!(meta.local_proxy_request_overrides.is_none());
     }
 
     #[test]
     fn spoof_merges_with_custom_headers() {
-        let mut p = provider("codex", GatewayApiFormat::OpenaiResponses);
+        let mut p = provider_with_format("codex", GatewayApiFormat::OpenaiResponses);
         p.impersonate_codex_client = true;
         p.custom_headers
             .insert("X-Title".to_string(), "foo".to_string());
-        let meta = provider_meta(&p);
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiResponses);
         let headers = override_headers(&meta);
         assert_eq!(headers.get("X-Title").map(String::as_str), Some("foo"));
         assert_eq!(headers.get("originator").map(String::as_str), Some("codex_cli_rs"));
@@ -814,60 +1395,29 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_provider_in_one_route_is_rejected() {
+    fn duplicate_alias_in_one_provider_is_rejected() {
         let mut config = GatewayConfig::default();
-        config.providers.push(provider("p1", GatewayApiFormat::OpenaiChat));
-        config.routes.push(GatewayRoute {
+        let mut p = provider_with_format("p1", GatewayApiFormat::OpenaiChat);
+        p.models.push(GatewayProviderModel {
             alias: "local".to_string(),
+            upstream_model: "model-b".to_string(),
+            api_format: GatewayApiFormat::OpenaiResponses,
             enabled: true,
-            targets: vec![
-                GatewayRouteTarget {
-                    provider_id: "p1".to_string(),
-                    upstream_model: "model-a".to_string(),
-                    enabled: true,
-                },
-                GatewayRouteTarget {
-                    provider_id: "p1".to_string(),
-                    upstream_model: "model-b".to_string(),
-                    enabled: true,
-                },
-            ],
         });
-        assert!(validate_config(&config).is_err());
-    }
-
-    #[test]
-    fn enabled_route_requires_an_enabled_provider() {
-        let mut config = GatewayConfig::default();
-        let mut disabled = provider("p1", GatewayApiFormat::OpenaiChat);
-        disabled.enabled = false;
-        config.providers.push(disabled);
-        config.routes.push(GatewayRoute {
-            alias: "local".to_string(),
-            enabled: true,
-            targets: vec![GatewayRouteTarget {
-                provider_id: "p1".to_string(),
-                upstream_model: "model-a".to_string(),
-                enabled: true,
-            }],
-        });
+        config.providers.push(p);
         assert!(validate_config(&config).is_err());
     }
 
     #[test]
     fn materialized_provider_contains_exact_alias_mapping() {
         let mut config = GatewayConfig::default();
-        config.providers.push(provider("p1", GatewayApiFormat::OpenaiResponses));
-        config.routes.push(GatewayRoute {
-            alias: "best-code".to_string(),
-            enabled: true,
-            targets: vec![GatewayRouteTarget {
-                provider_id: "p1".to_string(),
-                upstream_model: "gpt-test".to_string(),
-                enabled: true,
-            }],
-        });
-        let generated = materialize_provider(&config, &config.providers[0], "codex", 0);
+        let mut p = provider_with_format("p1", GatewayApiFormat::OpenaiResponses);
+        p.models[0].alias = "best-code".to_string();
+        p.models[0].upstream_model = "gpt-test".to_string();
+        config.providers.push(p);
+
+        let generated =
+            materialize_provider(&config.providers[0], GatewayApiFormat::OpenaiResponses, "codex", 0);
         assert_eq!(
             generated.settings_config["gateway_model_map"]["best-code"],
             Value::String("gpt-test".to_string())
@@ -875,6 +1425,72 @@ mod tests {
         assert_eq!(
             generated.meta.and_then(|meta| meta.api_format),
             Some("openai_responses".to_string())
+        );
+    }
+
+    #[test]
+    fn one_provider_with_two_formats_materializes_two_internal_providers() {
+        let mut config = GatewayConfig::default();
+        let mut p = provider_with_format("p1", GatewayApiFormat::OpenaiChat);
+        p.models[0].alias = "chat-alias".to_string();
+        p.models.push(GatewayProviderModel {
+            alias: "resp-alias".to_string(),
+            upstream_model: "gpt-5-preview".to_string(),
+            api_format: GatewayApiFormat::OpenaiResponses,
+            enabled: true,
+        });
+        config.providers.push(p);
+        let combos = iter_materialized_combos(&config);
+        assert_eq!(combos.len(), 2);
+        let mut formats: Vec<GatewayApiFormat> =
+            combos.iter().map(|(_, _, f)| *f).collect();
+        formats.sort_by_key(|f| f.as_wire_name());
+        assert_eq!(
+            formats,
+            vec![GatewayApiFormat::OpenaiChat, GatewayApiFormat::OpenaiResponses]
+        );
+    }
+
+    #[test]
+    fn legacy_config_migrates_apiformat_and_routes_into_models() {
+        let raw = json!({
+            "listenAddress": "127.0.0.1",
+            "listenPort": 10888,
+            "requireAuth": true,
+            "localApiKey": "local-sk-abc",
+            "autoStart": false,
+            "enableLogging": true,
+            "providers": [{
+                "id": "p1",
+                "name": "P1",
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-x",
+                "apiFormat": "openai_chat",
+                "enabled": true,
+                "authStyle": "auto",
+                "customUserAgent": "",
+                "modelsUrl": "",
+                "cachedModels": [],
+                "customHeaders": {},
+                "impersonateCodexClient": false,
+                "codexClientVersion": "",
+                "notes": ""
+            }],
+            "routes": [{
+                "alias": "local",
+                "enabled": true,
+                "targets": [{"providerId": "p1", "upstreamModel": "gpt-5", "enabled": true}]
+            }]
+        })
+        .to_string();
+        let config = parse_config_with_migration(&raw).expect("migrates");
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].models.len(), 1);
+        assert_eq!(config.providers[0].models[0].alias, "local");
+        assert_eq!(config.providers[0].models[0].upstream_model, "gpt-5");
+        assert_eq!(
+            config.providers[0].models[0].api_format,
+            GatewayApiFormat::OpenaiChat
         );
     }
 }

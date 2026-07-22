@@ -5,7 +5,7 @@
       {
         "label": "main",
         "title": "LLM Gateway Desktop",
-        "titleBarStyle": "Visible",
+        "decorations": false,
         "visible": false,
         "minWidth": 900,
         "minHeight": 600

@@ -476,7 +476,13 @@ pub fn run() {
             gateway::stop_gateway,
             gateway::fetch_gateway_provider_models,
             gateway::generate_gateway_api_key,
+            gateway::test_gateway_model,
             commands::set_window_theme,
+            commands::get_global_proxy_url,
+            commands::set_global_proxy_url,
+            commands::test_proxy_url,
+            commands::get_upstream_proxy_status,
+            commands::scan_local_proxies,
         ]);
 
     let app = builder
