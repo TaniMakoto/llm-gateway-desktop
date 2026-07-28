@@ -27,7 +27,7 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.0",
     "@types/node": "^20.0.0",
-    "@types/react": "^18.2.0",
+    "@types/react": "^19.2.17",
     "@types/react-dom": "^18.2.0",
     "@vitejs/plugin-react": "^4.2.0",
     "autoprefixer": "^10.4.20",
@@ -41,8 +41,8 @@
     "@tauri-apps/api": "^2.8.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.542.0",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.3.1"
   }
