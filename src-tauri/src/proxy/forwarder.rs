@@ -1072,6 +1072,14 @@ impl RequestForwarder {
                                         * 100.0;
                                 }
                             }
+                            let (log_code, log_message) = build_nonretryable_failure_log(
+                                &provider.name,
+                                attempted_providers,
+                                providers.len(),
+                                &e,
+                                category,
+                            );
+                            log::warn!("[{app_type_str}] [{log_code}] {log_message}");
                             return Err(ForwardError {
                                 error: e,
                                 provider: Some(provider.clone()),
@@ -2567,18 +2575,22 @@ impl RequestForwarder {
             ProxyError::ProviderUnhealthy(_) => ErrorCategory::Retryable,
             // 上游 HTTP 错误：按状态码分桶。
             //
-            // 客户端请求自身有问题的状态码无论换哪个 provider 都会被拒绝，
-            // 继续轮询只会放大错误率、污染熔断器健康度、浪费配额：
-            //   400 Bad Request / 422 Unprocessable Entity   ← 请求体格式或语义错误
-            //   405 Method Not Allowed / 406 Not Acceptable  ← 方法或 Accept 错误
-            //   413 Payload Too Large / 414 URI Too Long     ← 客户端构造超限
-            //   415 Unsupported Media Type                    ← Content-Type 错误
-            //   501 Not Implemented                           ← 上游协议确实不支持
+            // 仅把“换哪家都会同样失败”的客户端语义错误标为 NonRetryable：
+            //   400 / 422  ← 请求体格式或语义错误（对所有上游通常相同）
+            //   406 / 414 / 415 ← Accept / URI / Content-Type 客户端构造问题
             //
-            // 其他 4xx（401/403/404/408/409/429/451 等）和全部 5xx 都保留
-            // Retryable —— 换一家 provider 可能持有不同的 key、配额、地域或模型映射。
-            ProxyError::UpstreamError { status, .. } => match *status {
-                400 | 405 | 406 | 413 | 414 | 415 | 422 | 501 => ErrorCategory::NonRetryable,
+            // 多供应商中转场景下，下列状态码经常是“这一家”的问题，应继续 failover：
+            //   405 ← 常见于某家 nginx location 未放开 POST /v1/responses，不是本地方法错
+            //   413 ← 各家 client_max_body_size / 网关限额不同，换源可能成功
+            //   501 ← 某一家未实现该协议/端点，另一家可能支持
+            //   401/403/404/429 与全部 5xx ← 换 key、配额、通道或节点后可能恢复
+            ProxyError::UpstreamError { status, body } => match *status {
+                400 | 406 | 414 | 415 | 422 => ErrorCategory::NonRetryable,
+                // 405：默认允许换源。若响应体是明确的 JSON 应用层“方法不允许”，
+                // 且完全不像边缘/反代 HTML，才视为客户端协议问题并中止 failover。
+                405 if is_application_method_not_allowed(body.as_deref()) => {
+                    ErrorCategory::NonRetryable
+                }
                 _ => ErrorCategory::Retryable,
             },
             // Provider 级配置/转换问题：换一个 Provider 可能就能成功
@@ -2592,6 +2604,50 @@ impl RequestForwarder {
             _ => ErrorCategory::NonRetryable,
         }
     }
+}
+
+/// 判断 405 是否更像“应用层明确拒绝该方法”，而不是 nginx/CDN 边缘页。
+///
+/// 中转站返回的裸 nginx HTML（`<h1>405 Not Allowed</h1>`）对下一户供应商没有约束，
+/// 必须允许 failover；只有带 JSON 业务错误码/文案的 405 才倾向视为协议用错。
+fn is_application_method_not_allowed(body: Option<&str>) -> bool {
+    let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) else {
+        return false;
+    };
+
+    if looks_like_edge_gateway_body(body) {
+        return false;
+    }
+
+    let Ok(json_body) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+
+    let message = extract_json_error_message(&json_body)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let code = json_body
+        .pointer("/error/code")
+        .or_else(|| json_body.get("code"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    message.contains("method not allowed")
+        || message.contains("method_not_allowed")
+        || code.contains("method_not_allowed")
+}
+
+fn looks_like_edge_gateway_body(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("<html")
+        || lower.contains("<!doctype")
+        || lower.contains("<center>")
+        || lower.contains("nginx")
+        || lower.contains("cloudflare")
+        || lower.contains("405 not allowed")
+        || lower.contains("error code: 1010")
+        || lower.contains("error code: 1003")
 }
 
 /// 从 ProxyError 中提取错误消息
@@ -2634,6 +2690,28 @@ fn build_retryable_failure_log(
             ),
         )
     }
+}
+
+fn build_nonretryable_failure_log(
+    provider_name: &str,
+    attempted_providers: usize,
+    total_providers: usize,
+    error: &ProxyError,
+    category: ErrorCategory,
+) -> (&'static str, String) {
+    let error_summary = summarize_proxy_error(error);
+    let reason = match category {
+        ErrorCategory::ClientAbort => "客户端已断开",
+        ErrorCategory::NonRetryable => "判定为客户端/协议层错误，换源通常无效",
+        ErrorCategory::Retryable => "不可重试",
+    };
+
+    (
+        log_fwd::PROVIDER_FAILED_NO_FAILOVER,
+        format!(
+            "Provider {provider_name} 失败且不进行 failover ({attempted_providers}/{total_providers}): {error_summary}；原因: {reason}"
+        ),
+    )
 }
 
 fn build_terminal_failure_log(
@@ -4368,6 +4446,128 @@ mod tests {
                 ErrorCategory::NonRetryable
             );
         }
+    }
+
+    #[test]
+    fn nginx_html_405_is_retryable_for_multi_provider_failover() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let provider = test_provider_with_type(None);
+        let error = ProxyError::UpstreamError {
+            status: 405,
+            body: Some(
+                r#"<html>
+<head><title>405 Not Allowed</title></head>
+<body>
+<center><h1>405 Not Allowed</h1></center>
+<hr><center>nginx</center>
+</body>
+</html>"#
+                    .to_string(),
+            ),
+        };
+
+        assert_eq!(
+            forwarder.categorize_proxy_error(&error, &provider),
+            ErrorCategory::Retryable,
+            "裸 nginx 405 应继续换源，而不是中止整条 failover 链"
+        );
+    }
+
+    #[test]
+    fn empty_or_edge_405_and_413_are_retryable() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let provider = test_provider_with_type(None);
+
+        assert_eq!(
+            forwarder.categorize_proxy_error(
+                &ProxyError::UpstreamError {
+                    status: 405,
+                    body: None,
+                },
+                &provider,
+            ),
+            ErrorCategory::Retryable
+        );
+        assert_eq!(
+            forwarder.categorize_proxy_error(
+                &ProxyError::UpstreamError {
+                    status: 413,
+                    body: Some(
+                        "<html><head><title>413 Request Entity Too Large</title></head></html>"
+                            .to_string(),
+                    ),
+                },
+                &provider,
+            ),
+            ErrorCategory::Retryable
+        );
+        assert_eq!(
+            forwarder.categorize_proxy_error(
+                &ProxyError::UpstreamError {
+                    status: 501,
+                    body: Some(r#"{"error":{"message":"not implemented"}}"#.to_string()),
+                },
+                &provider,
+            ),
+            ErrorCategory::Retryable
+        );
+    }
+
+    #[test]
+    fn application_json_method_not_allowed_405_stays_non_retryable() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let provider = test_provider_with_type(None);
+        let error = ProxyError::UpstreamError {
+            status: 405,
+            body: Some(
+                r#"{"error":{"code":"method_not_allowed","message":"Method Not Allowed"}}"#
+                    .to_string(),
+            ),
+        };
+
+        assert_eq!(
+            forwarder.categorize_proxy_error(&error, &provider),
+            ErrorCategory::NonRetryable
+        );
+    }
+
+    #[test]
+    fn client_semantic_4xx_remain_non_retryable() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let provider = test_provider_with_type(None);
+
+        for status in [400_u16, 406, 414, 415, 422] {
+            assert_eq!(
+                forwarder.categorize_proxy_error(
+                    &ProxyError::UpstreamError {
+                        status,
+                        body: Some(r#"{"error":{"message":"bad request"}}"#.to_string()),
+                    },
+                    &provider,
+                ),
+                ErrorCategory::NonRetryable,
+                "status {status} should stay non-retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn nonretryable_failure_log_explains_no_failover() {
+        let (code, message) = build_nonretryable_failure_log(
+            "炸弹车 · openai_responses",
+            1,
+            7,
+            &ProxyError::UpstreamError {
+                status: 400,
+                body: Some(r#"{"error":{"message":"invalid schema"}}"#.to_string()),
+            },
+            ErrorCategory::NonRetryable,
+        );
+
+        assert_eq!(code, "FWD-004");
+        assert!(message.contains("不进行 failover"));
+        assert!(message.contains("1/7"));
+        assert!(message.contains("炸弹车"));
     }
 
     #[test]

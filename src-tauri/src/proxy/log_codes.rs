@@ -35,6 +35,8 @@ pub mod fwd {
     pub const PROVIDER_FAILED_RETRY: &str = "FWD-001";
     pub const ALL_PROVIDERS_FAILED: &str = "FWD-002";
     pub const SINGLE_PROVIDER_FAILED: &str = "FWD-003";
+    /// 上游返回了被判定为“换源也没用”的错误，本请求不再继续 failover。
+    pub const PROVIDER_FAILED_NO_FAILOVER: &str = "FWD-004";
 }
 
 /// 故障转移日志码
