@@ -2027,11 +2027,11 @@ mod tests {
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[1]["role"], "assistant");
         assert_eq!(input[2]["role"], "user");
-        assert_eq!(
-            input[0]["content"][0]["text"],
-            "你好",
-            "responses input text should be preserved"
-        );
+        // 经 chat_request_to_responses 转换后，Responses 的纯文本消息 content 仍是字符串，
+        // 而非 [{type:"input_text", text:...}] 数组——断言必须与该结构对齐。
+        assert_eq!(input[0]["content"], "你好", "responses input text should be preserved");
+        assert_eq!(input[1]["content"], "你好，有什么可以帮你？");
+        assert_eq!(input[2]["content"], "再问一个问题");
     }
 
     #[test]
