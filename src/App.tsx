@@ -11,6 +11,7 @@ import {
   CircleStop,
   Copy,
   Database,
+  Eraser,
   Eye,
   EyeOff,
   LayoutDashboard,
@@ -134,15 +135,34 @@ interface DetectedProxy {
   port: number;
 }
 
+interface ModelTestUsage {
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  totalTokens?: number | null;
+  cacheReadInputTokens?: number | null;
+  cacheCreationInputTokens?: number | null;
+  reasoningTokens?: number | null;
+}
+
 interface ModelTestResult {
   ok: boolean;
   status: number;
   latencyMs: number;
   replyText: string;
-  rawBodyPreview: string;
+  rawBody: string;
   error?: string | null;
   pathUsed: string;
   proxyEffective?: string | null;
+  finishReason?: string | null;
+  lengthTruncated: boolean;
+  usage?: ModelTestUsage | null;
+}
+
+type ModelTestRole = "user" | "assistant";
+
+interface ModelTestMessage {
+  role: ModelTestRole;
+  content: string;
 }
 
 interface ModelTestContext {
@@ -931,6 +951,7 @@ function App() {
           ctx={testCtx}
           gatewayRunning={!!status?.running}
           savedProviders={savedConfig.providers}
+          onCopy={copyText}
           onClose={() => setTestCtx(null)}
         />
       )}
@@ -1211,15 +1232,19 @@ function ModelTestModal({
   ctx,
   gatewayRunning,
   savedProviders,
+  onCopy,
   onClose,
 }: {
   ctx: ModelTestContext;
   gatewayRunning: boolean;
   savedProviders: GatewayProvider[];
+  onCopy: (text: string, label: string) => void;
   onClose: () => void;
 }) {
   const model = ctx.provider.models[ctx.modelIndex];
-  const [prompt, setPrompt] = useState("用一句话介绍你自己。");
+  const [history, setHistory] = useState<ModelTestMessage[]>([]);
+  const [draft, setDraft] = useState("用一句话介绍你自己。");
+  const [maxOutputTokensText, setMaxOutputTokensText] = useState("4096");
   const [viaGateway, setViaGateway] = useState<"direct" | "gateway">("direct");
   const [proxyMode, setProxyMode] = useState<ProxyMode>("bypass");
   const [customProxyUrl, setCustomProxyUrl] = useState("");
@@ -1239,6 +1264,12 @@ function ModelTestModal({
     }
   }, []);
 
+  const maxOutputTokens = Number(maxOutputTokensText);
+  const maxTokensValid =
+    Number.isInteger(maxOutputTokens) && maxOutputTokens >= 1 && maxOutputTokens <= 16384;
+  const draftTrimmed = draft.trim();
+  const canSend = !running && maxTokensValid && draftTrimmed.length > 0;
+
   // 判断此模型行是否已在“已保存”配置里（用于判断能否通过网关测试）
   const savedProvider = savedProviders.find((p) => p.id === ctx.provider.id);
   const savedAlias = model.alias.trim();
@@ -1255,11 +1286,35 @@ function ModelTestModal({
   );
   const gatewayAllowed = gatewayRunning && aliasIsSaved && !!savedAlias;
 
+  const updateHistoryMessage = (index: number, content: string) => {
+    setHistory((current) =>
+      current.map((message, i) => (i === index ? { ...message, content } : message)),
+    );
+  };
+  const deleteHistoryMessage = (index: number) => {
+    setHistory((current) => current.filter((_, i) => i !== index));
+  };
+  const clearSession = () => {
+    setHistory([]);
+    setDraft("用一句话介绍你自己。");
+    setResult(null);
+    setShowRaw(false);
+  };
+
   const run = async () => {
     if (!model.upstreamModel.trim()) {
       toast.error("请先填写上游模型名");
       return;
     }
+    if (!maxTokensValid) {
+      toast.error("最大输出 token 必须是 1 到 16384 之间的整数");
+      return;
+    }
+    if (!draftTrimmed) {
+      toast.error("请输入测试消息");
+      return;
+    }
+    const outgoingHistory = [...history, { role: "user" as ModelTestRole, content: draft }];
     setRunning(true);
     setResult(null);
     try {
@@ -1269,23 +1324,32 @@ function ModelTestModal({
           upstreamModel: model.upstreamModel,
           alias: model.alias,
           apiFormat: model.apiFormat,
-          prompt,
+          messages: outgoingHistory,
+          maxOutputTokens: maxOutputTokens,
           viaGateway: viaGateway === "gateway",
           proxyMode,
           customProxyUrl,
         },
       });
       setResult(res);
+      if (res.ok && res.replyText.trim()) {
+        setHistory([
+          ...outgoingHistory,
+          { role: "assistant", content: res.replyText },
+        ]);
+        setDraft("");
+      }
     } catch (error) {
       setResult({
         ok: false,
         status: 0,
         latencyMs: 0,
         replyText: "",
-        rawBodyPreview: "",
+        rawBody: "",
         error: String(error),
         pathUsed: viaGateway,
         proxyEffective: null,
+        lengthTruncated: false,
       });
     } finally {
       setRunning(false);
@@ -1293,10 +1357,19 @@ function ModelTestModal({
   };
 
   const proxyDisabled = viaGateway === "gateway";
+  const usageSummary = result?.usage
+    ? [
+        result.usage.inputTokens != null ? `输入 ${result.usage.inputTokens}` : null,
+        result.usage.outputTokens != null ? `输出 ${result.usage.outputTokens}` : null,
+        result.usage.totalTokens != null ? `合计 ${result.usage.totalTokens}` : null,
+        result.usage.cacheReadInputTokens != null ? `缓存读 ${result.usage.cacheReadInputTokens}` : null,
+        result.usage.reasoningTokens != null ? `推理 ${result.usage.reasoningTokens}` : null,
+      ].filter(Boolean)
+    : [];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <div className="panel max-h-[90vh] w-full max-w-2xl overflow-y-auto p-6 shadow-2xl">
+      <div className="panel max-h-[90vh] w-full max-w-3xl overflow-y-auto p-6 shadow-2xl">
         <div className="mb-4 flex items-start justify-between gap-3">
           <div>
             <h2 className="text-lg font-semibold">模型测试对话</h2>
@@ -1346,18 +1419,97 @@ function ModelTestModal({
             )}
           </div>
 
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+              最大输出 token
+              <input
+                className="input w-32 font-mono"
+                type="number"
+                min={1}
+                max={16384}
+                step={1}
+                value={maxOutputTokensText}
+                onChange={(event) => setMaxOutputTokensText(event.target.value)}
+              />
+            </label>
+            {!maxTokensValid && maxOutputTokensText !== "" && (
+              <span className="text-[11px] text-destructive">范围 1–16384</span>
+            )}
+            <button
+              className="secondary-button ml-auto"
+              disabled={running || history.length === 0}
+              onClick={clearSession}
+              title="清空当前会话"
+            >
+              <Eraser className="h-4 w-4" />
+              清空会话
+            </button>
+          </div>
+
+          {history.length > 0 && (
+            <div className="space-y-3">
+              {history.map((message, index) => (
+                <div key={index} className="rounded-lg border bg-muted/20 p-3">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <span className={cn(
+                      "rounded px-2 py-0.5 text-[11px] font-medium",
+                      message.role === "assistant" ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300" : "bg-primary/10 text-primary",
+                    )}>
+                      {message.role === "assistant" ? "助手" : "用户"}
+                    </span>
+                    <div className="flex items-center gap-1">
+                      {message.role === "assistant" && (
+                        <button
+                          className="icon-button"
+                          onClick={() => onCopy(message.content, "助手回复")}
+                          title="复制该回复"
+                          aria-label="复制该回复"
+                          disabled={running}
+                        >
+                          <Copy className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      <button
+                        className="icon-button text-destructive"
+                        onClick={() => deleteHistoryMessage(index)}
+                        title="删除该条"
+                        aria-label="删除该条"
+                        disabled={running}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                  <textarea
+                    className="input min-h-16 w-full resize-y text-xs leading-5"
+                    value={message.content}
+                    onChange={(event) => updateHistoryMessage(index, event.target.value)}
+                    disabled={running}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+
           <div>
-            <div className="mb-1 text-xs font-medium text-muted-foreground">消息</div>
+            <div className="mb-1 text-xs font-medium text-muted-foreground">下一条消息</div>
             <textarea
               className="input min-h-24 w-full resize-y"
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              disabled={running}
+              onKeyDown={(event) => {
+                if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && canSend) {
+                  event.preventDefault();
+                  void run();
+                }
+              }}
             />
           </div>
 
           <div className="flex justify-end gap-2">
             <button className="secondary-button" onClick={onClose}>关闭</button>
-            <button className="primary-button" disabled={running} onClick={() => void run()}>
+            <button className="primary-button" disabled={!canSend} onClick={() => void run()}>
               {running ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
               发送
             </button>
@@ -1376,28 +1528,55 @@ function ModelTestModal({
                 <span>· {result.latencyMs}ms</span>
                 <span>· {result.pathUsed === "gateway" ? "通过网关" : "直连"}</span>
                 <span>· {result.proxyEffective ? `代理 ${result.proxyEffective}` : "无代理"}</span>
+                {result.finishReason && <span>· 停止原因 {result.finishReason}</span>}
+                {usageSummary.length > 0 && <span>· {usageSummary.join(" · ")}</span>}
               </div>
               <div className="p-3">
+                {result.lengthTruncated && (
+                  <div className="mb-3 rounded border border-amber-300 bg-amber-50 p-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+                    输出因长度上限被截断（{result.finishReason ?? "length"}），可调高“最大输出 token”后重试。
+                  </div>
+                )}
                 {result.error && (
                   <div className="mb-3 rounded border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
                     {result.error}
                   </div>
                 )}
                 {result.replyText && (
-                  <div className="mb-2 text-xs font-medium text-muted-foreground">回复</div>
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <div className="text-xs font-medium text-muted-foreground">回复</div>
+                    <button
+                      className="icon-button"
+                      onClick={() => onCopy(result.replyText, "回复")}
+                      title="复制回复"
+                      aria-label="复制回复"
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
                 )}
                 {result.replyText && (
                   <div className="max-h-56 overflow-y-auto whitespace-pre-wrap rounded bg-muted p-3 text-xs leading-5">
                     {result.replyText}
                   </div>
                 )}
-                {result.rawBodyPreview && (
+                {result.rawBody && (
                   <div className="mt-3">
-                    <button className="text-[11px] text-muted-foreground underline" onClick={() => setShowRaw(!showRaw)}>
-                      {showRaw ? "隐藏原始响应" : "显示原始响应"}
-                    </button>
+                    <div className="flex items-center justify-between gap-2">
+                      <button className="text-[11px] text-muted-foreground underline" onClick={() => setShowRaw(!showRaw)}>
+                        {showRaw ? "隐藏原始响应" : "显示原始响应"}
+                      </button>
+                      <button
+                        className="icon-button"
+                        onClick={() => onCopy(result.rawBody, "原始响应")}
+                        title="复制完整原始响应"
+                        aria-label="复制完整原始响应"
+                      >
+                        <Copy className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                     {showRaw && (
-                      <pre className="mt-2 max-h-56 overflow-auto rounded bg-muted p-2 font-mono text-[10px] leading-4">{result.rawBodyPreview}</pre>
+                      <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">{result.rawBody}</pre>
                     )}
                   </div>
                 )}
