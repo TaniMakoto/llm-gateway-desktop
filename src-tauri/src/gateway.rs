@@ -1976,7 +1976,7 @@ mod tests {
         ]
     }
 
-    fn test_messages_value_of(payload: &Value, field: &str) -> &Vec<Value> {
+    fn test_messages_value_of<'a>(payload: &'a Value, field: &str) -> &'a Vec<Value> {
         payload
             .get(field)
             .and_then(Value::as_array)
