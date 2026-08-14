@@ -2101,7 +2101,7 @@ function ModelTestModal({
 
         {/* 可折叠配置面板 */}
         {showConfig && (
-          <div className="space-y-4 border-b bg-muted/20 p-4">
+          <div className="max-h-[45vh] shrink-0 space-y-4 overflow-y-auto border-b bg-muted/20 p-4">
             <div>
               <div className="mb-2 text-xs font-medium text-muted-foreground">
                 请求路径
@@ -2217,7 +2217,10 @@ function ModelTestModal({
         )}
 
         {/* 对话流 */}
-        <div ref={scrollRef} className="flex-1 space-y-4 overflow-y-auto p-4">
+        <div
+          ref={scrollRef}
+          className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4"
+        >
           {history.length === 0 && !running && (
             <div className="py-10 text-center text-xs text-muted-foreground">
               输入消息后按 Cmd/Ctrl + Enter 发送，回复会渲染 Markdown。
