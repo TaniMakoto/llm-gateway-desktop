@@ -152,6 +152,7 @@ interface ModelTestResult {
   latencyMs: number;
   replyText: string;
   rawBody: string;
+  rawRequest?: string;
   error?: string | null;
   pathUsed: string;
   proxyEffective?: string | null;
@@ -165,6 +166,10 @@ type ModelTestRole = "user" | "assistant";
 interface ModelTestMessage {
   role: ModelTestRole;
   content: string;
+  /** 当次发送给上游/网关的整段请求 payload（用户与助手消息共享同一次调用）。 */
+  rawRequest?: string;
+  /** 助手消息：当次返回的原始响应体。 */
+  rawResponse?: string;
 }
 
 interface ModelTestContext {
@@ -1911,7 +1916,6 @@ function ModelTestModal({
   const [result, setResult] = useState<ModelTestResult | null>(null);
   const [showConfig, setShowConfig] = useState(false);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
-  const [showRaw, setShowRaw] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const initialLoad = useRef(false);
 
@@ -1971,7 +1975,6 @@ function ModelTestModal({
     setDraft("用一句话介绍你自己。");
     setResult(null);
     setEditingIndex(null);
-    setShowRaw(false);
   };
 
   const run = async () => {
@@ -2009,9 +2012,16 @@ function ModelTestModal({
       });
       setResult(res);
       if (res.ok && res.replyText.trim()) {
+        const rawRequest = res.rawRequest ?? "";
         setHistory([
-          ...outgoingHistory,
-          { role: "assistant", content: res.replyText },
+          ...history,
+          { role: "user", content: draft, rawRequest },
+          {
+            role: "assistant",
+            content: res.replyText,
+            rawRequest,
+            rawResponse: res.rawBody,
+          },
         ]);
         setDraft("");
       }
@@ -2229,8 +2239,6 @@ function ModelTestModal({
           {history.map((message, index) => {
             const isUser = message.role === "user";
             const isEditing = editingIndex === index;
-            const isLastAssistant =
-              message.role === "assistant" && index === history.length - 1;
             return (
               <div
                 key={index}
@@ -2315,27 +2323,28 @@ function ModelTestModal({
                   ) : (
                     <Markdown content={message.content} />
                   )}
-                  {/* 最新一条助手回复附带原始响应折叠区 */}
-                  {isLastAssistant && result?.ok && result.rawBody && (
-                    <div className="mt-2 border-t border-border/60 pt-2">
-                      <button
-                        className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
-                        onClick={() => setShowRaw(!showRaw)}
-                      >
-                        <ChevronRight
-                          className={cn(
-                            "h-3 w-3 transition",
-                            showRaw && "rotate-90",
-                          )}
-                        />
-                        {showRaw ? "隐藏原始响应" : "显示原始响应"}
-                      </button>
-                      {showRaw && (
-                        <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
-                          {result.rawBody}
-                        </pre>
-                      )}
-                    </div>
+                  {/* 每条气泡各自的原始请求/响应，默认收起。 */}
+                  {isUser && message.rawRequest && (
+                    <details className="mt-2 border-t border-border/60 pt-2">
+                      <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                        <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                        原始请求
+                      </summary>
+                      <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
+                        {message.rawRequest}
+                      </pre>
+                    </details>
+                  )}
+                  {!isUser && message.rawResponse && (
+                    <details className="mt-2 border-t border-border/60 pt-2">
+                      <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                        <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                        原始响应
+                      </summary>
+                      <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
+                        {message.rawResponse}
+                      </pre>
+                    </details>
                   )}
                 </div>
               </div>

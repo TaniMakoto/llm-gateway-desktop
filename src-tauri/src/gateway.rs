@@ -1035,6 +1035,8 @@ pub struct GatewayModelTestResult {
     pub latency_ms: u64,
     pub reply_text: String,
     pub raw_body: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub raw_request: String,
     pub error: Option<String>,
     pub path_used: String,
     pub proxy_effective: Option<String>,
@@ -1112,6 +1114,11 @@ fn pretty_raw_body(text: &str) -> String {
         .ok()
         .and_then(|value| serde_json::to_string_pretty(&value).ok())
         .unwrap_or_else(|| text.to_string())
+}
+
+/// 把即将发送的请求 payload 格式化为可读的 JSON 字符串。
+fn pretty_json_value(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn json_u64(value: Option<&Value>) -> Option<u64> {
@@ -1426,7 +1433,7 @@ fn join_url(base: &str, path: &str) -> String {
 async fn run_direct_test(
     request: &GatewayModelTestRequest,
     client: &reqwest::Client,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String, String), String> {
     let url = join_url(&request.provider.base_url, endpoint_path(request.api_format));
     let payload = build_test_payload(
         request.api_format,
@@ -1434,6 +1441,7 @@ async fn run_direct_test(
         &request.messages,
         request.max_output_tokens,
     )?;
+    let raw_request = pretty_json_value(&payload);
 
     let mut req = client.post(&url).json(&payload);
 
@@ -1477,14 +1485,14 @@ async fn run_direct_test(
     let response = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
     let status = response.status().as_u16();
     let text = read_response_text(response).await?;
-    Ok((status, text))
+    Ok((status, text, raw_request))
 }
 
 async fn run_gateway_test(
     state: &AppState,
     request: &GatewayModelTestRequest,
     client: &reqwest::Client,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String, String), String> {
     let config = load_config(&state.db).map_err(|e| e.to_string())?;
     let alias = if request.alias.trim().is_empty() {
         request.upstream_model.trim()
@@ -1509,6 +1517,7 @@ async fn run_gateway_test(
         &request.messages,
         request.max_output_tokens,
     )?;
+    let raw_request = pretty_json_value(&payload);
 
     let mut req = client.post(&url).json(&payload);
     let local_key = config.local_api_key.trim();
@@ -1526,7 +1535,7 @@ async fn run_gateway_test(
     let response = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
     let status = response.status().as_u16();
     let text = read_response_text(response).await?;
-    Ok((status, text))
+    Ok((status, text, raw_request))
 }
 
 fn empty_test_result(
@@ -1541,6 +1550,7 @@ fn empty_test_result(
         latency_ms,
         reply_text: String::new(),
         raw_body: String::new(),
+        raw_request: String::new(),
         error,
         path_used: path_used.to_string(),
         proxy_effective,
@@ -1589,7 +1599,7 @@ pub async fn test_gateway_model(
     let latency_ms = start.elapsed().as_millis() as u64;
 
     match result {
-        Ok((status, text)) => {
+        Ok((status, text, raw_request)) => {
             let ok = (200..300).contains(&status);
             let raw_body = pretty_raw_body(&text);
             let body: Option<Value> = serde_json::from_str(&text).ok();
@@ -1614,6 +1624,7 @@ pub async fn test_gateway_model(
                 latency_ms,
                 reply_text: parsed.reply_text,
                 raw_body,
+                raw_request,
                 error,
                 path_used: path_used.to_string(),
                 proxy_effective: masked_proxy,
