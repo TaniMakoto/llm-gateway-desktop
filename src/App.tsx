@@ -1913,6 +1913,7 @@ function ModelTestModal({
   const [maxOutputTokensText, setMaxOutputTokensText] = useState("4096");
   const [thinkingLevel, setThinkingLevel] =
     useState<TestThinkingLevel>("disabled");
+  const [systemPrompt, setSystemPrompt] = useState("");
   const [viaGateway, setViaGateway] = useState<"direct" | "gateway">("direct");
   const [proxyMode, setProxyMode] = useState<ProxyMode>("bypass");
   const [customProxyUrl, setCustomProxyUrl] = useState("");
@@ -2010,6 +2011,7 @@ function ModelTestModal({
           messages: outgoingHistory,
           maxOutputTokens: maxOutputTokens,
           thinkingLevel,
+          systemPrompt: systemPrompt.trim() || undefined,
           viaGateway: viaGateway === "gateway",
           proxyMode,
           customProxyUrl,
@@ -2117,6 +2119,18 @@ function ModelTestModal({
         {/* 可折叠配置面板 */}
         {showConfig && (
           <div className="max-h-[45vh] shrink-0 space-y-4 overflow-y-auto border-b bg-muted/20 p-4">
+            <div>
+              <div className="mb-2 text-xs font-medium text-muted-foreground">
+                系统提示词
+              </div>
+              <textarea
+                className="input min-h-16 w-full resize-y text-xs leading-5"
+                value={systemPrompt}
+                onChange={(event) => setSystemPrompt(event.target.value)}
+                disabled={running}
+                placeholder="可选。留空则不注入 system 消息。"
+              />
+            </div>
             <div>
               <div className="mb-2 text-xs font-medium text-muted-foreground">
                 请求路径

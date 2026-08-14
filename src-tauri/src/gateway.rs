@@ -1036,6 +1036,8 @@ pub struct GatewayModelTestRequest {
     pub custom_proxy_url: String,
     #[serde(default)]
     pub thinking_level: GatewayTestThinkingLevel,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1365,6 +1367,23 @@ fn chat_messages_value(messages: &[GatewayModelTestMessage]) -> Value {
     )
 }
 
+/// 同 chat_messages_value，但可选地在最前面插一条 system 消息（OpenAI Chat/Responses 风格）。
+fn chat_messages_value_with_system(
+    messages: &[GatewayModelTestMessage],
+    system: Option<&str>,
+) -> Value {
+    let mut value = chat_messages_value(messages);
+    if let Some(text) = system {
+        if let Value::Array(arr) = &mut value {
+            arr.insert(
+                0,
+                json!({ "role": "system", "content": text }),
+            );
+        }
+    }
+    value
+}
+
 fn build_test_client(
     mode: GatewayTestProxyMode,
     custom_proxy_url: &str,
@@ -1409,12 +1428,16 @@ fn build_test_payload(
     messages: &[GatewayModelTestMessage],
     max_output_tokens: u32,
     thinking_level: GatewayTestThinkingLevel,
+    system_prompt: Option<&str>,
 ) -> Result<Value, String> {
+    let system = system_prompt
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
     match format {
         GatewayApiFormat::OpenaiChat => {
             let mut payload = json!({
                 "model": model,
-                "messages": chat_messages_value(messages),
+                "messages": chat_messages_value_with_system(messages, system),
                 "max_tokens": max_output_tokens,
                 "stream": false,
             });
@@ -1426,7 +1449,7 @@ fn build_test_payload(
         GatewayApiFormat::OpenaiResponses => {
             let mut chat_shaped = json!({
                 "model": model,
-                "messages": chat_messages_value(messages),
+                "messages": chat_messages_value_with_system(messages, system),
                 "max_tokens": max_output_tokens,
                 "stream": false,
             });
@@ -1443,6 +1466,9 @@ fn build_test_payload(
                 "max_tokens": max_output_tokens,
                 "stream": false,
             });
+            if let Some(text) = system {
+                payload["system"] = json!(text);
+            }
             match thinking_level {
                 GatewayTestThinkingLevel::Disabled => {
                     payload["thinking"] = json!({ "type": "disabled" });
@@ -1509,6 +1535,7 @@ async fn run_direct_test(
         &request.messages,
         request.max_output_tokens,
         request.thinking_level,
+        request.system_prompt.as_deref(),
     )?;
     let raw_request = pretty_json_value(&payload);
 
@@ -1586,6 +1613,7 @@ async fn run_gateway_test(
         &request.messages,
         request.max_output_tokens,
         request.thinking_level,
+        request.system_prompt.as_deref(),
     )?;
     let raw_request = pretty_json_value(&payload);
 
@@ -2073,6 +2101,7 @@ mod tests {
             &messages,
             4096,
             GatewayTestThinkingLevel::Disabled,
+            None,
         )
         .expect("chat payload");
         assert_eq!(payload["model"], "model-a");
@@ -2097,6 +2126,7 @@ mod tests {
             &messages,
             4096,
             GatewayTestThinkingLevel::Disabled,
+            None,
         )
         .expect("responses payload");
         assert_eq!(payload["model"], "model-a");
@@ -2126,6 +2156,7 @@ mod tests {
             &messages,
             4096,
             GatewayTestThinkingLevel::Disabled,
+            None,
         )
         .expect("anthropic payload");
         assert_eq!(payload["model"], "model-a");
@@ -2150,6 +2181,7 @@ mod tests {
             proxy_mode: GatewayTestProxyMode::Bypass,
             custom_proxy_url: String::new(),
             thinking_level: GatewayTestThinkingLevel::Disabled,
+            system_prompt: None,
         }
     }
 
@@ -2357,6 +2389,7 @@ mod tests {
             &messages,
             4096,
             GatewayTestThinkingLevel::High,
+            None,
         )
         .expect("chat payload builds");
         assert_eq!(payload["reasoning_effort"], json!("high"));
@@ -2367,6 +2400,7 @@ mod tests {
             &messages,
             4096,
             GatewayTestThinkingLevel::Disabled,
+            None,
         )
         .expect("chat payload builds");
         assert!(
@@ -2384,6 +2418,7 @@ mod tests {
             &messages,
             4096,
             GatewayTestThinkingLevel::Medium,
+            None,
         )
         .expect("anthropic payload builds");
         assert_eq!(payload["thinking"]["type"], json!("enabled"));
@@ -2395,9 +2430,55 @@ mod tests {
             &messages,
             4096,
             GatewayTestThinkingLevel::Disabled,
+            None,
         )
         .expect("anthropic payload builds");
         assert_eq!(disabled["thinking"]["type"], json!("disabled"));
         assert!(disabled["thinking"].get("budget_tokens").is_none());
+    }
+
+    #[test]
+    fn system_prompt_injected_per_protocol() {
+        let messages = vec![user_message("hi")];
+        let system = Some("you are concise");
+
+        // OpenAI Chat：system 作为 messages 首条。
+        let chat = build_test_payload(
+            GatewayApiFormat::OpenaiChat,
+            "model-a",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            system,
+        )
+        .expect("chat payload builds");
+        assert_eq!(chat["messages"][0]["role"], json!("system"));
+        assert_eq!(chat["messages"][0]["content"], json!("you are concise"));
+        assert_eq!(chat["messages"][1]["role"], json!("user"));
+
+        // Anthropic：system 走顶层字段，不在 messages 里。
+        let anthropic = build_test_payload(
+            GatewayApiFormat::Anthropic,
+            "claude-model",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            system,
+        )
+        .expect("anthropic payload builds");
+        assert_eq!(anthropic["system"], json!("you are concise"));
+        assert_eq!(anthropic["messages"][0]["role"], json!("user"));
+
+        // 空/空白 system 不注入。
+        let blank = build_test_payload(
+            GatewayApiFormat::Anthropic,
+            "claude-model",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            Some("   "),
+        )
+        .expect("anthropic payload builds");
+        assert!(blank.get("system").is_none());
     }
 }
