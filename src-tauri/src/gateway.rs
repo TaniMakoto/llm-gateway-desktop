@@ -959,6 +959,43 @@ pub enum GatewayTestProxyMode {
     Custom,
 }
 
+/// 测试时注入的思考/推理档位。后端按目标协议翻译为各自字段：
+/// - OpenAI Chat / Responses：`reasoning_effort`（low/medium/high），关闭则不写。
+/// - Anthropic：`thinking`（enabled + budget_tokens，按 max_output_tokens 比例映射），关闭为 disabled。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayTestThinkingLevel {
+    #[default]
+    Disabled,
+    Low,
+    Medium,
+    High,
+}
+
+impl GatewayTestThinkingLevel {
+    /// OpenAI 风格 reasoning_effort 值；关闭档返回 None（不写该字段）。
+    fn reasoning_effort(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => None,
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+        }
+    }
+
+    /// Anthropic thinking budget_tokens，按 max_output_tokens 比例映射（低 25% / 中 50% / 高 75%）。
+    fn anthropic_budget(self, max_output_tokens: u32) -> Option<u32> {
+        let ratio = match self {
+            Self::Disabled => return None,
+            Self::Low => 0.25,
+            Self::Medium => 0.50,
+            Self::High => 0.75,
+        };
+        let budget = ((max_output_tokens as f64) * ratio).floor() as u32;
+        Some(budget.max(1))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayModelTestRole {
@@ -997,6 +1034,8 @@ pub struct GatewayModelTestRequest {
     pub proxy_mode: GatewayTestProxyMode,
     #[serde(default)]
     pub custom_proxy_url: String,
+    #[serde(default)]
+    pub thinking_level: GatewayTestThinkingLevel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1369,29 +1408,58 @@ fn build_test_payload(
     model: &str,
     messages: &[GatewayModelTestMessage],
     max_output_tokens: u32,
+    thinking_level: GatewayTestThinkingLevel,
 ) -> Result<Value, String> {
     match format {
-        GatewayApiFormat::OpenaiChat => Ok(json!({
-            "model": model,
-            "messages": chat_messages_value(messages),
-            "max_tokens": max_output_tokens,
-            "stream": false,
-        })),
-        GatewayApiFormat::OpenaiResponses => {
-            let chat_shaped = json!({
+        GatewayApiFormat::OpenaiChat => {
+            let mut payload = json!({
                 "model": model,
                 "messages": chat_messages_value(messages),
                 "max_tokens": max_output_tokens,
                 "stream": false,
             });
-            crate::gateway_chat::chat_request_to_responses(chat_shaped).map_err(|error| error.to_string())
+            if let Some(effort) = thinking_level.reasoning_effort() {
+                payload["reasoning_effort"] = json!(effort);
+            }
+            Ok(payload)
         }
-        GatewayApiFormat::Anthropic => Ok(json!({
-            "model": model,
-            "messages": chat_messages_value(messages),
-            "max_tokens": max_output_tokens,
-            "stream": false,
-        })),
+        GatewayApiFormat::OpenaiResponses => {
+            let mut chat_shaped = json!({
+                "model": model,
+                "messages": chat_messages_value(messages),
+                "max_tokens": max_output_tokens,
+                "stream": false,
+            });
+            if let Some(effort) = thinking_level.reasoning_effort() {
+                chat_shaped["reasoning_effort"] = json!(effort);
+            }
+            crate::gateway_chat::chat_request_to_responses(chat_shaped)
+                .map_err(|error| error.to_string())
+        }
+        GatewayApiFormat::Anthropic => {
+            let mut payload = json!({
+                "model": model,
+                "messages": chat_messages_value(messages),
+                "max_tokens": max_output_tokens,
+                "stream": false,
+            });
+            match thinking_level {
+                GatewayTestThinkingLevel::Disabled => {
+                    payload["thinking"] = json!({ "type": "disabled" });
+                }
+                _ => {
+                    if let Some(budget) =
+                        thinking_level.anthropic_budget(max_output_tokens)
+                    {
+                        payload["thinking"] = json!({
+                            "type": "enabled",
+                            "budget_tokens": budget
+                        });
+                    }
+                }
+            }
+            Ok(payload)
+        }
     }
 }
 
@@ -1440,6 +1508,7 @@ async fn run_direct_test(
         &request.upstream_model,
         &request.messages,
         request.max_output_tokens,
+        request.thinking_level,
     )?;
     let raw_request = pretty_json_value(&payload);
 
@@ -1516,6 +1585,7 @@ async fn run_gateway_test(
         alias,
         &request.messages,
         request.max_output_tokens,
+        request.thinking_level,
     )?;
     let raw_request = pretty_json_value(&payload);
 
@@ -2076,6 +2146,7 @@ mod tests {
             via_gateway: false,
             proxy_mode: GatewayTestProxyMode::Bypass,
             custom_proxy_url: String::new(),
+            thinking_level: GatewayTestThinkingLevel::Disabled,
         }
     }
 
@@ -2238,5 +2309,92 @@ mod tests {
         assert_eq!(extract_structured_error(&body).as_deref(), Some("oops"));
 
         assert!(extract_structured_error(&json!({})).is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_mapping() {
+        assert_eq!(GatewayTestThinkingLevel::Disabled.reasoning_effort(), None);
+        assert_eq!(GatewayTestThinkingLevel::Low.reasoning_effort(), Some("low"));
+        assert_eq!(
+            GatewayTestThinkingLevel::Medium.reasoning_effort(),
+            Some("medium")
+        );
+        assert_eq!(GatewayTestThinkingLevel::High.reasoning_effort(), Some("high"));
+    }
+
+    #[test]
+    fn anthropic_budget_maps_to_ratio_of_max_tokens() {
+        // 低 25% / 中 50% / 高 75%，且至少为 1。
+        assert_eq!(
+            GatewayTestThinkingLevel::Low.anthropic_budget(4096),
+            Some(1024)
+        );
+        assert_eq!(
+            GatewayTestThinkingLevel::Medium.anthropic_budget(4096),
+            Some(2048)
+        );
+        assert_eq!(
+            GatewayTestThinkingLevel::High.anthropic_budget(4096),
+            Some(3072)
+        );
+        assert_eq!(
+            GatewayTestThinkingLevel::Disabled.anthropic_budget(4096),
+            None
+        );
+        // 小 max_tokens 也要兜底为 1。
+        assert_eq!(GatewayTestThinkingLevel::Low.anthropic_budget(1), Some(1));
+    }
+
+    #[test]
+    fn chat_payload_injects_reasoning_effort() {
+        let messages = vec![user_message("hi")];
+        let payload = build_test_payload(
+            GatewayApiFormat::OpenaiChat,
+            "model-a",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::High,
+        )
+        .expect("chat payload builds");
+        assert_eq!(payload["reasoning_effort"], json!("high"));
+
+        let disabled = build_test_payload(
+            GatewayApiFormat::OpenaiChat,
+            "model-a",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+        )
+        .expect("chat payload builds");
+        assert!(
+            disabled.get("reasoning_effort").is_none(),
+            "disabled must not emit reasoning_effort"
+        );
+    }
+
+    #[test]
+    fn anthropic_payload_injects_thinking_block() {
+        let messages = vec![user_message("hi")];
+        let payload = build_test_payload(
+            GatewayApiFormat::Anthropic,
+            "claude-model",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Medium,
+        )
+        .expect("anthropic payload builds");
+        assert_eq!(payload["thinking"]["type"], json!("enabled"));
+        assert_eq!(payload["thinking"]["budget_tokens"], json!(2048));
+
+        let disabled = build_test_payload(
+            GatewayApiFormat::Anthropic,
+            "claude-model",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+        )
+        .expect("anthropic payload builds");
+        assert_eq!(disabled["thinking"]["type"], json!("disabled"));
+        assert!(disabled["thinking"].get("budget_tokens").is_none());
     }
 }

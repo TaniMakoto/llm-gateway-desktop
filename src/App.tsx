@@ -163,6 +163,8 @@ interface ModelTestResult {
 
 type ModelTestRole = "user" | "assistant";
 
+type TestThinkingLevel = "disabled" | "low" | "medium" | "high";
+
 interface ModelTestMessage {
   role: ModelTestRole;
   content: string;
@@ -1909,6 +1911,8 @@ function ModelTestModal({
   const [history, setHistory] = useState<ModelTestMessage[]>([]);
   const [draft, setDraft] = useState("用一句话介绍你自己。");
   const [maxOutputTokensText, setMaxOutputTokensText] = useState("4096");
+  const [thinkingLevel, setThinkingLevel] =
+    useState<TestThinkingLevel>("disabled");
   const [viaGateway, setViaGateway] = useState<"direct" | "gateway">("direct");
   const [proxyMode, setProxyMode] = useState<ProxyMode>("bypass");
   const [customProxyUrl, setCustomProxyUrl] = useState("");
@@ -2005,6 +2009,7 @@ function ModelTestModal({
           apiFormat: model.apiFormat,
           messages: outgoingHistory,
           maxOutputTokens: maxOutputTokens,
+          thinkingLevel,
           viaGateway: viaGateway === "gateway",
           proxyMode,
           customProxyUrl,
@@ -2208,6 +2213,39 @@ function ModelTestModal({
                   }
                 />
               </label>
+              <div className="flex flex-col gap-1">
+                <span className="text-xs text-muted-foreground">思考等级</span>
+                <div className="grid grid-cols-4 gap-1 rounded-lg bg-muted p-1">
+                  <SegmentedOption
+                    name="thinkingLevel"
+                    checked={thinkingLevel === "disabled"}
+                    onChange={() => setThinkingLevel("disabled")}
+                  >
+                    关闭
+                  </SegmentedOption>
+                  <SegmentedOption
+                    name="thinkingLevel"
+                    checked={thinkingLevel === "low"}
+                    onChange={() => setThinkingLevel("low")}
+                  >
+                    低
+                  </SegmentedOption>
+                  <SegmentedOption
+                    name="thinkingLevel"
+                    checked={thinkingLevel === "medium"}
+                    onChange={() => setThinkingLevel("medium")}
+                  >
+                    中
+                  </SegmentedOption>
+                  <SegmentedOption
+                    name="thinkingLevel"
+                    checked={thinkingLevel === "high"}
+                    onChange={() => setThinkingLevel("high")}
+                  >
+                    高
+                  </SegmentedOption>
+                </div>
+              </div>
               {!maxTokensValid && maxOutputTokensText !== "" && (
                 <span className="text-[11px] text-destructive">
                   范围 1–16384
