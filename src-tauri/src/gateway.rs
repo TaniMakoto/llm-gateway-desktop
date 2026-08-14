@@ -2072,6 +2072,7 @@ mod tests {
             "model-a",
             &messages,
             4096,
+            GatewayTestThinkingLevel::Disabled,
         )
         .expect("chat payload");
         assert_eq!(payload["model"], "model-a");
@@ -2095,6 +2096,7 @@ mod tests {
             "model-a",
             &messages,
             4096,
+            GatewayTestThinkingLevel::Disabled,
         )
         .expect("responses payload");
         assert_eq!(payload["model"], "model-a");
@@ -2123,6 +2125,7 @@ mod tests {
             "model-a",
             &messages,
             4096,
+            GatewayTestThinkingLevel::Disabled,
         )
         .expect("anthropic payload");
         assert_eq!(payload["model"], "model-a");
