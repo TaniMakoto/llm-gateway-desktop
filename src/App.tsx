@@ -18,6 +18,7 @@ import {
   Maximize2,
   Minus,
   Network,
+  Pencil,
   Play,
   Plus,
   RadioTower,
@@ -35,6 +36,7 @@ import {
   Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Markdown } from "@/components/markdown";
 
 type ApiFormat = "openai_chat" | "openai_responses" | "anthropic";
 type Tab = "dashboard" | "providers" | "routes" | "settings";
@@ -1907,7 +1909,10 @@ function ModelTestModal({
   const [customProxyUrl, setCustomProxyUrl] = useState("");
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<ModelTestResult | null>(null);
+  const [showConfig, setShowConfig] = useState(false);
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [showRaw, setShowRaw] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const initialLoad = useRef(false);
 
   useEffect(() => {
@@ -1920,6 +1925,12 @@ function ModelTestModal({
         .catch(() => {});
     }
   }, []);
+
+  // 对话流新增内容后自动滚到底部。
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [history, running, result]);
 
   const maxOutputTokens = Number(maxOutputTokensText);
   const maxTokensValid =
@@ -1959,6 +1970,7 @@ function ModelTestModal({
     setHistory([]);
     setDraft("用一句话介绍你自己。");
     setResult(null);
+    setEditingIndex(null);
     setShowRaw(false);
   };
 
@@ -2048,11 +2060,12 @@ function ModelTestModal({
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <div className="panel max-h-[90vh] w-full max-w-3xl overflow-y-auto p-6 shadow-2xl">
-        <div className="mb-4 flex items-start justify-between gap-3">
-          <div>
+      <div className="panel flex max-h-[90vh] w-full max-w-3xl flex-col shadow-2xl">
+        {/* 标题栏 */}
+        <div className="flex items-start justify-between gap-3 border-b p-4">
+          <div className="min-w-0">
             <h2 className="text-lg font-semibold">模型测试对话</h2>
-            <p className="mt-1 text-xs text-muted-foreground">
+            <p className="mt-1 truncate text-xs text-muted-foreground">
               {ctx.providerName} · 上游模型{" "}
               <code className="font-mono">{model.upstreamModel || "(空)"}</code>{" "}
               · 协议 {formatLabels[model.apiFormat]}
@@ -2064,142 +2077,188 @@ function ModelTestModal({
               ) : null}
             </p>
           </div>
-          <button className="icon-button" onClick={onClose}>
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-
-        <div className="space-y-4">
-          <div className="rounded-xl border bg-muted/20 p-4">
-            <div className="mb-3 text-sm font-medium">请求路径</div>
-            <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted p-1">
-              <SegmentedOption
-                name="viaGateway"
-                checked={viaGateway === "direct"}
-                onChange={() => setViaGateway("direct")}
-              >
-                直连上游
-              </SegmentedOption>
-              <SegmentedOption
-                name="viaGateway"
-                checked={viaGateway === "gateway"}
-                disabled={!gatewayAllowed}
-                onChange={() => setViaGateway("gateway")}
-              >
-                通过本地网关
-              </SegmentedOption>
-            </div>
-            {!gatewayAllowed && (
-              <div className="mt-2.5 text-[11px] leading-5 text-muted-foreground">
-                {gatewayRunning
-                  ? "此模型条目尚未保存到运行配置中，无法通过网关测试。"
-                  : "网关未启动，无法通过网关测试。"}
-              </div>
-            )}
-          </div>
-
-          <div
-            className={cn(
-              "rounded-xl border bg-muted/20 p-4",
-              proxyDisabled && "opacity-60",
-            )}
-          >
-            <div className="mb-3 flex flex-wrap items-center gap-2">
-              <Shield className="h-4 w-4 text-muted-foreground" />
-              <span className="text-sm font-medium">出口方式</span>
-              {proxyDisabled && (
-                <span className="text-[11px] text-muted-foreground">
-                  通过网关时由网关全局设置决定
-                </span>
-              )}
-            </div>
-            <div className="grid grid-cols-3 gap-1 rounded-lg bg-muted p-1">
-              <SegmentedOption
-                name="proxyMode"
-                checked={!proxyDisabled && proxyMode === "bypass"}
-                disabled={proxyDisabled}
-                onChange={() => setProxyMode("bypass")}
-              >
-                直接连接
-              </SegmentedOption>
-              <SegmentedOption
-                name="proxyMode"
-                checked={!proxyDisabled && proxyMode === "follow_global"}
-                disabled={proxyDisabled}
-                onChange={() => setProxyMode("follow_global")}
-              >
-                跟随全局
-              </SegmentedOption>
-              <SegmentedOption
-                name="proxyMode"
-                checked={!proxyDisabled && proxyMode === "custom"}
-                disabled={proxyDisabled}
-                onChange={() => setProxyMode("custom")}
-              >
-                临时代理
-              </SegmentedOption>
-            </div>
-            {!proxyDisabled && proxyMode === "bypass" && (
-              <p className="mt-2.5 text-[11px] leading-5 text-muted-foreground">
-                本次测试强制直连上游，不使用全局设置或系统环境变量中的代理。
-              </p>
-            )}
-            {proxyMode === "custom" && !proxyDisabled && (
-              <input
-                className="input mt-3 w-full font-mono"
-                value={customProxyUrl}
-                onChange={(event) => setCustomProxyUrl(event.target.value)}
-                placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
-              />
-            )}
-          </div>
-
-          <div className="flex flex-wrap items-end gap-3">
-            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-              最大输出 token
-              <input
-                className="input w-32 font-mono"
-                type="number"
-                min={1}
-                max={16384}
-                step={1}
-                value={maxOutputTokensText}
-                onChange={(event) => setMaxOutputTokensText(event.target.value)}
-              />
-            </label>
-            {!maxTokensValid && maxOutputTokensText !== "" && (
-              <span className="text-[11px] text-destructive">范围 1–16384</span>
-            )}
+          <div className="flex items-center gap-1">
             <button
-              className="secondary-button ml-auto"
-              disabled={running || history.length === 0}
-              onClick={clearSession}
-              title="清空当前会话"
+              className={cn("secondary-button", showConfig && "bg-muted")}
+              onClick={() => setShowConfig(!showConfig)}
+              title="请求路径 / 出口方式 / token"
+              aria-label="请求路径 / 出口方式 / token"
             >
-              <Eraser className="h-4 w-4" />
-              清空会话
+              <Settings className="h-4 w-4" />
+              配置
+              <ChevronDown
+                className={cn(
+                  "h-3.5 w-3.5 transition",
+                  showConfig && "rotate-180",
+                )}
+              />
+            </button>
+            <button className="icon-button" onClick={onClose} aria-label="关闭">
+              <X className="h-4 w-4" />
             </button>
           </div>
+        </div>
 
-          {history.length > 0 && (
-            <div className="space-y-3">
-              {history.map((message, index) => (
-                <div key={index} className="rounded-lg border bg-muted/20 p-3">
-                  <div className="mb-2 flex items-center justify-between gap-2">
+        {/* 可折叠配置面板 */}
+        {showConfig && (
+          <div className="space-y-4 border-b bg-muted/20 p-4">
+            <div>
+              <div className="mb-2 text-xs font-medium text-muted-foreground">
+                请求路径
+              </div>
+              <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted p-1">
+                <SegmentedOption
+                  name="viaGateway"
+                  checked={viaGateway === "direct"}
+                  onChange={() => setViaGateway("direct")}
+                >
+                  直连上游
+                </SegmentedOption>
+                <SegmentedOption
+                  name="viaGateway"
+                  checked={viaGateway === "gateway"}
+                  disabled={!gatewayAllowed}
+                  onChange={() => setViaGateway("gateway")}
+                >
+                  通过本地网关
+                </SegmentedOption>
+              </div>
+              {!gatewayAllowed && (
+                <div className="mt-2 text-[11px] leading-5 text-muted-foreground">
+                  {gatewayRunning
+                    ? "此模型条目尚未保存到运行配置中，无法通过网关测试。"
+                    : "网关未启动，无法通过网关测试。"}
+                </div>
+              )}
+            </div>
+
+            <div className={cn(proxyDisabled && "opacity-60")}>
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <Shield className="h-4 w-4 text-muted-foreground" />
+                <span className="text-xs font-medium">出口方式</span>
+                {proxyDisabled && (
+                  <span className="text-[11px] text-muted-foreground">
+                    通过网关时由网关全局设置决定
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-3 gap-1 rounded-lg bg-muted p-1">
+                <SegmentedOption
+                  name="proxyMode"
+                  checked={!proxyDisabled && proxyMode === "bypass"}
+                  disabled={proxyDisabled}
+                  onChange={() => setProxyMode("bypass")}
+                >
+                  直接连接
+                </SegmentedOption>
+                <SegmentedOption
+                  name="proxyMode"
+                  checked={!proxyDisabled && proxyMode === "follow_global"}
+                  disabled={proxyDisabled}
+                  onChange={() => setProxyMode("follow_global")}
+                >
+                  跟随全局
+                </SegmentedOption>
+                <SegmentedOption
+                  name="proxyMode"
+                  checked={!proxyDisabled && proxyMode === "custom"}
+                  disabled={proxyDisabled}
+                  onChange={() => setProxyMode("custom")}
+                >
+                  临时代理
+                </SegmentedOption>
+              </div>
+              {!proxyDisabled && proxyMode === "bypass" && (
+                <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+                  本次测试强制直连上游，不使用全局设置或系统环境变量中的代理。
+                </p>
+              )}
+              {proxyMode === "custom" && !proxyDisabled && (
+                <input
+                  className="input mt-2 w-full font-mono"
+                  value={customProxyUrl}
+                  onChange={(event) => setCustomProxyUrl(event.target.value)}
+                  placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+                />
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                最大输出 token
+                <input
+                  className="input w-32 font-mono"
+                  type="number"
+                  min={1}
+                  max={16384}
+                  step={1}
+                  value={maxOutputTokensText}
+                  onChange={(event) =>
+                    setMaxOutputTokensText(event.target.value)
+                  }
+                />
+              </label>
+              {!maxTokensValid && maxOutputTokensText !== "" && (
+                <span className="text-[11px] text-destructive">
+                  范围 1–16384
+                </span>
+              )}
+              <button
+                className="secondary-button ml-auto"
+                disabled={running || history.length === 0}
+                onClick={clearSession}
+                title="清空当前会话"
+              >
+                <Eraser className="h-4 w-4" />
+                清空会话
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 对话流 */}
+        <div ref={scrollRef} className="flex-1 space-y-4 overflow-y-auto p-4">
+          {history.length === 0 && !running && (
+            <div className="py-10 text-center text-xs text-muted-foreground">
+              输入消息后按 Cmd/Ctrl + Enter 发送，回复会渲染 Markdown。
+            </div>
+          )}
+          {history.map((message, index) => {
+            const isUser = message.role === "user";
+            const isEditing = editingIndex === index;
+            const isLastAssistant =
+              message.role === "assistant" && index === history.length - 1;
+            return (
+              <div
+                key={index}
+                className={cn(
+                  "group flex",
+                  isUser ? "justify-end" : "justify-start",
+                )}
+              >
+                <div
+                  className={cn(
+                    "relative max-w-[85%] rounded-2xl px-4 py-2.5",
+                    isUser
+                      ? "rounded-br-sm bg-primary/10"
+                      : "rounded-bl-sm bg-muted/40",
+                  )}
+                >
+                  <div className="mb-1 flex items-center justify-between gap-2">
                     <span
                       className={cn(
-                        "rounded px-2 py-0.5 text-[11px] font-medium",
-                        message.role === "assistant"
-                          ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300"
-                          : "bg-primary/10 text-primary",
+                        "text-[10px] font-medium",
+                        isUser
+                          ? "text-primary"
+                          : "text-emerald-600 dark:text-emerald-400",
                       )}
                     >
-                      {message.role === "assistant" ? "助手" : "用户"}
+                      {isUser ? "用户" : "助手"}
                     </span>
-                    <div className="flex items-center gap-1">
-                      {message.role === "assistant" && (
+                    <div className="flex items-center gap-0.5 opacity-0 transition group-hover:opacity-100">
+                      {!isUser && (
                         <button
-                          className="icon-button"
+                          className="icon-button h-7 w-7"
                           onClick={() => onCopy(message.content, "助手回复")}
                           title="复制该回复"
                           aria-label="复制该回复"
@@ -2209,8 +2268,26 @@ function ModelTestModal({
                         </button>
                       )}
                       <button
-                        className="icon-button text-destructive"
-                        onClick={() => deleteHistoryMessage(index)}
+                        className="icon-button h-7 w-7"
+                        onClick={() =>
+                          setEditingIndex(isEditing ? null : index)
+                        }
+                        title={isEditing ? "完成编辑" : "编辑该条"}
+                        aria-label={isEditing ? "完成编辑" : "编辑该条"}
+                        disabled={running}
+                      >
+                        {isEditing ? (
+                          <Check className="h-3.5 w-3.5" />
+                        ) : (
+                          <Pencil className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                      <button
+                        className="icon-button h-7 w-7 text-destructive"
+                        onClick={() => {
+                          deleteHistoryMessage(index);
+                          setEditingIndex(null);
+                        }}
                         title="删除该条"
                         aria-label="删除该条"
                         disabled={running}
@@ -2219,42 +2296,131 @@ function ModelTestModal({
                       </button>
                     </div>
                   </div>
-                  <textarea
-                    className="input min-h-16 w-full resize-y text-xs leading-5"
-                    value={message.content}
-                    onChange={(event) =>
-                      updateHistoryMessage(index, event.target.value)
-                    }
-                    disabled={running}
-                  />
+                  {isEditing ? (
+                    <textarea
+                      className="input min-h-16 w-full resize-y text-xs leading-5"
+                      value={message.content}
+                      onChange={(event) =>
+                        updateHistoryMessage(index, event.target.value)
+                      }
+                      disabled={running}
+                    />
+                  ) : isUser ? (
+                    <div className="whitespace-pre-wrap break-words text-sm leading-6">
+                      {message.content}
+                    </div>
+                  ) : (
+                    <Markdown content={message.content} />
+                  )}
+                  {/* 最新一条助手回复附带原始响应折叠区 */}
+                  {isLastAssistant && result?.ok && result.rawBody && (
+                    <div className="mt-2 border-t border-border/60 pt-2">
+                      <button
+                        className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+                        onClick={() => setShowRaw(!showRaw)}
+                      >
+                        <ChevronRight
+                          className={cn(
+                            "h-3 w-3 transition",
+                            showRaw && "rotate-90",
+                          )}
+                        />
+                        {showRaw ? "隐藏原始响应" : "显示原始响应"}
+                      </button>
+                      {showRaw && (
+                        <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
+                          {result.rawBody}
+                        </pre>
+                      )}
+                    </div>
+                  )}
                 </div>
-              ))}
+              </div>
+            );
+          })}
+
+          {/* 运行中加载气泡 */}
+          {running && (
+            <div className="flex justify-start">
+              <div className="rounded-2xl rounded-bl-sm bg-muted/40 px-4 py-2.5">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                  等待上游回复…
+                </div>
+              </div>
             </div>
           )}
 
-          <div>
-            <div className="mb-1 text-xs font-medium text-muted-foreground">
-              下一条消息
+          {/* 最近一次结果状态条 / 失败错误气泡 */}
+          {result && (
+            <div
+              className={cn(
+                "rounded-lg border px-3 py-2 text-[11px] leading-5",
+                result.ok
+                  ? "border-border bg-muted/30 text-muted-foreground"
+                  : "border-destructive/30 bg-destructive/5 text-destructive",
+              )}
+            >
+              {result.ok ? (
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                  <span className="font-medium text-emerald-600 dark:text-emerald-400">
+                    成功
+                  </span>
+                  {result.status > 0 && <span>· HTTP {result.status}</span>}
+                  <span>· {result.latencyMs}ms</span>
+                  <span>
+                    · {result.pathUsed === "gateway" ? "通过网关" : "直连"}
+                  </span>
+                  <span>
+                    ·{" "}
+                    {result.proxyEffective
+                      ? `代理 ${result.proxyEffective}`
+                      : "无代理"}
+                  </span>
+                  {result.finishReason && (
+                    <span>· 停止原因 {result.finishReason}</span>
+                  )}
+                  {usageSummary.length > 0 && (
+                    <span>· {usageSummary.join(" · ")}</span>
+                  )}
+                  {result.lengthTruncated && (
+                    <span className="text-amber-700 dark:text-amber-300">
+                      · 输出因长度上限被截断（{result.finishReason ?? "length"}
+                      ），可调高最大输出 token
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <div className="break-words">
+                  <span className="font-medium">失败</span>
+                  {result.status > 0 && <span> · HTTP {result.status}</span>}
+                  {result.error && <span> · {result.error}</span>}
+                </div>
+              )}
             </div>
-            <textarea
-              className="input min-h-24 w-full resize-y"
-              value={draft}
-              onChange={(event) => setDraft(event.target.value)}
-              disabled={running}
-              onKeyDown={(event) => {
-                if (
-                  (event.metaKey || event.ctrlKey) &&
-                  event.key === "Enter" &&
-                  canSend
-                ) {
-                  event.preventDefault();
-                  void run();
-                }
-              }}
-            />
-          </div>
+          )}
+        </div>
 
-          <div className="flex justify-end gap-2">
+        {/* 底部输入区 */}
+        <div className="border-t p-4">
+          <textarea
+            className="input min-h-20 w-full resize-y"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            disabled={running}
+            placeholder="输入测试消息，Cmd/Ctrl + Enter 发送"
+            onKeyDown={(event) => {
+              if (
+                (event.metaKey || event.ctrlKey) &&
+                event.key === "Enter" &&
+                canSend
+              ) {
+                event.preventDefault();
+                void run();
+              }
+            }}
+          />
+          <div className="mt-2 flex items-center justify-between gap-2">
             <button className="secondary-button" onClick={onClose}>
               关闭
             </button>
@@ -2271,105 +2437,6 @@ function ModelTestModal({
               发送
             </button>
           </div>
-
-          {result && (
-            <div className="rounded-lg border">
-              <div
-                className={cn(
-                  "flex flex-wrap items-center gap-2 border-b px-3 py-2 text-xs",
-                  result.ok
-                    ? "bg-emerald-50 dark:bg-emerald-950/30"
-                    : "bg-destructive/5",
-                )}
-              >
-                <span
-                  className={cn(
-                    "font-semibold",
-                    result.ok
-                      ? "text-emerald-700 dark:text-emerald-300"
-                      : "text-destructive",
-                  )}
-                >
-                  {result.ok ? "成功" : "失败"}
-                </span>
-                {result.status > 0 && <span>· HTTP {result.status}</span>}
-                <span>· {result.latencyMs}ms</span>
-                <span>
-                  · {result.pathUsed === "gateway" ? "通过网关" : "直连"}
-                </span>
-                <span>
-                  ·{" "}
-                  {result.proxyEffective
-                    ? `代理 ${result.proxyEffective}`
-                    : "无代理"}
-                </span>
-                {result.finishReason && (
-                  <span>· 停止原因 {result.finishReason}</span>
-                )}
-                {usageSummary.length > 0 && (
-                  <span>· {usageSummary.join(" · ")}</span>
-                )}
-              </div>
-              <div className="p-3">
-                {result.lengthTruncated && (
-                  <div className="mb-3 rounded border border-amber-300 bg-amber-50 p-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-                    输出因长度上限被截断（{result.finishReason ?? "length"}
-                    ），可调高“最大输出 token”后重试。
-                  </div>
-                )}
-                {result.error && (
-                  <div className="mb-3 rounded border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
-                    {result.error}
-                  </div>
-                )}
-                {result.replyText && (
-                  <div className="mb-2 flex items-center justify-between gap-2">
-                    <div className="text-xs font-medium text-muted-foreground">
-                      回复
-                    </div>
-                    <button
-                      className="icon-button"
-                      onClick={() => onCopy(result.replyText, "回复")}
-                      title="复制回复"
-                      aria-label="复制回复"
-                    >
-                      <Copy className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                )}
-                {result.replyText && (
-                  <div className="max-h-56 overflow-y-auto whitespace-pre-wrap rounded bg-muted p-3 text-xs leading-5">
-                    {result.replyText}
-                  </div>
-                )}
-                {result.rawBody && (
-                  <div className="mt-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <button
-                        className="text-[11px] text-muted-foreground underline"
-                        onClick={() => setShowRaw(!showRaw)}
-                      >
-                        {showRaw ? "隐藏原始响应" : "显示原始响应"}
-                      </button>
-                      <button
-                        className="icon-button"
-                        onClick={() => onCopy(result.rawBody, "原始响应")}
-                        title="复制完整原始响应"
-                        aria-label="复制完整原始响应"
-                      >
-                        <Copy className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                    {showRaw && (
-                      <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
-                        {result.rawBody}
-                      </pre>
-                    )}
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
         </div>
       </div>
     </div>
