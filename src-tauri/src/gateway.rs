@@ -13,6 +13,7 @@ use crate::provider::{LocalProxyRequestOverrides, Provider, ProviderMeta};
 use crate::proxy::types::{ProxyServerInfo, ProxyStatus};
 use crate::services::model_fetch;
 use crate::store::AppState;
+use futures::StreamExt;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -69,6 +70,10 @@ pub struct GatewayProviderModel {
     pub api_format: GatewayApiFormat,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 单模型级请求体录制开关：Some(true) 强制开启，Some(false) 强制关闭，
+    /// None 跟随供应商级 recordBodies。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_bodies: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +116,10 @@ pub struct GatewayProvider {
     /// 该供应商下的模型条目，协议下沉到条目上。
     #[serde(default)]
     pub models: Vec<GatewayProviderModel>,
+    /// 请求体录制（诊断用）：开启后把发往该供应商的最终请求体与
+    /// 上游最终响应体转储为 JSONL 文件，用于核对中转站实际收到的内容。
+    #[serde(default)]
+    pub record_bodies: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +332,7 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
                     upstream_model: target.upstream_model.clone(),
                     api_format: format,
                     enabled: route.enabled && target.enabled,
+                    record_bodies: None,
                 });
         }
     }
@@ -348,6 +358,7 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
             reasoning_history_mode: default_auto_mode(),
             adaptive_thinking_display: default_auto_mode(),
             notes: p.notes,
+            record_bodies: false,
             models: provider_models.remove(&p.id).unwrap_or_default(),
         })
         .collect();
@@ -572,6 +583,30 @@ fn provider_meta(
             headers: override_headers,
             body: None,
         });
+    }
+
+    // 请求体录制开关物化：None=关闭。开启时收集该 (供应商, 协议) 下启用模型的
+    // 上游模型名；空列表表示全量录制，非空表示仅录制命中的出站模型。
+    // 模型级 record_bodies 优先于供应商级开关（true 强制开，false 强制排除）。
+    let mut recording_models: Vec<String> = Vec::new();
+    let mut any_model_forced_on = false;
+    for model in &provider.models {
+        if !model.enabled || model.api_format != format {
+            continue;
+        }
+        let forced_on = model.record_bodies == Some(true);
+        let forced_off = model.record_bodies == Some(false);
+        if forced_on {
+            any_model_forced_on = true;
+        }
+        if provider.record_bodies || forced_on {
+            if !forced_off {
+                recording_models.push(model.upstream_model.trim().to_string());
+            }
+        }
+    }
+    if !recording_models.is_empty() || any_model_forced_on {
+        meta.body_recording_models = Some(recording_models);
     }
     meta
 }
@@ -937,6 +972,16 @@ pub fn generate_gateway_api_key() -> String {
 // 单模型测试对话
 // ============================================================================
 
+const TEST_MAX_OUTPUT_TOKENS_MIN: u32 = 1;
+const TEST_MAX_OUTPUT_TOKENS_MAX: u32 = 16_384;
+const TEST_MESSAGE_COUNT_MAX: usize = 100;
+const TEST_MESSAGE_BYTES_MAX: usize = 64 * 1024;
+const TEST_MESSAGES_TOTAL_BYTES_MAX: usize = 1024 * 1024;
+const TEST_RESPONSE_BYTES_MAX: usize = 16 * 1024 * 1024;
+const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const TEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const TEST_GATEWAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayTestProxyMode {
@@ -948,6 +993,66 @@ pub enum GatewayTestProxyMode {
     Custom,
 }
 
+/// 测试时注入的思考/推理档位。后端按目标协议翻译为各自字段：
+/// - OpenAI Chat / Responses：`reasoning_effort`（low/medium/high），关闭则不写。
+/// - Anthropic：`thinking`（enabled + budget_tokens，按 max_output_tokens 比例映射），关闭为 disabled。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayTestThinkingLevel {
+    #[default]
+    Disabled,
+    Low,
+    Medium,
+    High,
+}
+
+impl GatewayTestThinkingLevel {
+    /// OpenAI 风格 reasoning_effort 值；关闭档返回 None（不写该字段）。
+    fn reasoning_effort(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => None,
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+        }
+    }
+
+    /// Anthropic thinking budget_tokens，按 max_output_tokens 比例映射（低 25% / 中 50% / 高 75%）。
+    fn anthropic_budget(self, max_output_tokens: u32) -> Option<u32> {
+        let ratio = match self {
+            Self::Disabled => return None,
+            Self::Low => 0.25,
+            Self::Medium => 0.50,
+            Self::High => 0.75,
+        };
+        let budget = ((max_output_tokens as f64) * ratio).floor() as u32;
+        Some(budget.max(1))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayModelTestRole {
+    User,
+    Assistant,
+}
+
+impl GatewayModelTestRole {
+    fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelTestMessage {
+    pub role: GatewayModelTestRole,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayModelTestRequest {
@@ -956,12 +1061,45 @@ pub struct GatewayModelTestRequest {
     #[serde(default)]
     pub alias: String,
     pub api_format: GatewayApiFormat,
-    pub prompt: String,
+    pub messages: Vec<GatewayModelTestMessage>,
+    pub max_output_tokens: u32,
     #[serde(default)]
     pub via_gateway: bool,
     pub proxy_mode: GatewayTestProxyMode,
     #[serde(default)]
     pub custom_proxy_url: String,
+    #[serde(default)]
+    pub thinking_level: GatewayTestThinkingLevel,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelTestUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+}
+
+impl GatewayModelTestUsage {
+    fn is_empty(&self) -> bool {
+        self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.total_tokens.is_none()
+            && self.cache_read_input_tokens.is_none()
+            && self.cache_creation_input_tokens.is_none()
+            && self.reasoning_tokens.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -971,64 +1109,313 @@ pub struct GatewayModelTestResult {
     pub status: u16,
     pub latency_ms: u64,
     pub reply_text: String,
-    pub raw_body_preview: String,
+    pub raw_body: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub raw_request: String,
     pub error: Option<String>,
     pub path_used: String,
     pub proxy_effective: Option<String>,
+    pub finish_reason: Option<String>,
+    pub length_truncated: bool,
+    pub usage: Option<GatewayModelTestUsage>,
 }
 
-const TEST_RAW_PREVIEW_MAX: usize = 2 * 1024;
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ParsedTestResponse {
+    reply_text: String,
+    finish_reason: Option<String>,
+    length_truncated: bool,
+    usage: Option<GatewayModelTestUsage>,
+}
 
-fn truncate_preview(s: &str) -> String {
-    if s.len() <= TEST_RAW_PREVIEW_MAX {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..TEST_RAW_PREVIEW_MAX])
+fn validate_test_request(request: &GatewayModelTestRequest) -> Result<(), String> {
+    if request.upstream_model.trim().is_empty() {
+        return Err("上游模型名不能为空".to_string());
+    }
+    if request.provider.base_url.trim().is_empty() {
+        return Err("Base URL 不能为空".to_string());
+    }
+    if !(TEST_MAX_OUTPUT_TOKENS_MIN..=TEST_MAX_OUTPUT_TOKENS_MAX)
+        .contains(&request.max_output_tokens)
+    {
+        return Err(format!(
+            "max_output_tokens 必须在 {TEST_MAX_OUTPUT_TOKENS_MIN} 到 {TEST_MAX_OUTPUT_TOKENS_MAX} 之间"
+        ));
+    }
+    validate_test_messages(&request.messages)?;
+    Ok(())
+}
+
+fn validate_test_messages(messages: &[GatewayModelTestMessage]) -> Result<(), String> {
+    if messages.is_empty() {
+        return Err("测试消息不能为空".to_string());
+    }
+    if messages.len() > TEST_MESSAGE_COUNT_MAX {
+        return Err(format!("测试消息最多 {TEST_MESSAGE_COUNT_MAX} 条"));
+    }
+    if messages[0].role != GatewayModelTestRole::User {
+        return Err("第一条测试消息必须是 user".to_string());
+    }
+    if messages.last().map(|message| message.role) != Some(GatewayModelTestRole::User) {
+        return Err("最后一条测试消息必须是 user".to_string());
+    }
+
+    let mut total_bytes = 0usize;
+    for (index, message) in messages.iter().enumerate() {
+        if message.content.trim().is_empty() {
+            return Err(format!("第 {} 条测试消息内容不能为空", index + 1));
+        }
+        let bytes = message.content.len();
+        if bytes > TEST_MESSAGE_BYTES_MAX {
+            return Err(format!(
+                "第 {} 条测试消息超过 {} 字节上限",
+                index + 1,
+                TEST_MESSAGE_BYTES_MAX
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(bytes);
+        if total_bytes > TEST_MESSAGES_TOTAL_BYTES_MAX {
+            return Err(format!(
+                "测试消息总长度超过 {} 字节上限",
+                TEST_MESSAGES_TOTAL_BYTES_MAX
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn pretty_raw_body(text: &str) -> String {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| text.to_string())
+}
+
+/// 把即将发送的请求 payload 格式化为可读的 JSON 字符串。
+fn pretty_json_value(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn json_u64(value: Option<&Value>) -> Option<u64> {
+    value.and_then(Value::as_u64).or_else(|| {
+        value
+            .and_then(Value::as_f64)
+            .filter(|number| number.is_finite() && *number >= 0.0)
+            .map(|number| number as u64)
+    })
+}
+
+fn extract_structured_error(body: &Value) -> Option<String> {
+    body.pointer("/error/message")
+        .or_else(|| body.get("message"))
+        .or_else(|| body.get("detail"))
+        .and_then(|value| match value {
+            Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+            other if !other.is_null() => Some(other.to_string()),
+            _ => None,
+        })
+}
+
+fn is_length_truncated(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some("length")
+            | Some("max_tokens")
+            | Some("max_output_tokens")
+            | Some("model_context_window_exceeded")
+    )
+}
+
+fn parse_chat_usage(usage: &Value) -> GatewayModelTestUsage {
+    let mut parsed = GatewayModelTestUsage {
+        input_tokens: json_u64(usage.get("prompt_tokens")).or_else(|| json_u64(usage.get("input_tokens"))),
+        output_tokens: json_u64(usage.get("completion_tokens"))
+            .or_else(|| json_u64(usage.get("output_tokens"))),
+        total_tokens: json_u64(usage.get("total_tokens")),
+        cache_read_input_tokens: json_u64(usage.pointer("/prompt_tokens_details/cached_tokens"))
+            .or_else(|| json_u64(usage.get("cache_read_input_tokens"))),
+        cache_creation_input_tokens: json_u64(usage.get("cache_creation_input_tokens")),
+        reasoning_tokens: json_u64(usage.pointer("/completion_tokens_details/reasoning_tokens"))
+            .or_else(|| json_u64(usage.pointer("/output_tokens_details/reasoning_tokens"))),
+    };
+    if parsed.total_tokens.is_none() {
+        if let (Some(input), Some(output)) = (parsed.input_tokens, parsed.output_tokens) {
+            parsed.total_tokens = Some(input.saturating_add(output));
+        }
+    }
+    parsed
+}
+
+fn parse_responses_usage(usage: &Value) -> GatewayModelTestUsage {
+    let mut parsed = GatewayModelTestUsage {
+        input_tokens: json_u64(usage.get("input_tokens")),
+        output_tokens: json_u64(usage.get("output_tokens")),
+        total_tokens: json_u64(usage.get("total_tokens")),
+        cache_read_input_tokens: json_u64(usage.pointer("/input_tokens_details/cached_tokens"))
+            .or_else(|| json_u64(usage.get("cache_read_input_tokens"))),
+        cache_creation_input_tokens: json_u64(usage.get("cache_creation_input_tokens")),
+        reasoning_tokens: json_u64(usage.pointer("/output_tokens_details/reasoning_tokens")),
+    };
+    if parsed.total_tokens.is_none() {
+        if let (Some(input), Some(output)) = (parsed.input_tokens, parsed.output_tokens) {
+            parsed.total_tokens = Some(input.saturating_add(output));
+        }
+    }
+    parsed
+}
+
+fn parse_anthropic_usage(usage: &Value) -> GatewayModelTestUsage {
+    let mut parsed = GatewayModelTestUsage {
+        input_tokens: json_u64(usage.get("input_tokens")),
+        output_tokens: json_u64(usage.get("output_tokens")),
+        total_tokens: json_u64(usage.get("total_tokens")),
+        cache_read_input_tokens: json_u64(usage.get("cache_read_input_tokens")),
+        cache_creation_input_tokens: json_u64(usage.get("cache_creation_input_tokens")),
+        reasoning_tokens: json_u64(usage.pointer("/output_tokens_details/reasoning_tokens")),
+    };
+    if parsed.total_tokens.is_none() {
+        if let (Some(input), Some(output)) = (parsed.input_tokens, parsed.output_tokens) {
+            parsed.total_tokens = Some(input.saturating_add(output));
+        }
+    }
+    parsed
+}
+
+fn extract_openai_chat_reply(body: &Value) -> String {
+    let content = body
+        .pointer("/choices/0/message/content")
+        .cloned()
+        .unwrap_or(Value::Null);
+    match content {
+        Value::String(text) => text,
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
     }
 }
 
-fn extract_reply_text(format: GatewayApiFormat, body: &Value) -> String {
-    match format {
-        GatewayApiFormat::OpenaiChat => body
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        GatewayApiFormat::OpenaiResponses => {
-            if let Some(text) = body.get("output_text").and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    return text.to_string();
-                }
-            }
-            let mut out = String::new();
-            if let Some(outputs) = body.get("output").and_then(|v| v.as_array()) {
-                for item in outputs {
-                    if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
-                        for part in parts {
-                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                out.push_str(text);
-                            }
-                        }
-                    }
-                }
-            }
-            out
+fn extract_responses_reply(body: &Value) -> String {
+    if let Some(text) = body.get("output_text").and_then(Value::as_str) {
+        if !text.is_empty() {
+            return text.to_string();
         }
-        GatewayApiFormat::Anthropic => {
-            let mut out = String::new();
-            if let Some(parts) = body.get("content").and_then(|v| v.as_array()) {
+    }
+    let mut out = String::new();
+    if let Some(outputs) = body.get("output").and_then(Value::as_array) {
+        for item in outputs {
+            if let Some(parts) = item.get("content").and_then(Value::as_array) {
                 for part in parts {
-                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
                         out.push_str(text);
                     }
                 }
             }
-            out
         }
     }
+    out
+}
+
+fn extract_anthropic_reply(body: &Value) -> String {
+    let mut out = String::new();
+    if let Some(parts) = body.get("content").and_then(Value::as_array) {
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                out.push_str(text);
+            }
+        }
+    }
+    out
+}
+
+fn parse_test_response(format: GatewayApiFormat, body: &Value) -> ParsedTestResponse {
+    match format {
+        GatewayApiFormat::OpenaiChat => {
+            let finish_reason = body
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let usage = body
+                .get("usage")
+                .map(parse_chat_usage)
+                .filter(|usage| !usage.is_empty());
+            ParsedTestResponse {
+                reply_text: extract_openai_chat_reply(body),
+                length_truncated: is_length_truncated(finish_reason.as_deref()),
+                finish_reason,
+                usage,
+            }
+        }
+        GatewayApiFormat::OpenaiResponses => {
+            let finish_reason = body
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| body.get("status").and_then(Value::as_str))
+                .map(str::to_string);
+            let usage = body
+                .get("usage")
+                .map(parse_responses_usage)
+                .filter(|usage| !usage.is_empty());
+            ParsedTestResponse {
+                reply_text: extract_responses_reply(body),
+                length_truncated: is_length_truncated(finish_reason.as_deref()),
+                finish_reason,
+                usage,
+            }
+        }
+        GatewayApiFormat::Anthropic => {
+            let finish_reason = body
+                .get("stop_reason")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let usage = body
+                .get("usage")
+                .map(parse_anthropic_usage)
+                .filter(|usage| !usage.is_empty());
+            ParsedTestResponse {
+                reply_text: extract_anthropic_reply(body),
+                length_truncated: is_length_truncated(finish_reason.as_deref()),
+                finish_reason,
+                usage,
+            }
+        }
+    }
+}
+
+fn chat_messages_value(messages: &[GatewayModelTestMessage]) -> Value {
+    Value::Array(
+        messages
+            .iter()
+            .map(|message| {
+                json!({
+                    "role": message.role.as_wire_name(),
+                    "content": message.content,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// 同 chat_messages_value，但可选地在最前面插一条 system 消息（OpenAI Chat/Responses 风格）。
+fn chat_messages_value_with_system(
+    messages: &[GatewayModelTestMessage],
+    system: Option<&str>,
+) -> Value {
+    let mut value = chat_messages_value(messages);
+    if let Some(text) = system {
+        if let Value::Array(arr) = &mut value {
+            arr.insert(
+                0,
+                json!({ "role": "system", "content": text }),
+            );
+        }
+    }
+    value
 }
 
 fn build_test_client(
@@ -1043,8 +1430,8 @@ fn build_test_client(
         GatewayTestProxyMode::Bypass => {
             let client = reqwest::Client::builder()
                 .no_proxy()
-                .timeout(Duration::from_secs(30))
-                .connect_timeout(Duration::from_secs(15))
+                .timeout(TEST_REQUEST_TIMEOUT)
+                .connect_timeout(TEST_CONNECT_TIMEOUT)
                 .build()
                 .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
             Ok((client, None))
@@ -1060,8 +1447,8 @@ fn build_test_client(
             let client = reqwest::Client::builder()
                 .no_proxy()
                 .proxy(proxy)
-                .timeout(Duration::from_secs(30))
-                .connect_timeout(Duration::from_secs(15))
+                .timeout(TEST_REQUEST_TIMEOUT)
+                .connect_timeout(TEST_CONNECT_TIMEOUT)
                 .build()
                 .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
             Ok((client, Some(trimmed.to_string())))
@@ -1069,25 +1456,88 @@ fn build_test_client(
     }
 }
 
-fn build_test_payload(format: GatewayApiFormat, model: &str, prompt: &str) -> Value {
+fn build_test_payload(
+    format: GatewayApiFormat,
+    model: &str,
+    messages: &[GatewayModelTestMessage],
+    max_output_tokens: u32,
+    thinking_level: GatewayTestThinkingLevel,
+    system_prompt: Option<&str>,
+) -> Result<Value, String> {
+    let system = system_prompt
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
     match format {
-        GatewayApiFormat::OpenaiChat => json!({
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 256,
-            "stream": false,
-        }),
-        GatewayApiFormat::OpenaiResponses => json!({
-            "model": model,
-            "input": prompt,
-            "stream": false,
-        }),
-        GatewayApiFormat::Anthropic => json!({
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 256,
-        }),
+        GatewayApiFormat::OpenaiChat => {
+            let mut payload = json!({
+                "model": model,
+                "messages": chat_messages_value_with_system(messages, system),
+                "max_tokens": max_output_tokens,
+                "stream": false,
+            });
+            if let Some(effort) = thinking_level.reasoning_effort() {
+                payload["reasoning_effort"] = json!(effort);
+            }
+            Ok(payload)
+        }
+        GatewayApiFormat::OpenaiResponses => {
+            let mut chat_shaped = json!({
+                "model": model,
+                "messages": chat_messages_value_with_system(messages, system),
+                "max_tokens": max_output_tokens,
+                "stream": false,
+            });
+            if let Some(effort) = thinking_level.reasoning_effort() {
+                chat_shaped["reasoning_effort"] = json!(effort);
+            }
+            crate::gateway_chat::chat_request_to_responses(chat_shaped)
+                .map_err(|error| error.to_string())
+        }
+        GatewayApiFormat::Anthropic => {
+            let mut payload = json!({
+                "model": model,
+                "messages": chat_messages_value(messages),
+                "max_tokens": max_output_tokens,
+                "stream": false,
+            });
+            if let Some(text) = system {
+                payload["system"] = json!(text);
+            }
+            match thinking_level {
+                GatewayTestThinkingLevel::Disabled => {
+                    payload["thinking"] = json!({ "type": "disabled" });
+                }
+                _ => {
+                    if let Some(budget) =
+                        thinking_level.anthropic_budget(max_output_tokens)
+                    {
+                        payload["thinking"] = json!({
+                            "type": "enabled",
+                            "budget_tokens": budget
+                        });
+                    }
+                }
+            }
+            Ok(payload)
+        }
     }
+}
+
+async fn read_response_text(response: reqwest::Response) -> Result<String, String> {
+    let mut body = response.bytes_stream();
+    let mut collected = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| format!("读取响应失败: {e}"))?;
+        let bytes: &[u8] = chunk.as_ref();
+        if collected.len().saturating_add(bytes.len()) > TEST_RESPONSE_BYTES_MAX {
+            return Err(format!(
+                "响应体超过 {} 字节上限",
+                TEST_RESPONSE_BYTES_MAX
+            ));
+        }
+        collected.extend_from_slice(bytes);
+    }
+    String::from_utf8(collected).map_err(|e| format!("响应不是有效 UTF-8: {e}"))
 }
 
 fn endpoint_path(format: GatewayApiFormat) -> &'static str {
@@ -1111,9 +1561,17 @@ fn join_url(base: &str, path: &str) -> String {
 async fn run_direct_test(
     request: &GatewayModelTestRequest,
     client: &reqwest::Client,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String, String), String> {
     let url = join_url(&request.provider.base_url, endpoint_path(request.api_format));
-    let payload = build_test_payload(request.api_format, &request.upstream_model, &request.prompt);
+    let payload = build_test_payload(
+        request.api_format,
+        &request.upstream_model,
+        &request.messages,
+        request.max_output_tokens,
+        request.thinking_level,
+        request.system_prompt.as_deref(),
+    )?;
+    let raw_request = pretty_json_value(&payload);
 
     let mut req = client.post(&url).json(&payload);
 
@@ -1156,18 +1614,15 @@ async fn run_direct_test(
 
     let response = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
     let status = response.status().as_u16();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("读取响应失败: {e}"))?;
-    Ok((status, text))
+    let text = read_response_text(response).await?;
+    Ok((status, text, raw_request))
 }
 
 async fn run_gateway_test(
     state: &AppState,
     request: &GatewayModelTestRequest,
     client: &reqwest::Client,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String, String), String> {
     let config = load_config(&state.db).map_err(|e| e.to_string())?;
     let alias = if request.alias.trim().is_empty() {
         request.upstream_model.trim()
@@ -1186,7 +1641,15 @@ async fn run_gateway_test(
     };
     let base = format!("http://{}:{}", address, config.listen_port);
     let url = format!("{}{}", base, endpoint_path(request.api_format));
-    let payload = build_test_payload(request.api_format, alias, &request.prompt);
+    let payload = build_test_payload(
+        request.api_format,
+        alias,
+        &request.messages,
+        request.max_output_tokens,
+        request.thinking_level,
+        request.system_prompt.as_deref(),
+    )?;
+    let raw_request = pretty_json_value(&payload);
 
     let mut req = client.post(&url).json(&payload);
     let local_key = config.local_api_key.trim();
@@ -1203,11 +1666,30 @@ async fn run_gateway_test(
 
     let response = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
     let status = response.status().as_u16();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("读取响应失败: {e}"))?;
-    Ok((status, text))
+    let text = read_response_text(response).await?;
+    Ok((status, text, raw_request))
+}
+
+fn empty_test_result(
+    path_used: &str,
+    latency_ms: u64,
+    proxy_effective: Option<String>,
+    error: Option<String>,
+) -> GatewayModelTestResult {
+    GatewayModelTestResult {
+        ok: false,
+        status: 0,
+        latency_ms,
+        reply_text: String::new(),
+        raw_body: String::new(),
+        raw_request: String::new(),
+        error,
+        path_used: path_used.to_string(),
+        proxy_effective,
+        finish_reason: None,
+        length_truncated: false,
+        usage: None,
+    }
 }
 
 #[tauri::command]
@@ -1215,23 +1697,15 @@ pub async fn test_gateway_model(
     state: tauri::State<'_, AppState>,
     request: GatewayModelTestRequest,
 ) -> Result<GatewayModelTestResult, String> {
-    if request.upstream_model.trim().is_empty() {
-        return Err("上游模型名不能为空".to_string());
-    }
-    if request.provider.base_url.trim().is_empty() {
-        return Err("Base URL 不能为空".to_string());
-    }
-    if request.prompt.trim().is_empty() {
-        return Err("测试消息不能为空".to_string());
-    }
+    validate_test_request(&request)?;
 
     // 通过网关测试时，本地测试请求必须严格直连本地监听端口；真正的
     // “网关 → 上游”出站段仍由网关共享客户端按全局代理配置决定。
     let (client, proxy_effective) = if request.via_gateway {
         let local_client = reqwest::Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(5))
+            .timeout(TEST_REQUEST_TIMEOUT)
+            .connect_timeout(TEST_GATEWAY_CONNECT_TIMEOUT)
             .build()
             .map_err(|e| format!("构建本地网关测试客户端失败: {e}"))?;
         (
@@ -1244,6 +1718,9 @@ pub async fn test_gateway_model(
 
     let start = Instant::now();
     let path_used = if request.via_gateway { "gateway" } else { "direct" };
+    let masked_proxy = proxy_effective
+        .as_ref()
+        .map(|url| crate::proxy::http_client::mask_url(url));
 
     let result = if request.via_gateway {
         run_gateway_test(&state, &request, &client).await
@@ -1254,39 +1731,41 @@ pub async fn test_gateway_model(
     let latency_ms = start.elapsed().as_millis() as u64;
 
     match result {
-        Ok((status, text)) => {
+        Ok((status, text, raw_request)) => {
             let ok = (200..300).contains(&status);
+            let raw_body = pretty_raw_body(&text);
             let body: Option<Value> = serde_json::from_str(&text).ok();
-            let reply_text = body
+            let parsed = body
                 .as_ref()
-                .map(|b| extract_reply_text(request.api_format, b))
+                .map(|value| parse_test_response(request.api_format, value))
                 .unwrap_or_default();
-            let raw_body_preview = truncate_preview(&text);
+            let error = if ok {
+                None
+            } else {
+                body.as_ref()
+                    .and_then(extract_structured_error)
+                    .or_else(|| {
+                        let trimmed = text.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.to_string())
+                    })
+                    .or_else(|| Some(format!("HTTP {status}")))
+            };
             Ok(GatewayModelTestResult {
                 ok,
                 status,
                 latency_ms,
-                reply_text,
-                raw_body_preview,
-                error: None,
+                reply_text: parsed.reply_text,
+                raw_body,
+                raw_request,
+                error,
                 path_used: path_used.to_string(),
-                proxy_effective: proxy_effective
-                    .as_ref()
-                    .map(|u| crate::proxy::http_client::mask_url(u)),
+                proxy_effective: masked_proxy,
+                finish_reason: parsed.finish_reason,
+                length_truncated: parsed.length_truncated,
+                usage: parsed.usage,
             })
         }
-        Err(err) => Ok(GatewayModelTestResult {
-            ok: false,
-            status: 0,
-            latency_ms,
-            reply_text: String::new(),
-            raw_body_preview: String::new(),
-            error: Some(err),
-            path_used: path_used.to_string(),
-            proxy_effective: proxy_effective
-                .as_ref()
-                .map(|u| crate::proxy::http_client::mask_url(u)),
-        }),
+        Err(err) => Ok(empty_test_result(path_used, latency_ms, masked_proxy, Some(err))),
     }
 }
 
@@ -1374,13 +1853,48 @@ mod tests {
             reasoning_history_mode: default_auto_mode(),
             adaptive_thinking_display: default_auto_mode(),
             notes: String::new(),
+            record_bodies: false,
             models: vec![GatewayProviderModel {
                 alias: "local".to_string(),
                 upstream_model: "model-a".to_string(),
                 api_format: format,
                 enabled: true,
+                record_bodies: None,
             }],
         }
+    }
+
+    #[test]
+    fn provider_meta_body_recording_scopes() {
+        // 未开启：None
+        let p = provider_with_format("a", GatewayApiFormat::OpenaiChat);
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiChat);
+        assert!(meta.body_recording_models.is_none());
+
+        // 供应商级开启：全量录制（空列表）
+        let mut p = provider_with_format("b", GatewayApiFormat::OpenaiChat);
+        p.record_bodies = true;
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiChat);
+        assert_eq!(meta.body_recording_models, Some(Vec::new()));
+
+        // 模型级强制开启：仅该模型，其他协议不受影响
+        let mut p = provider_with_format("c", GatewayApiFormat::OpenaiChat);
+        p.models[0].record_bodies = Some(true);
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiChat);
+        assert_eq!(
+            meta.body_recording_models,
+            Some(vec!["model-a".to_string()])
+        );
+        // Anthropic 协议下该模型条目不匹配（api_format 不同）→ 关闭
+        let meta = provider_meta(&p, GatewayApiFormat::Anthropic);
+        assert!(meta.body_recording_models.is_none());
+
+        // 供应商开启 + 模型级显式排除：列表为空 → 仍视为关闭该协议
+        let mut p = provider_with_format("d", GatewayApiFormat::OpenaiChat);
+        p.record_bodies = true;
+        p.models[0].record_bodies = Some(false);
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiChat);
+        assert!(meta.body_recording_models.is_none());
     }
 
     #[test]
@@ -1503,6 +2017,7 @@ mod tests {
             upstream_model: "model-b".to_string(),
             api_format: GatewayApiFormat::OpenaiResponses,
             enabled: true,
+            record_bodies: None,
         });
         config.providers.push(p);
         assert!(validate_config(&config).is_err());
@@ -1538,6 +2053,7 @@ mod tests {
             upstream_model: "gpt-5-preview".to_string(),
             api_format: GatewayApiFormat::OpenaiResponses,
             enabled: true,
+            record_bodies: None,
         });
         config.providers.push(p);
         let combos = iter_materialized_combos(&config);
@@ -1616,5 +2132,424 @@ mod tests {
         assert_eq!(parsed.providers[0].reasoning_request_mode, "auto");
         assert_eq!(parsed.providers[0].reasoning_history_mode, "auto");
         assert_eq!(parsed.providers[0].adaptive_thinking_display, "auto");
+    }
+
+    fn user_message(content: &str) -> GatewayModelTestMessage {
+        GatewayModelTestMessage {
+            role: GatewayModelTestRole::User,
+            content: content.to_string(),
+        }
+    }
+
+    fn assistant_message(content: &str) -> GatewayModelTestMessage {
+        GatewayModelTestMessage {
+            role: GatewayModelTestRole::Assistant,
+            content: content.to_string(),
+        }
+    }
+
+    fn multi_turn_messages() -> Vec<GatewayModelTestMessage> {
+        vec![
+            user_message("你好"),
+            assistant_message("你好，有什么可以帮你？"),
+            user_message("再问一个问题"),
+        ]
+    }
+
+    fn test_messages_value_of<'a>(payload: &'a Value, field: &str) -> &'a Vec<Value> {
+        payload
+            .get(field)
+            .and_then(Value::as_array)
+            .expect("messages array present")
+    }
+
+    #[test]
+    fn chat_payload_preserves_multi_turn_and_max_tokens() {
+        let messages = multi_turn_messages();
+        let payload = build_test_payload(
+            GatewayApiFormat::OpenaiChat,
+            "model-a",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            None,
+        )
+        .expect("chat payload");
+        assert_eq!(payload["model"], "model-a");
+        assert_eq!(payload["max_tokens"], 4096);
+        assert_eq!(payload["stream"], false);
+        let messages = test_messages_value_of(&payload, "messages");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "你好");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "你好，有什么可以帮你？");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "再问一个问题");
+    }
+
+    #[test]
+    fn responses_payload_preserves_multi_turn_and_max_output_tokens() {
+        let messages = multi_turn_messages();
+        let payload = build_test_payload(
+            GatewayApiFormat::OpenaiResponses,
+            "model-a",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            None,
+        )
+        .expect("responses payload");
+        assert_eq!(payload["model"], "model-a");
+        assert_eq!(payload["max_output_tokens"], 4096);
+        assert_eq!(payload["stream"], false);
+        let input = payload
+            .get("input")
+            .and_then(Value::as_array)
+            .expect("responses input array");
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[2]["role"], "user");
+        // 经 chat_request_to_responses 转换后，Responses 的纯文本消息 content 仍是字符串，
+        // 而非 [{type:"input_text", text:...}] 数组——断言必须与该结构对齐。
+        assert_eq!(input[0]["content"], "你好", "responses input text should be preserved");
+        assert_eq!(input[1]["content"], "你好，有什么可以帮你？");
+        assert_eq!(input[2]["content"], "再问一个问题");
+    }
+
+    #[test]
+    fn anthropic_payload_preserves_multi_turn_and_max_tokens() {
+        let messages = multi_turn_messages();
+        let payload = build_test_payload(
+            GatewayApiFormat::Anthropic,
+            "model-a",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            None,
+        )
+        .expect("anthropic payload");
+        assert_eq!(payload["model"], "model-a");
+        assert_eq!(payload["max_tokens"], 4096);
+        assert_eq!(payload["stream"], false);
+        let messages = test_messages_value_of(&payload, "messages");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "user");
+    }
+
+    fn test_request_with_messages(messages: Vec<GatewayModelTestMessage>) -> GatewayModelTestRequest {
+        GatewayModelTestRequest {
+            provider: provider_with_format("p1", GatewayApiFormat::OpenaiChat),
+            upstream_model: "model-a".to_string(),
+            alias: "local".to_string(),
+            api_format: GatewayApiFormat::OpenaiChat,
+            messages,
+            max_output_tokens: 4096,
+            via_gateway: false,
+            proxy_mode: GatewayTestProxyMode::Bypass,
+            custom_proxy_url: String::new(),
+            thinking_level: GatewayTestThinkingLevel::Disabled,
+            system_prompt: None,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_default_output_limit() {
+        let request = test_request_with_messages(vec![user_message("hi")]);
+        validate_test_request(&request).expect("4096 is valid");
+    }
+
+    #[test]
+    fn validate_rejects_zero_and_oversized_output_limit() {
+        let mut request = test_request_with_messages(vec![user_message("hi")]);
+        request.max_output_tokens = 0;
+        assert!(validate_test_request(&request).is_err());
+
+        request.max_output_tokens = 16_385;
+        assert!(validate_test_request(&request).is_err());
+
+        request.max_output_tokens = 16_384;
+        validate_test_request(&request).expect("16384 is the upper bound");
+    }
+
+    #[test]
+    fn validate_rejects_empty_or_blank_messages() {
+        let mut request = test_request_with_messages(vec![user_message("   ")]);
+        assert!(validate_test_request(&request).is_err());
+
+        request.messages = vec![];
+        assert!(validate_test_request(&request).is_err());
+    }
+
+    #[test]
+    fn validate_requires_user_first_and_last_turn() {
+        let request = test_request_with_messages(vec![
+            assistant_message("先说话"),
+            user_message("提问"),
+        ]);
+        assert!(validate_test_request(&request).is_err());
+
+        let request = test_request_with_messages(vec![
+            user_message("提问"),
+            assistant_message("回答"),
+        ]);
+        assert!(validate_test_request(&request).is_err());
+    }
+
+    #[test]
+    fn validate_enforces_message_size_limits() {
+        let big = "a".repeat(65 * 1024);
+        let request = test_request_with_messages(vec![user_message(&big)]);
+        assert!(validate_test_request(&request).is_err());
+    }
+
+    #[test]
+    fn parse_chat_response_reports_length_truncation_and_usage() {
+        let body = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "半截回复"},
+                "finish_reason": "length"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4096,
+                "total_tokens": 4106,
+                "prompt_tokens_details": {"cached_tokens": 4},
+                "completion_tokens_details": {"reasoning_tokens": 8}
+            }
+        });
+        let parsed = parse_test_response(GatewayApiFormat::OpenaiChat, &body);
+        assert_eq!(parsed.reply_text, "半截回复");
+        assert_eq!(parsed.finish_reason.as_deref(), Some("length"));
+        assert!(parsed.length_truncated);
+        let usage = parsed.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(4096));
+        assert_eq!(usage.total_tokens, Some(4106));
+        assert_eq!(usage.cache_read_input_tokens, Some(4));
+        assert_eq!(usage.reasoning_tokens, Some(8));
+    }
+
+    #[test]
+    fn parse_responses_response_reports_incomplete_and_usage() {
+        let body = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{
+                "content": [{"type": "output_text", "text": "回复片段"}]
+            }],
+            "usage": {"input_tokens": 7, "output_tokens": 4096, "total_tokens": 4103}
+        });
+        let parsed = parse_test_response(GatewayApiFormat::OpenaiResponses, &body);
+        assert_eq!(parsed.reply_text, "回复片段");
+        assert_eq!(parsed.finish_reason.as_deref(), Some("max_output_tokens"));
+        assert!(parsed.length_truncated);
+        assert_eq!(parsed.usage.unwrap().output_tokens, Some(4096));
+    }
+
+    #[test]
+    fn parse_anthropic_response_reports_stop_reason_and_usage() {
+        let body = json!({
+            "stop_reason": "max_tokens",
+            "content": [{"type": "text", "text": "截断的回复"}],
+            "usage": {"input_tokens": 5, "output_tokens": 4096, "cache_read_input_tokens": 2}
+        });
+        let parsed = parse_test_response(GatewayApiFormat::Anthropic, &body);
+        assert_eq!(parsed.reply_text, "截断的回复");
+        assert_eq!(parsed.finish_reason.as_deref(), Some("max_tokens"));
+        assert!(parsed.length_truncated);
+        let usage = parsed.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(5));
+        assert_eq!(usage.output_tokens, Some(4096));
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
+        assert_eq!(usage.total_tokens, Some(4101));
+    }
+
+    #[test]
+    fn parse_chat_response_without_truncation() {
+        let body = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "完整回复"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5}
+        });
+        let parsed = parse_test_response(GatewayApiFormat::OpenaiChat, &body);
+        assert_eq!(parsed.finish_reason.as_deref(), Some("stop"));
+        assert!(!parsed.length_truncated);
+        assert_eq!(parsed.usage.unwrap().total_tokens, Some(8));
+    }
+
+    #[test]
+    fn pretty_raw_body_formats_large_unicode_json() {
+        let value = json!({
+            "content": "你好，世界！".repeat(200),
+            "nested": {"ok": true}
+        });
+        let raw = serde_json::to_string(&value).expect("compact json");
+        assert!(raw.len() > 2 * 1024);
+        let pretty = pretty_raw_body(&raw);
+        assert!(pretty.contains('\n'), "pretty-printed body should be multi-line");
+        let reparsed: Value = serde_json::from_str(&pretty).expect("pretty body is valid json");
+        assert_eq!(reparsed, value);
+    }
+
+    #[test]
+    fn pretty_raw_body_preserves_non_json_text() {
+        let raw = "not a json body at all";
+        assert_eq!(pretty_raw_body(raw), raw);
+    }
+
+    #[test]
+    fn extract_structured_error_picks_message_fields() {
+        let body = json!({"error": {"message": "boom", "type": "x"}});
+        assert_eq!(extract_structured_error(&body).as_deref(), Some("boom"));
+
+        let body = json!({"detail": "bad input"});
+        assert_eq!(extract_structured_error(&body).as_deref(), Some("bad input"));
+
+        let body = json!({"message": "oops"});
+        assert_eq!(extract_structured_error(&body).as_deref(), Some("oops"));
+
+        assert!(extract_structured_error(&json!({})).is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_mapping() {
+        assert_eq!(GatewayTestThinkingLevel::Disabled.reasoning_effort(), None);
+        assert_eq!(GatewayTestThinkingLevel::Low.reasoning_effort(), Some("low"));
+        assert_eq!(
+            GatewayTestThinkingLevel::Medium.reasoning_effort(),
+            Some("medium")
+        );
+        assert_eq!(GatewayTestThinkingLevel::High.reasoning_effort(), Some("high"));
+    }
+
+    #[test]
+    fn anthropic_budget_maps_to_ratio_of_max_tokens() {
+        // 低 25% / 中 50% / 高 75%，且至少为 1。
+        assert_eq!(
+            GatewayTestThinkingLevel::Low.anthropic_budget(4096),
+            Some(1024)
+        );
+        assert_eq!(
+            GatewayTestThinkingLevel::Medium.anthropic_budget(4096),
+            Some(2048)
+        );
+        assert_eq!(
+            GatewayTestThinkingLevel::High.anthropic_budget(4096),
+            Some(3072)
+        );
+        assert_eq!(
+            GatewayTestThinkingLevel::Disabled.anthropic_budget(4096),
+            None
+        );
+        // 小 max_tokens 也要兜底为 1。
+        assert_eq!(GatewayTestThinkingLevel::Low.anthropic_budget(1), Some(1));
+    }
+
+    #[test]
+    fn chat_payload_injects_reasoning_effort() {
+        let messages = vec![user_message("hi")];
+        let payload = build_test_payload(
+            GatewayApiFormat::OpenaiChat,
+            "model-a",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::High,
+            None,
+        )
+        .expect("chat payload builds");
+        assert_eq!(payload["reasoning_effort"], json!("high"));
+
+        let disabled = build_test_payload(
+            GatewayApiFormat::OpenaiChat,
+            "model-a",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            None,
+        )
+        .expect("chat payload builds");
+        assert!(
+            disabled.get("reasoning_effort").is_none(),
+            "disabled must not emit reasoning_effort"
+        );
+    }
+
+    #[test]
+    fn anthropic_payload_injects_thinking_block() {
+        let messages = vec![user_message("hi")];
+        let payload = build_test_payload(
+            GatewayApiFormat::Anthropic,
+            "claude-model",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Medium,
+            None,
+        )
+        .expect("anthropic payload builds");
+        assert_eq!(payload["thinking"]["type"], json!("enabled"));
+        assert_eq!(payload["thinking"]["budget_tokens"], json!(2048));
+
+        let disabled = build_test_payload(
+            GatewayApiFormat::Anthropic,
+            "claude-model",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            None,
+        )
+        .expect("anthropic payload builds");
+        assert_eq!(disabled["thinking"]["type"], json!("disabled"));
+        assert!(disabled["thinking"].get("budget_tokens").is_none());
+    }
+
+    #[test]
+    fn system_prompt_injected_per_protocol() {
+        let messages = vec![user_message("hi")];
+        let system = Some("you are concise");
+
+        // OpenAI Chat：system 作为 messages 首条。
+        let chat = build_test_payload(
+            GatewayApiFormat::OpenaiChat,
+            "model-a",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            system,
+        )
+        .expect("chat payload builds");
+        assert_eq!(chat["messages"][0]["role"], json!("system"));
+        assert_eq!(chat["messages"][0]["content"], json!("you are concise"));
+        assert_eq!(chat["messages"][1]["role"], json!("user"));
+
+        // Anthropic：system 走顶层字段，不在 messages 里。
+        let anthropic = build_test_payload(
+            GatewayApiFormat::Anthropic,
+            "claude-model",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            system,
+        )
+        .expect("anthropic payload builds");
+        assert_eq!(anthropic["system"], json!("you are concise"));
+        assert_eq!(anthropic["messages"][0]["role"], json!("user"));
+
+        // 空/空白 system 不注入。
+        let blank = build_test_payload(
+            GatewayApiFormat::Anthropic,
+            "claude-model",
+            &messages,
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            Some("   "),
+        )
+        .expect("anthropic payload builds");
+        assert!(blank.get("system").is_none());
     }
 }

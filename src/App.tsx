@@ -11,12 +11,14 @@ import {
   CircleStop,
   Copy,
   Database,
+  Eraser,
   Eye,
   EyeOff,
   LayoutDashboard,
   Maximize2,
   Minus,
   Network,
+  Pencil,
   Play,
   Plus,
   RadioTower,
@@ -34,6 +36,7 @@ import {
   Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Markdown } from "@/components/markdown";
 
 type ApiFormat = "openai_chat" | "openai_responses" | "anthropic";
 type Tab = "dashboard" | "providers" | "routes" | "settings";
@@ -50,6 +53,7 @@ interface ProviderModel {
   upstreamModel: string;
   apiFormat: ApiFormat;
   enabled: boolean;
+  recordBodies?: boolean | null;
 }
 
 interface GatewayProvider {
@@ -70,6 +74,7 @@ interface GatewayProvider {
   reasoningHistoryMode: "auto" | "reasoning_content" | "disabled";
   adaptiveThinkingDisplay: "auto" | "summarized" | "omitted";
   notes: string;
+  recordBodies?: boolean;
   models: ProviderModel[];
 }
 
@@ -134,15 +139,41 @@ interface DetectedProxy {
   port: number;
 }
 
+interface ModelTestUsage {
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  totalTokens?: number | null;
+  cacheReadInputTokens?: number | null;
+  cacheCreationInputTokens?: number | null;
+  reasoningTokens?: number | null;
+}
+
 interface ModelTestResult {
   ok: boolean;
   status: number;
   latencyMs: number;
   replyText: string;
-  rawBodyPreview: string;
+  rawBody: string;
+  rawRequest?: string;
   error?: string | null;
   pathUsed: string;
   proxyEffective?: string | null;
+  finishReason?: string | null;
+  lengthTruncated: boolean;
+  usage?: ModelTestUsage | null;
+}
+
+type ModelTestRole = "user" | "assistant";
+
+type TestThinkingLevel = "disabled" | "low" | "medium" | "high";
+
+interface ModelTestMessage {
+  role: ModelTestRole;
+  content: string;
+  /** 当次发送给上游/网关的整段请求 payload（用户与助手消息共享同一次调用）。 */
+  rawRequest?: string;
+  /** 助手消息：当次返回的原始响应体。 */
+  rawResponse?: string;
 }
 
 interface ModelTestContext {
@@ -168,7 +199,8 @@ const formatLabels: Record<ApiFormat, string> = {
 };
 
 function newId(prefix: string): string {
-  const value = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+  const value =
+    globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
   return `${prefix}-${value}`;
 }
 
@@ -177,7 +209,11 @@ function formatDuration(seconds: number): string {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   const secs = seconds % 60;
-  return [hours ? `${hours} 时` : "", minutes ? `${minutes} 分` : "", `${secs} 秒`]
+  return [
+    hours ? `${hours} 时` : "",
+    minutes ? `${minutes} 分` : "",
+    `${secs} 秒`,
+  ]
     .filter(Boolean)
     .join(" ");
 }
@@ -189,7 +225,9 @@ function maskKey(value: string): string {
 }
 
 function addressForUrl(address: string): string {
-  return address.includes(":") && !address.startsWith("[") ? `[${address}]` : address;
+  return address.includes(":") && !address.startsWith("[")
+    ? `[${address}]`
+    : address;
 }
 
 function allEnabledAliases(config: GatewayConfig): string[] {
@@ -212,16 +250,24 @@ function App() {
   const [status, setStatus] = useState<ProxyStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [startupPreferences, setStartupPreferences] = useState<StartupPreferences | null>(null);
+  const [startupPreferences, setStartupPreferences] =
+    useState<StartupPreferences | null>(null);
   const [startupSettingsBusy, setStartupSettingsBusy] = useState(false);
   const [showLocalKey, setShowLocalKey] = useState(false);
-  const [providerEditor, setProviderEditor] = useState<GatewayProvider | null>(null);
-  const [editingProviderId, setEditingProviderId] = useState<string | null>(null);
+  const [providerEditor, setProviderEditor] = useState<GatewayProvider | null>(
+    null,
+  );
+  const [editingProviderId, setEditingProviderId] = useState<string | null>(
+    null,
+  );
   const [showProviderKey, setShowProviderKey] = useState(false);
   const [headersText, setHeadersText] = useState("");
   const [fetchingModels, setFetchingModels] = useState(false);
-  const [modelsFetchFormat, setModelsFetchFormat] = useState<ApiFormat>("openai_chat");
-  const [expandedProviders, setExpandedProviders] = useState<Record<string, boolean>>({});
+  const [modelsFetchFormat, setModelsFetchFormat] =
+    useState<ApiFormat>("openai_chat");
+  const [expandedProviders, setExpandedProviders] = useState<
+    Record<string, boolean>
+  >({});
   const [testCtx, setTestCtx] = useState<ModelTestContext | null>(null);
 
   // 全局出口代理（独立于网关配置持久化）
@@ -266,7 +312,9 @@ function App() {
 
   const loadStartupPreferences = async () => {
     try {
-      const preferences = await invoke<StartupPreferences>("get_startup_preferences");
+      const preferences = await invoke<StartupPreferences>(
+        "get_startup_preferences",
+      );
       setStartupPreferences(preferences);
     } catch (error) {
       console.warn("Failed to load startup preferences", error);
@@ -274,12 +322,17 @@ function App() {
   };
 
   const updateStartupPreference = async (
-    command: "set_auto_launch" | "set_start_hidden_on_autostart" | "set_minimize_to_tray_on_close",
+    command:
+      | "set_auto_launch"
+      | "set_start_hidden_on_autostart"
+      | "set_minimize_to_tray_on_close",
     enabled: boolean,
   ) => {
     setStartupSettingsBusy(true);
     try {
-      const preferences = await invoke<StartupPreferences>(command, { enabled });
+      const preferences = await invoke<StartupPreferences>(command, {
+        enabled,
+      });
       setStartupPreferences(preferences);
       if (command === "set_auto_launch") {
         toast.success(
@@ -437,6 +490,7 @@ function App() {
       reasoningHistoryMode: "auto",
       adaptiveThinkingDisplay: "auto",
       notes: "",
+      recordBodies: false,
       models: [],
     };
     setEditingProviderId(null);
@@ -459,6 +513,7 @@ function App() {
       reasoningRequestMode: provider.reasoningRequestMode ?? "auto",
       reasoningHistoryMode: provider.reasoningHistoryMode ?? "auto",
       adaptiveThinkingDisplay: provider.adaptiveThinkingDisplay ?? "auto",
+      recordBodies: provider.recordBodies ?? false,
       models: provider.models ?? [],
     });
     setHeadersText(
@@ -499,12 +554,15 @@ function App() {
 
     setFetchingModels(true);
     try {
-      const result = await invoke<ModelFetchResult>("fetch_gateway_provider_models", {
-        request: {
-          provider: { ...providerEditor, customHeaders },
-          apiFormat: modelsFetchFormat,
+      const result = await invoke<ModelFetchResult>(
+        "fetch_gateway_provider_models",
+        {
+          request: {
+            provider: { ...providerEditor, customHeaders },
+            apiFormat: modelsFetchFormat,
+          },
         },
-      });
+      );
       setProviderEditor({
         ...providerEditor,
         customHeaders,
@@ -564,7 +622,10 @@ function App() {
     });
   };
 
-  const patchProvider = (providerId: string, patch: Partial<GatewayProvider>) => {
+  const patchProvider = (
+    providerId: string,
+    patch: Partial<GatewayProvider>,
+  ) => {
     setConfig((current) => ({
       ...current,
       providers: current.providers.map((provider) =>
@@ -593,7 +654,10 @@ function App() {
     }));
   };
 
-  const addProviderModel = (providerId: string, initial?: Partial<ProviderModel>) => {
+  const addProviderModel = (
+    providerId: string,
+    initial?: Partial<ProviderModel>,
+  ) => {
     setConfig((current) => ({
       ...current,
       providers: current.providers.map((provider) =>
@@ -607,6 +671,7 @@ function App() {
                   upstreamModel: initial?.upstreamModel ?? "",
                   apiFormat: initial?.apiFormat ?? "openai_chat",
                   enabled: initial?.enabled ?? true,
+                  recordBodies: initial?.recordBodies ?? null,
                 },
               ],
             }
@@ -623,7 +688,9 @@ function App() {
         provider.id === providerId
           ? {
               ...provider,
-              models: provider.models.filter((_, index) => index !== modelIndex),
+              models: provider.models.filter(
+                (_, index) => index !== modelIndex,
+              ),
             }
           : provider,
       ),
@@ -647,7 +714,10 @@ function App() {
         data-tauri-drag-region
         className="flex h-12 shrink-0 items-center justify-between border-b bg-card px-4"
       >
-        <div data-tauri-drag-region className="flex items-center gap-2 font-semibold">
+        <div
+          data-tauri-drag-region
+          className="flex items-center gap-2 font-semibold"
+        >
           <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary text-primary-foreground">
             <Network className="h-4 w-4" />
           </div>
@@ -657,10 +727,16 @@ function App() {
           </span>
         </div>
         <div className="no-drag flex items-center">
-          <button className="window-button" onClick={() => void appWindow.minimize()}>
+          <button
+            className="window-button"
+            onClick={() => void appWindow.minimize()}
+          >
             <Minus className="h-4 w-4" />
           </button>
-          <button className="window-button" onClick={() => void appWindow.toggleMaximize()}>
+          <button
+            className="window-button"
+            onClick={() => void appWindow.toggleMaximize()}
+          >
             <Maximize2 className="h-3.5 w-3.5" />
           </button>
           <button
@@ -675,18 +751,49 @@ function App() {
       <div className="flex min-h-0 flex-1">
         <aside className="flex w-56 shrink-0 flex-col border-r bg-card/50 p-3">
           <nav className="space-y-1">
-            <NavButton icon={LayoutDashboard} label="运行状态" active={tab === "dashboard"} onClick={() => setTab("dashboard")} />
-            <NavButton icon={Server} label="上游供应商" active={tab === "providers"} onClick={() => setTab("providers")} badge={config.providers.length} />
-            <NavButton icon={Route} label="模型路由" active={tab === "routes"} onClick={() => setTab("routes")} badge={enabledAliases.length} />
-            <NavButton icon={Settings} label="网关设置" active={tab === "settings"} onClick={() => setTab("settings")} />
+            <NavButton
+              icon={LayoutDashboard}
+              label="运行状态"
+              active={tab === "dashboard"}
+              onClick={() => setTab("dashboard")}
+            />
+            <NavButton
+              icon={Server}
+              label="上游供应商"
+              active={tab === "providers"}
+              onClick={() => setTab("providers")}
+              badge={config.providers.length}
+            />
+            <NavButton
+              icon={Route}
+              label="模型路由"
+              active={tab === "routes"}
+              onClick={() => setTab("routes")}
+              badge={enabledAliases.length}
+            />
+            <NavButton
+              icon={Settings}
+              label="网关设置"
+              active={tab === "settings"}
+              onClick={() => setTab("settings")}
+            />
           </nav>
 
           <div className="mt-auto rounded-xl border bg-background p-3">
             <div className="flex items-center gap-2">
-              <span className={cn("h-2.5 w-2.5 rounded-full", status?.running ? "bg-emerald-500" : "bg-muted-foreground/40")} />
-              <span className="text-xs font-medium">{status?.running ? "正在运行" : "已停止"}</span>
+              <span
+                className={cn(
+                  "h-2.5 w-2.5 rounded-full",
+                  status?.running ? "bg-emerald-500" : "bg-muted-foreground/40",
+                )}
+              />
+              <span className="text-xs font-medium">
+                {status?.running ? "正在运行" : "已停止"}
+              </span>
             </div>
-            <div className="mt-2 truncate font-mono text-[10px] text-muted-foreground">{baseUrl}</div>
+            <div className="mt-2 truncate font-mono text-[10px] text-muted-foreground">
+              {baseUrl}
+            </div>
           </div>
         </aside>
 
@@ -709,10 +816,21 @@ function App() {
               <PageHeader
                 title="上游供应商"
                 description="集中保存第三方 API 的地址和 Key；协议在“模型路由”中按模型独立指定。"
-                action={<button className="primary-button" onClick={openNewProvider}><Plus className="h-4 w-4" />添加供应商</button>}
+                action={
+                  <button className="primary-button" onClick={openNewProvider}>
+                    <Plus className="h-4 w-4" />
+                    添加供应商
+                  </button>
+                }
               />
               {config.providers.length === 0 ? (
-                <EmptyState icon={Server} title="还没有供应商" description="先添加一个 OpenAI、Anthropic 或兼容中转 API。" action="添加第一个供应商" onAction={openNewProvider} />
+                <EmptyState
+                  icon={Server}
+                  title="还没有供应商"
+                  description="先添加一个 OpenAI、Anthropic 或兼容中转 API。"
+                  action="添加第一个供应商"
+                  onAction={openNewProvider}
+                />
               ) : (
                 <div className="grid gap-4 lg:grid-cols-2">
                   {config.providers.map((provider) => (
@@ -720,23 +838,60 @@ function App() {
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
                           <div className="flex items-center gap-2">
-                            <span className={cn("h-2.5 w-2.5 rounded-full", provider.enabled ? "bg-emerald-500" : "bg-muted-foreground/40")} />
-                            <h3 className="truncate font-semibold">{provider.name}</h3>
+                            <span
+                              className={cn(
+                                "h-2.5 w-2.5 rounded-full",
+                                provider.enabled
+                                  ? "bg-emerald-500"
+                                  : "bg-muted-foreground/40",
+                              )}
+                            />
+                            <h3 className="truncate font-semibold">
+                              {provider.name}
+                            </h3>
                           </div>
-                          <p className="mt-1 truncate text-xs text-muted-foreground">{provider.baseUrl}</p>
+                          <p className="mt-1 truncate text-xs text-muted-foreground">
+                            {provider.baseUrl}
+                          </p>
                         </div>
                         <div className="flex gap-1">
-                          <button className="icon-button" onClick={() => openProvider(provider)}><Settings className="h-4 w-4" /></button>
-                          <button className="icon-button text-destructive" onClick={() => deleteProvider(provider.id)}><Trash2 className="h-4 w-4" /></button>
+                          <button
+                            className="icon-button"
+                            onClick={() => openProvider(provider)}
+                          >
+                            <Settings className="h-4 w-4" />
+                          </button>
+                          <button
+                            className="icon-button text-destructive"
+                            onClick={() => deleteProvider(provider.id)}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
                         </div>
                       </div>
                       <div className="mt-4 flex flex-wrap gap-2 text-xs">
-                        <span className="tag">{provider.authStyle === "auto" ? "自动鉴权" : provider.authStyle}</span>
-                        <span className="tag font-mono">{maskKey(provider.apiKey)}</span>
-                        <span className="tag">{provider.models.length} 个模型</span>
-                        {(provider.cachedModels?.length ?? 0) > 0 && <span className="tag">缓存 {provider.cachedModels.length}</span>}
+                        <span className="tag">
+                          {provider.authStyle === "auto"
+                            ? "自动鉴权"
+                            : provider.authStyle}
+                        </span>
+                        <span className="tag font-mono">
+                          {maskKey(provider.apiKey)}
+                        </span>
+                        <span className="tag">
+                          {provider.models.length} 个模型
+                        </span>
+                        {(provider.cachedModels?.length ?? 0) > 0 && (
+                          <span className="tag">
+                            缓存 {provider.cachedModels.length}
+                          </span>
+                        )}
                       </div>
-                      {provider.notes && <p className="mt-4 line-clamp-2 text-xs text-muted-foreground">{provider.notes}</p>}
+                      {provider.notes && (
+                        <p className="mt-4 line-clamp-2 text-xs text-muted-foreground">
+                          {provider.notes}
+                        </p>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -749,10 +904,28 @@ function App() {
               <PageHeader
                 title="模型路由"
                 description="按上游供应商分组管理；每个模型独立选择协议、上游模型名、对外别名。"
-                action={<button className="primary-button" disabled={!config.providers.length} onClick={() => config.providers[0] && addProviderModel(config.providers[0].id)}><Plus className="h-4 w-4" />快速添加</button>}
+                action={
+                  <button
+                    className="primary-button"
+                    disabled={!config.providers.length}
+                    onClick={() =>
+                      config.providers[0] &&
+                      addProviderModel(config.providers[0].id)
+                    }
+                  >
+                    <Plus className="h-4 w-4" />
+                    快速添加
+                  </button>
+                }
               />
               {config.providers.length === 0 ? (
-                <EmptyState icon={Route} title="先添加供应商" description="模型路由从供应商派生，需要先在“上游供应商”里添加一个。" action="去添加供应商" onAction={() => setTab("providers")} />
+                <EmptyState
+                  icon={Route}
+                  title="先添加供应商"
+                  description="模型路由从供应商派生，需要先在“上游供应商”里添加一个。"
+                  action="去添加供应商"
+                  onAction={() => setTab("providers")}
+                />
               ) : (
                 <div className="space-y-4">
                   {config.providers.map((provider, providerIndex) => (
@@ -763,14 +936,33 @@ function App() {
                       canMoveUp={providerIndex > 0}
                       canMoveDown={providerIndex < config.providers.length - 1}
                       expanded={expandedProviders[provider.id] !== false}
-                      onToggleExpand={() => setExpandedProviders((c) => ({ ...c, [provider.id]: c[provider.id] === false }))}
+                      onToggleExpand={() =>
+                        setExpandedProviders((c) => ({
+                          ...c,
+                          [provider.id]: c[provider.id] === false,
+                        }))
+                      }
                       onPatch={(patch) => patchProvider(provider.id, patch)}
-                      onMove={(direction) => moveProvider(providerIndex, direction)}
+                      onMove={(direction) =>
+                        moveProvider(providerIndex, direction)
+                      }
                       onEdit={() => openProvider(provider)}
-                      onAddModel={(initial) => addProviderModel(provider.id, initial)}
-                      onPatchModel={(index, patch) => patchProviderModel(provider.id, index, patch)}
-                      onRemoveModel={(index) => removeProviderModel(provider.id, index)}
-                      onTestModel={(modelIndex) => setTestCtx({ providerName: provider.name, provider, modelIndex })}
+                      onAddModel={(initial) =>
+                        addProviderModel(provider.id, initial)
+                      }
+                      onPatchModel={(index, patch) =>
+                        patchProviderModel(provider.id, index, patch)
+                      }
+                      onRemoveModel={(index) =>
+                        removeProviderModel(provider.id, index)
+                      }
+                      onTestModel={(modelIndex) =>
+                        setTestCtx({
+                          providerName: provider.name,
+                          provider,
+                          modelIndex,
+                        })
+                      }
                     />
                   ))}
                 </div>
@@ -780,64 +972,199 @@ function App() {
 
           {tab === "settings" && (
             <section className="mx-auto max-w-4xl">
-              <PageHeader title="网关设置" description="默认只监听本机回环地址，避免 API 暴露到局域网。" />
+              <PageHeader
+                title="网关设置"
+                description="默认只监听本机回环地址，避免 API 暴露到局域网。"
+              />
               <div className="panel divide-y">
-                <SettingRow title="监听地址" description="推荐保持 127.0.0.1。只有明确需要局域网访问时才改为 0.0.0.0。">
-                  <input className="input w-52 font-mono" value={config.listenAddress} onChange={(event) => setConfig({ ...config, listenAddress: event.target.value })} />
+                <SettingRow
+                  title="监听地址"
+                  description="推荐保持 127.0.0.1。只有明确需要局域网访问时才改为 0.0.0.0。"
+                >
+                  <input
+                    className="input w-52 font-mono"
+                    value={config.listenAddress}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        listenAddress: event.target.value,
+                      })
+                    }
+                  />
                 </SettingRow>
-                <SettingRow title="监听端口" description="其他程序将通过这个端口调用统一 API。">
-                  <input className="input w-32 font-mono" type="number" min={1} max={65535} value={config.listenPort} onChange={(event) => setConfig({ ...config, listenPort: Number(event.target.value) })} />
+                <SettingRow
+                  title="监听端口"
+                  description="其他程序将通过这个端口调用统一 API。"
+                >
+                  <input
+                    className="input w-32 font-mono"
+                    type="number"
+                    min={1}
+                    max={65535}
+                    value={config.listenPort}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        listenPort: Number(event.target.value),
+                      })
+                    }
+                  />
                 </SettingRow>
-                <SettingRow title="本地访问鉴权" description="OpenAI 客户端使用 Authorization: Bearer；Anthropic 客户端也可使用 x-api-key。">
-                  <label className="switch-label"><input type="checkbox" checked={config.requireAuth} onChange={(event) => setConfig({ ...config, requireAuth: event.target.checked })} />启用</label>
+                <SettingRow
+                  title="本地访问鉴权"
+                  description="OpenAI 客户端使用 Authorization: Bearer；Anthropic 客户端也可使用 x-api-key。"
+                >
+                  <label className="switch-label">
+                    <input
+                      type="checkbox"
+                      checked={config.requireAuth}
+                      onChange={(event) =>
+                        setConfig({
+                          ...config,
+                          requireAuth: event.target.checked,
+                        })
+                      }
+                    />
+                    启用
+                  </label>
                 </SettingRow>
-                <SettingRow title="本地 API Key" description="这个 Key 只用于访问本地网关，不会发送给上游。">
+                <SettingRow
+                  title="本地 API Key"
+                  description="这个 Key 只用于访问本地网关，不会发送给上游。"
+                >
                   <div className="flex items-center gap-2">
                     <div className="relative">
-                      <input className="input w-80 pr-9 font-mono" type={showLocalKey ? "text" : "password"} value={config.localApiKey} onChange={(event) => setConfig({ ...config, localApiKey: event.target.value })} />
-                      <button className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground" onClick={() => setShowLocalKey(!showLocalKey)}>{showLocalKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button>
+                      <input
+                        className="input w-80 pr-9 font-mono"
+                        type={showLocalKey ? "text" : "password"}
+                        value={config.localApiKey}
+                        onChange={(event) =>
+                          setConfig({
+                            ...config,
+                            localApiKey: event.target.value,
+                          })
+                        }
+                      />
+                      <button
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground"
+                        onClick={() => setShowLocalKey(!showLocalKey)}
+                      >
+                        {showLocalKey ? (
+                          <EyeOff className="h-4 w-4" />
+                        ) : (
+                          <Eye className="h-4 w-4" />
+                        )}
+                      </button>
                     </div>
-                    <button className="secondary-button" onClick={regenerateKey}><RotateCcw className="h-4 w-4" />重新生成</button>
+                    <button
+                      className="secondary-button"
+                      onClick={regenerateKey}
+                    >
+                      <RotateCcw className="h-4 w-4" />
+                      重新生成
+                    </button>
                   </div>
                 </SettingRow>
-                <SettingRow title="开机自启动" description="登录系统时自动启动应用。安装版和便携版均支持；便携版移动后，手动运行一次即可自动修复启动路径。">
+                <SettingRow
+                  title="开机自启动"
+                  description="登录系统时自动启动应用。安装版和便携版均支持；便携版移动后，手动运行一次即可自动修复启动路径。"
+                >
                   <label className="switch-label">
                     <input
                       type="checkbox"
                       disabled={!startupPreferences || startupSettingsBusy}
                       checked={startupPreferences?.launchOnStartup ?? false}
-                      onChange={(event) => void updateStartupPreference("set_auto_launch", event.target.checked)}
+                      onChange={(event) =>
+                        void updateStartupPreference(
+                          "set_auto_launch",
+                          event.target.checked,
+                        )
+                      }
                     />
                     启用
                   </label>
                 </SettingRow>
-                <SettingRow title="以最小化启动" description="仅在“开机自启动”开启时生效。登录后直接进入托盘，不弹出主窗口；手动双击软件仍会正常显示。" nested>
+                <SettingRow
+                  title="以最小化启动"
+                  description="仅在“开机自启动”开启时生效。登录后直接进入托盘，不弹出主窗口；手动双击软件仍会正常显示。"
+                  nested
+                >
                   <label className="switch-label">
                     <input
                       type="checkbox"
-                      disabled={!startupPreferences?.launchOnStartup || startupSettingsBusy}
-                      checked={startupPreferences?.startHiddenOnAutostart ?? false}
-                      onChange={(event) => void updateStartupPreference("set_start_hidden_on_autostart", event.target.checked)}
+                      disabled={
+                        !startupPreferences?.launchOnStartup ||
+                        startupSettingsBusy
+                      }
+                      checked={
+                        startupPreferences?.startHiddenOnAutostart ?? false
+                      }
+                      onChange={(event) =>
+                        void updateStartupPreference(
+                          "set_start_hidden_on_autostart",
+                          event.target.checked,
+                        )
+                      }
                     />
                     启用
                   </label>
                 </SettingRow>
-                <SettingRow title="应用启动后自动启动网关" description="启动桌面软件后自动监听本地端口，但不会修改或接管其他程序的配置。">
-                  <label className="switch-label"><input type="checkbox" checked={config.autoStart} onChange={(event) => setConfig({ ...config, autoStart: event.target.checked })} />启用</label>
+                <SettingRow
+                  title="应用启动后自动启动网关"
+                  description="启动桌面软件后自动监听本地端口，但不会修改或接管其他程序的配置。"
+                >
+                  <label className="switch-label">
+                    <input
+                      type="checkbox"
+                      checked={config.autoStart}
+                      onChange={(event) =>
+                        setConfig({
+                          ...config,
+                          autoStart: event.target.checked,
+                        })
+                      }
+                    />
+                    启用
+                  </label>
                 </SettingRow>
-                <SettingRow title="关闭窗口后继续运行" description="点击右上角关闭按钮时隐藏到托盘；关闭后可从托盘菜单重新打开或彻底退出。">
+                <SettingRow
+                  title="关闭窗口后继续运行"
+                  description="点击右上角关闭按钮时隐藏到托盘；关闭后可从托盘菜单重新打开或彻底退出。"
+                >
                   <label className="switch-label">
                     <input
                       type="checkbox"
                       disabled={!startupPreferences || startupSettingsBusy}
-                      checked={startupPreferences?.minimizeToTrayOnClose ?? true}
-                      onChange={(event) => void updateStartupPreference("set_minimize_to_tray_on_close", event.target.checked)}
+                      checked={
+                        startupPreferences?.minimizeToTrayOnClose ?? true
+                      }
+                      onChange={(event) =>
+                        void updateStartupPreference(
+                          "set_minimize_to_tray_on_close",
+                          event.target.checked,
+                        )
+                      }
                     />
                     启用
                   </label>
                 </SettingRow>
-                <SettingRow title="请求日志" description="记录模型、供应商、延迟、Token 和状态；默认不记录提示词正文。">
-                  <label className="switch-label"><input type="checkbox" checked={config.enableLogging} onChange={(event) => setConfig({ ...config, enableLogging: event.target.checked })} />启用</label>
+                <SettingRow
+                  title="请求日志"
+                  description="记录模型、供应商、延迟、Token 和状态；默认不记录提示词正文。"
+                >
+                  <label className="switch-label">
+                    <input
+                      type="checkbox"
+                      checked={config.enableLogging}
+                      onChange={(event) =>
+                        setConfig({
+                          ...config,
+                          enableLogging: event.target.checked,
+                        })
+                      }
+                    />
+                    启用
+                  </label>
                 </SettingRow>
               </div>
 
@@ -853,25 +1180,57 @@ function App() {
                 </div>
                 <div className="panel space-y-3 p-5">
                   <p className="text-xs text-muted-foreground">
-                    向上游转发时使用的代理。留空 = 直连。支持 http / https / socks5 / socks5h。
+                    向上游转发时使用的代理。留空 = 直连。支持 http / https /
+                    socks5 / socks5h。
                   </p>
                   <div className="flex items-center gap-2">
                     <input
                       className="input flex-1 font-mono"
                       value={globalProxyUrl}
-                      onChange={(event) => setGlobalProxyUrl(event.target.value)}
+                      onChange={(event) =>
+                        setGlobalProxyUrl(event.target.value)
+                      }
                       placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
                     />
-                    <button className="secondary-button" disabled={proxyTesting} onClick={() => void testGlobalProxy()}>
-                      <Zap className={cn("h-4 w-4", proxyTesting && "animate-pulse")} />测试
+                    <button
+                      className="secondary-button"
+                      disabled={proxyTesting}
+                      onClick={() => void testGlobalProxy()}
+                    >
+                      <Zap
+                        className={cn(
+                          "h-4 w-4",
+                          proxyTesting && "animate-pulse",
+                        )}
+                      />
+                      测试
                     </button>
-                    <button className="primary-button" disabled={!proxyDirty || proxyApplying} onClick={() => void applyGlobalProxy()}>
-                      {proxyApplying ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}应用
+                    <button
+                      className="primary-button"
+                      disabled={!proxyDirty || proxyApplying}
+                      onClick={() => void applyGlobalProxy()}
+                    >
+                      {proxyApplying ? (
+                        <RefreshCw className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Check className="h-4 w-4" />
+                      )}
+                      应用
                     </button>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
-                    <button className="secondary-button" disabled={scanningProxies} onClick={() => void scanProxies()}>
-                      <RefreshCw className={cn("h-4 w-4", scanningProxies && "animate-spin")} />扫描本地代理
+                    <button
+                      className="secondary-button"
+                      disabled={scanningProxies}
+                      onClick={() => void scanProxies()}
+                    >
+                      <RefreshCw
+                        className={cn(
+                          "h-4 w-4",
+                          scanningProxies && "animate-spin",
+                        )}
+                      />
+                      扫描本地代理
                     </button>
                     {detectedProxies.map((detected) => (
                       <button
@@ -883,7 +1242,10 @@ function App() {
                       </button>
                     ))}
                     {globalProxyUrl && (
-                      <button className="tag hover:bg-destructive hover:text-destructive-foreground" onClick={() => setGlobalProxyUrl("")}>
+                      <button
+                        className="tag hover:bg-destructive hover:text-destructive-foreground"
+                        onClick={() => setGlobalProxyUrl("")}
+                      >
                         清空
                       </button>
                     )}
@@ -900,9 +1262,25 @@ function App() {
           {dirty ? "有尚未保存的修改" : "所有修改已保存"}
         </div>
         <div className="flex gap-2">
-          {dirty && <button className="secondary-button" onClick={() => setConfig(savedConfig)}><RotateCcw className="h-4 w-4" />撤销</button>}
-          <button className="primary-button" disabled={!dirty || saving} onClick={() => void save()}>
-            {saving ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+          {dirty && (
+            <button
+              className="secondary-button"
+              onClick={() => setConfig(savedConfig)}
+            >
+              <RotateCcw className="h-4 w-4" />
+              撤销
+            </button>
+          )}
+          <button
+            className="primary-button"
+            disabled={!dirty || saving}
+            onClick={() => void save()}
+          >
+            {saving ? (
+              <RefreshCw className="h-4 w-4 animate-spin" />
+            ) : (
+              <Save className="h-4 w-4" />
+            )}
             保存配置
           </button>
         </div>
@@ -931,6 +1309,7 @@ function App() {
           ctx={testCtx}
           gatewayRunning={!!status?.running}
           savedProviders={savedConfig.providers}
+          onCopy={copyText}
           onClose={() => setTestCtx(null)}
         />
       )}
@@ -970,21 +1349,61 @@ function ProviderRoutesCard({
   return (
     <div className="panel overflow-hidden">
       <div className="flex items-center gap-3 border-b p-4">
-        <button className="icon-button" onClick={onToggleExpand} aria-label="展开/收起">
-          {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+        <button
+          className="icon-button"
+          onClick={onToggleExpand}
+          aria-label="展开/收起"
+        >
+          {expanded ? (
+            <ChevronDown className="h-4 w-4" />
+          ) : (
+            <ChevronRight className="h-4 w-4" />
+          )}
         </button>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <span className={cn("h-2.5 w-2.5 rounded-full", provider.enabled ? "bg-emerald-500" : "bg-muted-foreground/40")} />
-            <span className="truncate font-semibold">{provider.name || "(未命名)"}</span>
-            <span className="text-[11px] text-muted-foreground">#{providerIndex + 1}</span>
+            <span
+              className={cn(
+                "h-2.5 w-2.5 rounded-full",
+                provider.enabled ? "bg-emerald-500" : "bg-muted-foreground/40",
+              )}
+            />
+            <span className="truncate font-semibold">
+              {provider.name || "(未命名)"}
+            </span>
+            <span className="text-[11px] text-muted-foreground">
+              #{providerIndex + 1}
+            </span>
           </div>
-          <div className="mt-0.5 truncate text-[11px] text-muted-foreground">{provider.baseUrl}</div>
+          <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
+            {provider.baseUrl}
+          </div>
         </div>
-        <label className="switch-label"><input type="checkbox" checked={provider.enabled} onChange={(event) => onPatch({ enabled: event.target.checked })} />启用</label>
-        <button className="icon-button" disabled={!canMoveUp} onClick={() => onMove(-1)}><ChevronUp className="h-4 w-4" /></button>
-        <button className="icon-button" disabled={!canMoveDown} onClick={() => onMove(1)}><ChevronDown className="h-4 w-4" /></button>
-        <button className="icon-button" onClick={onEdit} title="编辑供应商"><Settings className="h-4 w-4" /></button>
+        <label className="switch-label">
+          <input
+            type="checkbox"
+            checked={provider.enabled}
+            onChange={(event) => onPatch({ enabled: event.target.checked })}
+          />
+          启用
+        </label>
+        <button
+          className="icon-button"
+          disabled={!canMoveUp}
+          onClick={() => onMove(-1)}
+        >
+          <ChevronUp className="h-4 w-4" />
+        </button>
+        <button
+          className="icon-button"
+          disabled={!canMoveDown}
+          onClick={() => onMove(1)}
+        >
+          <ChevronDown className="h-4 w-4" />
+        </button>
+        <button className="icon-button" onClick={onEdit} title="编辑供应商">
+          <Settings className="h-4 w-4" />
+        </button>
       </div>
 
       {expanded && (
@@ -1008,13 +1427,16 @@ function ProviderRoutesCard({
 
           <div className="flex flex-wrap gap-2 pt-2">
             <button className="secondary-button" onClick={() => onAddModel()}>
-              <Plus className="h-4 w-4" />添加模型
+              <Plus className="h-4 w-4" />
+              添加模型
             </button>
             {(provider.cachedModels ?? []).slice(0, 6).map((cached) => (
               <button
                 key={cached.id}
                 className="tag hover:bg-primary hover:text-primary-foreground"
-                onClick={() => onAddModel({ upstreamModel: cached.id, alias: cached.id })}
+                onClick={() =>
+                  onAddModel({ upstreamModel: cached.id, alias: cached.id })
+                }
                 title={cached.displayName || cached.id}
               >
                 + {cached.id}
@@ -1059,19 +1481,53 @@ function ModelRow({
         />
         <datalist id={listId}>
           {cachedModels.map((cached) => (
-            <option key={cached.id} value={cached.id}>{cached.displayName || cached.ownedBy || cached.id}</option>
+            <option key={cached.id} value={cached.id}>
+              {cached.displayName || cached.ownedBy || cached.id}
+            </option>
           ))}
         </datalist>
       </div>
-      <select className="input" value={model.apiFormat} onChange={(event) => onPatch({ apiFormat: event.target.value as ApiFormat })}>
+      <select
+        className="input"
+        value={model.apiFormat}
+        onChange={(event) =>
+          onPatch({ apiFormat: event.target.value as ApiFormat })
+        }
+      >
         <option value="openai_chat">OpenAI Chat</option>
         <option value="openai_responses">OpenAI Responses</option>
         <option value="anthropic">Anthropic Messages</option>
       </select>
-      <label className="switch-label"><input type="checkbox" checked={model.enabled} onChange={(event) => onPatch({ enabled: event.target.checked })} />启用</label>
+      <label className="switch-label">
+        <input
+          type="checkbox"
+          checked={model.enabled}
+          onChange={(event) => onPatch({ enabled: event.target.checked })}
+        />
+        启用
+      </label>
+      <label className="switch-label">
+        <input
+          type="checkbox"
+          checked={model.recordBodies ?? false}
+          onChange={(event) =>
+            onPatch({ recordBodies: event.target.checked || null })
+          }
+          title="单独强制录制此模型的请求/响应体"
+        />
+        录制
+      </label>
       <div className="flex gap-1">
-        <button className="icon-button" onClick={onTest} title="测试此模型"><Send className="h-4 w-4" /></button>
-        <button className="icon-button text-destructive" onClick={onRemove} title="删除"><Trash2 className="h-4 w-4" /></button>
+        <button className="icon-button" onClick={onTest} title="测试此模型">
+          <Send className="h-4 w-4" />
+        </button>
+        <button
+          className="icon-button text-destructive"
+          onClick={onRemove}
+          title="删除"
+        >
+          <Trash2 className="h-4 w-4" />
+        </button>
       </div>
     </div>
   );
@@ -1107,50 +1563,218 @@ function ProviderEditorModal({
   onFetchModels: () => void;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
       <div className="panel max-h-[90vh] w-full max-w-2xl overflow-y-auto p-6 shadow-2xl">
         <div className="mb-5 flex items-center justify-between">
           <div>
-            <h2 className="text-lg font-semibold">{isEditing ? "编辑供应商" : "添加供应商"}</h2>
-            <p className="mt-1 text-xs text-muted-foreground">协议不再绑定在供应商上，请在“模型路由”里为每个模型独立选择。</p>
+            <h2 className="text-lg font-semibold">
+              {isEditing ? "编辑供应商" : "添加供应商"}
+            </h2>
+            <p className="mt-1 text-xs text-muted-foreground">
+              协议不再绑定在供应商上，请在“模型路由”里为每个模型独立选择。
+            </p>
           </div>
-          <button className="icon-button" onClick={onClose}><X className="h-4 w-4" /></button>
+          <button className="icon-button" onClick={onClose}>
+            <X className="h-4 w-4" />
+          </button>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="名称"><input className="input w-full" value={provider.name} onChange={(event) => onChange({ ...provider, name: event.target.value })} placeholder="例如 OpenRouter" /></Field>
-          <Field label="状态"><label className="switch-label h-10"><input type="checkbox" checked={provider.enabled} onChange={(event) => onChange({ ...provider, enabled: event.target.checked })} />启用供应商</label></Field>
-          <div className="sm:col-span-2"><Field label="Base URL"><input className="input w-full font-mono" value={provider.baseUrl} onChange={(event) => onChange({ ...provider, baseUrl: event.target.value })} placeholder="https://api.example.com/v1" /></Field></div>
-          <div className="sm:col-span-2"><Field label="API Key"><div className="relative"><input className="input w-full pr-10 font-mono" type={showProviderKey ? "text" : "password"} value={provider.apiKey} onChange={(event) => onChange({ ...provider, apiKey: event.target.value })} placeholder="sk-..." /><button className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground" onClick={onToggleProviderKey}>{showProviderKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button></div></Field></div>
-          <Field label="鉴权方式"><select className="input w-full" value={provider.authStyle} onChange={(event) => onChange({ ...provider, authStyle: event.target.value as GatewayProvider["authStyle"] })}><option value="auto">自动</option><option value="bearer">Authorization: Bearer</option><option value="x-api-key">x-api-key</option></select></Field>
-          <Field label="模型列表 URL（可选）"><input className="input w-full font-mono" value={provider.modelsUrl} onChange={(event) => onChange({ ...provider, modelsUrl: event.target.value })} placeholder="留空时自动尝试 /v1/models" /></Field>
-          <div className="sm:col-span-2"><Field label="自定义 User-Agent（可选）"><input className="input w-full font-mono" value={provider.customUserAgent} onChange={(event) => onChange({ ...provider, customUserAgent: event.target.value })} placeholder="例如 MyClient/1.0" /></Field><p className="mt-1 text-[11px] leading-5 text-muted-foreground">用于上游公开兼容要求；不会注入官方客户端私有令牌、身份提示词或设备指纹。</p></div>
+          <Field label="名称">
+            <input
+              className="input w-full"
+              value={provider.name}
+              onChange={(event) =>
+                onChange({ ...provider, name: event.target.value })
+              }
+              placeholder="例如 OpenRouter"
+            />
+          </Field>
+          <Field label="状态">
+            <label className="switch-label h-10">
+              <input
+                type="checkbox"
+                checked={provider.enabled}
+                onChange={(event) =>
+                  onChange({ ...provider, enabled: event.target.checked })
+                }
+              />
+              启用供应商
+            </label>
+          </Field>
+          <div className="sm:col-span-2">
+            <Field label="Base URL">
+              <input
+                className="input w-full font-mono"
+                value={provider.baseUrl}
+                onChange={(event) =>
+                  onChange({ ...provider, baseUrl: event.target.value })
+                }
+                placeholder="https://api.example.com/v1"
+              />
+            </Field>
+          </div>
+          <div className="sm:col-span-2">
+            <Field label="API Key">
+              <div className="relative">
+                <input
+                  className="input w-full pr-10 font-mono"
+                  type={showProviderKey ? "text" : "password"}
+                  value={provider.apiKey}
+                  onChange={(event) =>
+                    onChange({ ...provider, apiKey: event.target.value })
+                  }
+                  placeholder="sk-..."
+                />
+                <button
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground"
+                  onClick={onToggleProviderKey}
+                >
+                  {showProviderKey ? (
+                    <EyeOff className="h-4 w-4" />
+                  ) : (
+                    <Eye className="h-4 w-4" />
+                  )}
+                </button>
+              </div>
+            </Field>
+          </div>
+          <Field label="鉴权方式">
+            <select
+              className="input w-full"
+              value={provider.authStyle}
+              onChange={(event) =>
+                onChange({
+                  ...provider,
+                  authStyle: event.target.value as GatewayProvider["authStyle"],
+                })
+              }
+            >
+              <option value="auto">自动</option>
+              <option value="bearer">Authorization: Bearer</option>
+              <option value="x-api-key">x-api-key</option>
+            </select>
+          </Field>
+          <Field label="模型列表 URL（可选）">
+            <input
+              className="input w-full font-mono"
+              value={provider.modelsUrl}
+              onChange={(event) =>
+                onChange({ ...provider, modelsUrl: event.target.value })
+              }
+              placeholder="留空时自动尝试 /v1/models"
+            />
+          </Field>
+          <div className="sm:col-span-2">
+            <Field label="自定义 User-Agent（可选）">
+              <input
+                className="input w-full font-mono"
+                value={provider.customUserAgent}
+                onChange={(event) =>
+                  onChange({ ...provider, customUserAgent: event.target.value })
+                }
+                placeholder="例如 MyClient/1.0"
+              />
+            </Field>
+            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+              用于上游公开兼容要求；不会注入官方客户端私有令牌、身份提示词或设备指纹。
+            </p>
+          </div>
           <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
-            <label className="switch-label"><input type="checkbox" checked={provider.impersonateCodexClient} onChange={(event) => onChange({ ...provider, impersonateCodexClient: event.target.checked })} />以 Codex 客户端身份转发</label>
-            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">部分上游会校验客户端指纹（返回 <code>unauthorized client detected</code>）。开启后转发时发送 <code>codex_cli_rs</code> 的 User-Agent 及成对的 <code>originator</code>/<code>version</code> 兼容标识。</p>
+            <label className="switch-label">
+              <input
+                type="checkbox"
+                checked={provider.impersonateCodexClient}
+                onChange={(event) =>
+                  onChange({
+                    ...provider,
+                    impersonateCodexClient: event.target.checked,
+                  })
+                }
+              />
+              以 Codex 客户端身份转发
+            </label>
+            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+              部分上游会校验客户端指纹（返回{" "}
+              <code>unauthorized client detected</code>）。开启后转发时发送{" "}
+              <code>codex_cli_rs</code> 的 User-Agent 及成对的{" "}
+              <code>originator</code>/<code>version</code> 兼容标识。
+            </p>
             {provider.impersonateCodexClient && (
-              <div className="mt-2"><Field label="Codex 版本（可选）"><input className="input w-full font-mono" value={provider.codexClientVersion} onChange={(event) => onChange({ ...provider, codexClientVersion: event.target.value })} placeholder="留空使用默认 0.144.1" /></Field></div>
+              <div className="mt-2">
+                <Field label="Codex 版本（可选）">
+                  <input
+                    className="input w-full font-mono"
+                    value={provider.codexClientVersion}
+                    onChange={(event) =>
+                      onChange({
+                        ...provider,
+                        codexClientVersion: event.target.value,
+                      })
+                    }
+                    placeholder="留空使用默认 0.144.1"
+                  />
+                </Field>
+              </div>
             )}
           </div>
           <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
             <div className="text-xs font-medium">推理兼容（高级）</div>
-            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">默认保持自动判断。只有第三方接口不返回思考、错误发送推理参数导致 400，或原生 Claude adaptive thinking 不展示摘要时才需要调整。</p>
+            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+              默认保持自动判断。只有第三方接口不返回思考、错误发送推理参数导致
+              400，或原生 Claude adaptive thinking 不展示摘要时才需要调整。
+            </p>
             <div className="mt-3 grid gap-3 sm:grid-cols-3">
               <Field label="推理请求映射">
-                <select className="input w-full" value={provider.reasoningRequestMode} onChange={(event) => onChange({ ...provider, reasoningRequestMode: event.target.value as GatewayProvider["reasoningRequestMode"] })}>
+                <select
+                  className="input w-full"
+                  value={provider.reasoningRequestMode}
+                  onChange={(event) =>
+                    onChange({
+                      ...provider,
+                      reasoningRequestMode: event.target
+                        .value as GatewayProvider["reasoningRequestMode"],
+                    })
+                  }
+                >
                   <option value="auto">自动</option>
                   <option value="force">强制映射 effort</option>
                   <option value="disabled">不发送 effort</option>
                 </select>
               </Field>
               <Field label="历史推理回传">
-                <select className="input w-full" value={provider.reasoningHistoryMode} onChange={(event) => onChange({ ...provider, reasoningHistoryMode: event.target.value as GatewayProvider["reasoningHistoryMode"] })}>
+                <select
+                  className="input w-full"
+                  value={provider.reasoningHistoryMode}
+                  onChange={(event) =>
+                    onChange({
+                      ...provider,
+                      reasoningHistoryMode: event.target
+                        .value as GatewayProvider["reasoningHistoryMode"],
+                    })
+                  }
+                >
                   <option value="auto">自动</option>
                   <option value="reasoning_content">reasoning_content</option>
                   <option value="disabled">关闭</option>
                 </select>
               </Field>
               <Field label="Adaptive 展示">
-                <select className="input w-full" value={provider.adaptiveThinkingDisplay} onChange={(event) => onChange({ ...provider, adaptiveThinkingDisplay: event.target.value as GatewayProvider["adaptiveThinkingDisplay"] })}>
+                <select
+                  className="input w-full"
+                  value={provider.adaptiveThinkingDisplay}
+                  onChange={(event) =>
+                    onChange({
+                      ...provider,
+                      adaptiveThinkingDisplay: event.target
+                        .value as GatewayProvider["adaptiveThinkingDisplay"],
+                    })
+                  }
+                >
                   <option value="auto">自动（不改写）</option>
                   <option value="summarized">显示摘要</option>
                   <option value="omitted">不显示摘要</option>
@@ -1158,36 +1782,125 @@ function ProviderEditorModal({
               </Field>
             </div>
           </div>
-          <div className="sm:col-span-2"><Field label="自定义请求头（每行一个 Header: Value）"><textarea className="input min-h-24 w-full resize-y font-mono text-xs" value={headersText} onChange={(event) => onHeadersText(event.target.value)} placeholder={"HTTP-Referer: https://example.com\nX-Title: My Gateway"} /></Field></div>
+          <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
+            <label className="switch-label">
+              <input
+                type="checkbox"
+                checked={provider.recordBodies ?? false}
+                onChange={(event) =>
+                  onChange({
+                    ...provider,
+                    recordBodies: event.target.checked,
+                  })
+                }
+              />
+              录制请求/响应体（诊断）
+            </label>
+            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+              把实际发往该供应商的最终请求体和上游响应体转储为 JSONL 文件
+              （日志目录下 <code>request-bodies/</code>），用于核对中转站实际
+              收到的内容。也可在下方单个模型上强制开启或排除。含完整对话内容，
+              排查完成后请及时关闭。
+            </p>
+          </div>
+          <div className="sm:col-span-2">
+            <Field label="自定义请求头（每行一个 Header: Value）">
+              <textarea
+                className="input min-h-24 w-full resize-y font-mono text-xs"
+                value={headersText}
+                onChange={(event) => onHeadersText(event.target.value)}
+                placeholder={
+                  "HTTP-Referer: https://example.com\nX-Title: My Gateway"
+                }
+              />
+            </Field>
+          </div>
           <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <div className="text-xs font-medium">上游模型列表（供“模型路由”自动补全）</div>
-                <div className="mt-1 text-[11px] text-muted-foreground">{provider.cachedModels.length ? `已缓存 ${provider.cachedModels.length} 个模型` : "尚未获取"}{provider.modelsFetchedAt ? ` · ${new Date(provider.modelsFetchedAt).toLocaleString()}` : ""}</div>
+                <div className="text-xs font-medium">
+                  上游模型列表（供“模型路由”自动补全）
+                </div>
+                <div className="mt-1 text-[11px] text-muted-foreground">
+                  {provider.cachedModels.length
+                    ? `已缓存 ${provider.cachedModels.length} 个模型`
+                    : "尚未获取"}
+                  {provider.modelsFetchedAt
+                    ? ` · ${new Date(provider.modelsFetchedAt).toLocaleString()}`
+                    : ""}
+                </div>
               </div>
               <div className="flex items-center gap-2">
-                <select className="input" value={modelsFetchFormat} onChange={(event) => onModelsFetchFormat(event.target.value as ApiFormat)}>
+                <select
+                  className="input"
+                  value={modelsFetchFormat}
+                  onChange={(event) =>
+                    onModelsFetchFormat(event.target.value as ApiFormat)
+                  }
+                >
                   <option value="openai_chat">OpenAI Chat</option>
                   <option value="openai_responses">OpenAI Responses</option>
                   <option value="anthropic">Anthropic Messages</option>
                 </select>
-                <button className="secondary-button" disabled={fetchingModels} onClick={onFetchModels}>
-                  <RefreshCw className={cn("h-4 w-4", fetchingModels && "animate-spin")} />
+                <button
+                  className="secondary-button"
+                  disabled={fetchingModels}
+                  onClick={onFetchModels}
+                >
+                  <RefreshCw
+                    className={cn("h-4 w-4", fetchingModels && "animate-spin")}
+                  />
                   {fetchingModels ? "获取中" : "获取模型"}
                 </button>
               </div>
             </div>
-            {provider.cachedModels.length > 0 && <div className="mt-3 max-h-36 overflow-y-auto rounded border bg-background p-2 font-mono text-[11px] leading-5">{provider.cachedModels.map((model) => <div key={model.id} className="truncate" title={model.displayName || model.id}>{model.id}</div>)}</div>}
+            {provider.cachedModels.length > 0 && (
+              <div className="mt-3 max-h-36 overflow-y-auto rounded border bg-background p-2 font-mono text-[11px] leading-5">
+                {provider.cachedModels.map((model) => (
+                  <div
+                    key={model.id}
+                    className="truncate"
+                    title={model.displayName || model.id}
+                  >
+                    {model.id}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-          <div className="sm:col-span-2"><Field label="备注"><textarea className="input min-h-20 w-full resize-y" value={provider.notes} onChange={(event) => onChange({ ...provider, notes: event.target.value })} /></Field></div>
+          <div className="sm:col-span-2">
+            <Field label="备注">
+              <textarea
+                className="input min-h-20 w-full resize-y"
+                value={provider.notes}
+                onChange={(event) =>
+                  onChange({ ...provider, notes: event.target.value })
+                }
+              />
+            </Field>
+          </div>
         </div>
-        <div className="mt-6 flex justify-end gap-2"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" onClick={onSubmit}><Check className="h-4 w-4" />确定</button></div>
+        <div className="mt-6 flex justify-end gap-2">
+          <button className="secondary-button" onClick={onClose}>
+            取消
+          </button>
+          <button className="primary-button" onClick={onSubmit}>
+            <Check className="h-4 w-4" />
+            确定
+          </button>
+        </div>
       </div>
     </div>
   );
 }
 
-function SegmentedOption({ name, checked, disabled = false, onChange, children }: {
+function SegmentedOption({
+  name,
+  checked,
+  disabled = false,
+  onChange,
+  children,
+}: {
   name: string;
   checked: boolean;
   disabled?: boolean;
@@ -1195,12 +1908,23 @@ function SegmentedOption({ name, checked, disabled = false, onChange, children }
   children: ReactNode;
 }) {
   return (
-    <label className={cn(
-      "flex min-h-10 cursor-pointer select-none items-center justify-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors",
-      checked ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:bg-background/60 hover:text-foreground",
-      disabled && "pointer-events-none cursor-not-allowed opacity-40",
-    )}>
-      <input className="sr-only" type="radio" name={name} checked={checked} disabled={disabled} onChange={onChange} />
+    <label
+      className={cn(
+        "flex min-h-10 cursor-pointer select-none items-center justify-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors",
+        checked
+          ? "bg-background text-foreground shadow-sm"
+          : "text-muted-foreground hover:bg-background/60 hover:text-foreground",
+        disabled && "pointer-events-none cursor-not-allowed opacity-40",
+      )}
+    >
+      <input
+        className="sr-only"
+        type="radio"
+        name={name}
+        checked={checked}
+        disabled={disabled}
+        onChange={onChange}
+      />
       {checked && <Check className="h-3.5 w-3.5 shrink-0 text-emerald-500" />}
       <span>{children}</span>
     </label>
@@ -1211,21 +1935,30 @@ function ModelTestModal({
   ctx,
   gatewayRunning,
   savedProviders,
+  onCopy,
   onClose,
 }: {
   ctx: ModelTestContext;
   gatewayRunning: boolean;
   savedProviders: GatewayProvider[];
+  onCopy: (text: string, label: string) => void;
   onClose: () => void;
 }) {
   const model = ctx.provider.models[ctx.modelIndex];
-  const [prompt, setPrompt] = useState("用一句话介绍你自己。");
+  const [history, setHistory] = useState<ModelTestMessage[]>([]);
+  const [draft, setDraft] = useState("用一句话介绍你自己。");
+  const [maxOutputTokensText, setMaxOutputTokensText] = useState("4096");
+  const [thinkingLevel, setThinkingLevel] =
+    useState<TestThinkingLevel>("disabled");
+  const [systemPrompt, setSystemPrompt] = useState("");
   const [viaGateway, setViaGateway] = useState<"direct" | "gateway">("direct");
   const [proxyMode, setProxyMode] = useState<ProxyMode>("bypass");
   const [customProxyUrl, setCustomProxyUrl] = useState("");
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<ModelTestResult | null>(null);
-  const [showRaw, setShowRaw] = useState(false);
+  const [showConfig, setShowConfig] = useState(false);
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const initialLoad = useRef(false);
 
   useEffect(() => {
@@ -1238,6 +1971,20 @@ function ModelTestModal({
         .catch(() => {});
     }
   }, []);
+
+  // 对话流新增内容后自动滚到底部。
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [history, running, result]);
+
+  const maxOutputTokens = Number(maxOutputTokensText);
+  const maxTokensValid =
+    Number.isInteger(maxOutputTokens) &&
+    maxOutputTokens >= 1 &&
+    maxOutputTokens <= 16384;
+  const draftTrimmed = draft.trim();
+  const canSend = !running && maxTokensValid && draftTrimmed.length > 0;
 
   // 判断此模型行是否已在“已保存”配置里（用于判断能否通过网关测试）
   const savedProvider = savedProviders.find((p) => p.id === ctx.provider.id);
@@ -1255,11 +2002,40 @@ function ModelTestModal({
   );
   const gatewayAllowed = gatewayRunning && aliasIsSaved && !!savedAlias;
 
+  const updateHistoryMessage = (index: number, content: string) => {
+    setHistory((current) =>
+      current.map((message, i) =>
+        i === index ? { ...message, content } : message,
+      ),
+    );
+  };
+  const deleteHistoryMessage = (index: number) => {
+    setHistory((current) => current.filter((_, i) => i !== index));
+  };
+  const clearSession = () => {
+    setHistory([]);
+    setDraft("用一句话介绍你自己。");
+    setResult(null);
+    setEditingIndex(null);
+  };
+
   const run = async () => {
     if (!model.upstreamModel.trim()) {
       toast.error("请先填写上游模型名");
       return;
     }
+    if (!maxTokensValid) {
+      toast.error("最大输出 token 必须是 1 到 16384 之间的整数");
+      return;
+    }
+    if (!draftTrimmed) {
+      toast.error("请输入测试消息");
+      return;
+    }
+    const outgoingHistory = [
+      ...history,
+      { role: "user" as ModelTestRole, content: draft },
+    ];
     setRunning(true);
     setResult(null);
     try {
@@ -1269,23 +2045,41 @@ function ModelTestModal({
           upstreamModel: model.upstreamModel,
           alias: model.alias,
           apiFormat: model.apiFormat,
-          prompt,
+          messages: outgoingHistory,
+          maxOutputTokens: maxOutputTokens,
+          thinkingLevel,
+          systemPrompt: systemPrompt.trim() || undefined,
           viaGateway: viaGateway === "gateway",
           proxyMode,
           customProxyUrl,
         },
       });
       setResult(res);
+      if (res.ok && res.replyText.trim()) {
+        const rawRequest = res.rawRequest ?? "";
+        setHistory([
+          ...history,
+          { role: "user", content: draft, rawRequest },
+          {
+            role: "assistant",
+            content: res.replyText,
+            rawRequest,
+            rawResponse: res.rawBody,
+          },
+        ]);
+        setDraft("");
+      }
     } catch (error) {
       setResult({
         ok: false,
         status: 0,
         latencyMs: 0,
         replyText: "",
-        rawBodyPreview: "",
+        rawBody: "",
         error: String(error),
         pathUsed: viaGateway,
         proxyEffective: null,
+        lengthTruncated: false,
       });
     } finally {
       setRunning(false);
@@ -1293,124 +2087,473 @@ function ModelTestModal({
   };
 
   const proxyDisabled = viaGateway === "gateway";
+  const usageSummary = result?.usage
+    ? [
+        result.usage.inputTokens != null
+          ? `输入 ${result.usage.inputTokens}`
+          : null,
+        result.usage.outputTokens != null
+          ? `输出 ${result.usage.outputTokens}`
+          : null,
+        result.usage.totalTokens != null
+          ? `合计 ${result.usage.totalTokens}`
+          : null,
+        result.usage.cacheReadInputTokens != null
+          ? `缓存读 ${result.usage.cacheReadInputTokens}`
+          : null,
+        result.usage.reasoningTokens != null
+          ? `推理 ${result.usage.reasoningTokens}`
+          : null,
+      ].filter(Boolean)
+    : [];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <div className="panel max-h-[90vh] w-full max-w-2xl overflow-y-auto p-6 shadow-2xl">
-        <div className="mb-4 flex items-start justify-between gap-3">
-          <div>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="panel flex max-h-[90vh] w-full max-w-3xl flex-col shadow-2xl">
+        {/* 标题栏 */}
+        <div className="flex items-start justify-between gap-3 border-b p-4">
+          <div className="min-w-0">
             <h2 className="text-lg font-semibold">模型测试对话</h2>
-            <p className="mt-1 text-xs text-muted-foreground">
-              {ctx.providerName} · 上游模型 <code className="font-mono">{model.upstreamModel || "(空)"}</code> · 协议 {formatLabels[model.apiFormat]}
-              {savedAlias ? <> · 别名 <code className="font-mono">{savedAlias}</code></> : null}
+            <p className="mt-1 truncate text-xs text-muted-foreground">
+              {ctx.providerName} · 上游模型{" "}
+              <code className="font-mono">{model.upstreamModel || "(空)"}</code>{" "}
+              · 协议 {formatLabels[model.apiFormat]}
+              {savedAlias ? (
+                <>
+                  {" "}
+                  · 别名 <code className="font-mono">{savedAlias}</code>
+                </>
+              ) : null}
             </p>
           </div>
-          <button className="icon-button" onClick={onClose}><X className="h-4 w-4" /></button>
-        </div>
-
-        <div className="space-y-4">
-          <div className="rounded-xl border bg-muted/20 p-4">
-            <div className="mb-3 text-sm font-medium">请求路径</div>
-            <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted p-1">
-              <SegmentedOption name="viaGateway" checked={viaGateway === "direct"} onChange={() => setViaGateway("direct")}>直连上游</SegmentedOption>
-              <SegmentedOption name="viaGateway" checked={viaGateway === "gateway"} disabled={!gatewayAllowed} onChange={() => setViaGateway("gateway")}>通过本地网关</SegmentedOption>
-            </div>
-            {!gatewayAllowed && (
-              <div className="mt-2.5 text-[11px] leading-5 text-muted-foreground">
-                {gatewayRunning ? "此模型条目尚未保存到运行配置中，无法通过网关测试。" : "网关未启动，无法通过网关测试。"}
-              </div>
-            )}
-          </div>
-
-          <div className={cn("rounded-xl border bg-muted/20 p-4", proxyDisabled && "opacity-60")}>
-            <div className="mb-3 flex flex-wrap items-center gap-2">
-              <Shield className="h-4 w-4 text-muted-foreground" />
-              <span className="text-sm font-medium">出口方式</span>
-              {proxyDisabled && <span className="text-[11px] text-muted-foreground">通过网关时由网关全局设置决定</span>}
-            </div>
-            <div className="grid grid-cols-3 gap-1 rounded-lg bg-muted p-1">
-              <SegmentedOption name="proxyMode" checked={!proxyDisabled && proxyMode === "bypass"} disabled={proxyDisabled} onChange={() => setProxyMode("bypass")}>直接连接</SegmentedOption>
-              <SegmentedOption name="proxyMode" checked={!proxyDisabled && proxyMode === "follow_global"} disabled={proxyDisabled} onChange={() => setProxyMode("follow_global")}>跟随全局</SegmentedOption>
-              <SegmentedOption name="proxyMode" checked={!proxyDisabled && proxyMode === "custom"} disabled={proxyDisabled} onChange={() => setProxyMode("custom")}>临时代理</SegmentedOption>
-            </div>
-            {!proxyDisabled && proxyMode === "bypass" && (
-              <p className="mt-2.5 text-[11px] leading-5 text-muted-foreground">本次测试强制直连上游，不使用全局设置或系统环境变量中的代理。</p>
-            )}
-            {proxyMode === "custom" && !proxyDisabled && (
-              <input
-                className="input mt-3 w-full font-mono"
-                value={customProxyUrl}
-                onChange={(event) => setCustomProxyUrl(event.target.value)}
-                placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+          <div className="flex items-center gap-1">
+            <button
+              className={cn("secondary-button", showConfig && "bg-muted")}
+              onClick={() => setShowConfig(!showConfig)}
+              title="请求路径 / 出口方式 / token"
+              aria-label="请求路径 / 出口方式 / token"
+            >
+              <Settings className="h-4 w-4" />
+              配置
+              <ChevronDown
+                className={cn(
+                  "h-3.5 w-3.5 transition",
+                  showConfig && "rotate-180",
+                )}
               />
-            )}
-          </div>
-
-          <div>
-            <div className="mb-1 text-xs font-medium text-muted-foreground">消息</div>
-            <textarea
-              className="input min-h-24 w-full resize-y"
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-            />
-          </div>
-
-          <div className="flex justify-end gap-2">
-            <button className="secondary-button" onClick={onClose}>关闭</button>
-            <button className="primary-button" disabled={running} onClick={() => void run()}>
-              {running ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-              发送
+            </button>
+            <button className="icon-button" onClick={onClose} aria-label="关闭">
+              <X className="h-4 w-4" />
             </button>
           </div>
+        </div>
 
-          {result && (
-            <div className="rounded-lg border">
-              <div className={cn(
-                "flex flex-wrap items-center gap-2 border-b px-3 py-2 text-xs",
-                result.ok ? "bg-emerald-50 dark:bg-emerald-950/30" : "bg-destructive/5",
-              )}>
-                <span className={cn("font-semibold", result.ok ? "text-emerald-700 dark:text-emerald-300" : "text-destructive")}>
-                  {result.ok ? "成功" : "失败"}
-                </span>
-                {result.status > 0 && <span>· HTTP {result.status}</span>}
-                <span>· {result.latencyMs}ms</span>
-                <span>· {result.pathUsed === "gateway" ? "通过网关" : "直连"}</span>
-                <span>· {result.proxyEffective ? `代理 ${result.proxyEffective}` : "无代理"}</span>
+        {/* 可折叠配置面板 */}
+        {showConfig && (
+          <div className="max-h-[45vh] shrink-0 space-y-4 overflow-y-auto border-b bg-muted/20 p-4">
+            <div>
+              <div className="mb-2 text-xs font-medium text-muted-foreground">
+                系统提示词
               </div>
-              <div className="p-3">
-                {result.error && (
-                  <div className="mb-3 rounded border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
-                    {result.error}
+              <textarea
+                className="input min-h-16 w-full resize-y text-xs leading-5"
+                value={systemPrompt}
+                onChange={(event) => setSystemPrompt(event.target.value)}
+                disabled={running}
+                placeholder="可选。留空则不注入 system 消息。"
+              />
+            </div>
+            <div>
+              <div className="mb-2 text-xs font-medium text-muted-foreground">
+                请求路径
+              </div>
+              <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted p-1">
+                <SegmentedOption
+                  name="viaGateway"
+                  checked={viaGateway === "direct"}
+                  onChange={() => setViaGateway("direct")}
+                >
+                  直连上游
+                </SegmentedOption>
+                <SegmentedOption
+                  name="viaGateway"
+                  checked={viaGateway === "gateway"}
+                  disabled={!gatewayAllowed}
+                  onChange={() => setViaGateway("gateway")}
+                >
+                  通过本地网关
+                </SegmentedOption>
+              </div>
+              {!gatewayAllowed && (
+                <div className="mt-2 text-[11px] leading-5 text-muted-foreground">
+                  {gatewayRunning
+                    ? "此模型条目尚未保存到运行配置中，无法通过网关测试。"
+                    : "网关未启动，无法通过网关测试。"}
+                </div>
+              )}
+            </div>
+
+            <div className={cn(proxyDisabled && "opacity-60")}>
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <Shield className="h-4 w-4 text-muted-foreground" />
+                <span className="text-xs font-medium">出口方式</span>
+                {proxyDisabled && (
+                  <span className="text-[11px] text-muted-foreground">
+                    通过网关时由网关全局设置决定
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-3 gap-1 rounded-lg bg-muted p-1">
+                <SegmentedOption
+                  name="proxyMode"
+                  checked={!proxyDisabled && proxyMode === "bypass"}
+                  disabled={proxyDisabled}
+                  onChange={() => setProxyMode("bypass")}
+                >
+                  直接连接
+                </SegmentedOption>
+                <SegmentedOption
+                  name="proxyMode"
+                  checked={!proxyDisabled && proxyMode === "follow_global"}
+                  disabled={proxyDisabled}
+                  onChange={() => setProxyMode("follow_global")}
+                >
+                  跟随全局
+                </SegmentedOption>
+                <SegmentedOption
+                  name="proxyMode"
+                  checked={!proxyDisabled && proxyMode === "custom"}
+                  disabled={proxyDisabled}
+                  onChange={() => setProxyMode("custom")}
+                >
+                  临时代理
+                </SegmentedOption>
+              </div>
+              {!proxyDisabled && proxyMode === "bypass" && (
+                <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+                  本次测试强制直连上游，不使用全局设置或系统环境变量中的代理。
+                </p>
+              )}
+              {proxyMode === "custom" && !proxyDisabled && (
+                <input
+                  className="input mt-2 w-full font-mono"
+                  value={customProxyUrl}
+                  onChange={(event) => setCustomProxyUrl(event.target.value)}
+                  placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+                />
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                最大输出 token
+                <input
+                  className="input w-32 font-mono"
+                  type="number"
+                  min={1}
+                  max={16384}
+                  step={1}
+                  value={maxOutputTokensText}
+                  onChange={(event) =>
+                    setMaxOutputTokensText(event.target.value)
+                  }
+                />
+              </label>
+              <div className="flex flex-col gap-1">
+                <span className="text-xs text-muted-foreground">思考等级</span>
+                <div className="grid grid-cols-4 gap-1 rounded-lg bg-muted p-1">
+                  <SegmentedOption
+                    name="thinkingLevel"
+                    checked={thinkingLevel === "disabled"}
+                    onChange={() => setThinkingLevel("disabled")}
+                  >
+                    关闭
+                  </SegmentedOption>
+                  <SegmentedOption
+                    name="thinkingLevel"
+                    checked={thinkingLevel === "low"}
+                    onChange={() => setThinkingLevel("low")}
+                  >
+                    低
+                  </SegmentedOption>
+                  <SegmentedOption
+                    name="thinkingLevel"
+                    checked={thinkingLevel === "medium"}
+                    onChange={() => setThinkingLevel("medium")}
+                  >
+                    中
+                  </SegmentedOption>
+                  <SegmentedOption
+                    name="thinkingLevel"
+                    checked={thinkingLevel === "high"}
+                    onChange={() => setThinkingLevel("high")}
+                  >
+                    高
+                  </SegmentedOption>
+                </div>
+              </div>
+              {!maxTokensValid && maxOutputTokensText !== "" && (
+                <span className="text-[11px] text-destructive">
+                  范围 1–16384
+                </span>
+              )}
+              <button
+                className="secondary-button ml-auto"
+                disabled={running || history.length === 0}
+                onClick={clearSession}
+                title="清空当前会话"
+              >
+                <Eraser className="h-4 w-4" />
+                清空会话
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 对话流 */}
+        <div
+          ref={scrollRef}
+          className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4"
+        >
+          {history.length === 0 && !running && (
+            <div className="py-10 text-center text-xs text-muted-foreground">
+              输入消息后按 Cmd/Ctrl + Enter 发送，回复会渲染 Markdown。
+            </div>
+          )}
+          {history.map((message, index) => {
+            const isUser = message.role === "user";
+            const isEditing = editingIndex === index;
+            return (
+              <div
+                key={index}
+                className={cn(
+                  "group flex",
+                  isUser ? "justify-end" : "justify-start",
+                )}
+              >
+                <div
+                  className={cn(
+                    "relative max-w-[85%] rounded-2xl px-4 py-2.5",
+                    isUser
+                      ? "rounded-br-sm bg-primary/10"
+                      : "rounded-bl-sm bg-muted/40",
+                  )}
+                >
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <span
+                      className={cn(
+                        "text-[10px] font-medium",
+                        isUser
+                          ? "text-primary"
+                          : "text-emerald-600 dark:text-emerald-400",
+                      )}
+                    >
+                      {isUser ? "用户" : "助手"}
+                    </span>
+                    <div className="flex items-center gap-0.5 opacity-0 transition group-hover:opacity-100">
+                      {!isUser && (
+                        <button
+                          className="icon-button h-7 w-7"
+                          onClick={() => onCopy(message.content, "助手回复")}
+                          title="复制该回复"
+                          aria-label="复制该回复"
+                          disabled={running}
+                        >
+                          <Copy className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      <button
+                        className="icon-button h-7 w-7"
+                        onClick={() =>
+                          setEditingIndex(isEditing ? null : index)
+                        }
+                        title={isEditing ? "完成编辑" : "编辑该条"}
+                        aria-label={isEditing ? "完成编辑" : "编辑该条"}
+                        disabled={running}
+                      >
+                        {isEditing ? (
+                          <Check className="h-3.5 w-3.5" />
+                        ) : (
+                          <Pencil className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                      <button
+                        className="icon-button h-7 w-7 text-destructive"
+                        onClick={() => {
+                          deleteHistoryMessage(index);
+                          setEditingIndex(null);
+                        }}
+                        title="删除该条"
+                        aria-label="删除该条"
+                        disabled={running}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   </div>
-                )}
-                {result.replyText && (
-                  <div className="mb-2 text-xs font-medium text-muted-foreground">回复</div>
-                )}
-                {result.replyText && (
-                  <div className="max-h-56 overflow-y-auto whitespace-pre-wrap rounded bg-muted p-3 text-xs leading-5">
-                    {result.replyText}
-                  </div>
-                )}
-                {result.rawBodyPreview && (
-                  <div className="mt-3">
-                    <button className="text-[11px] text-muted-foreground underline" onClick={() => setShowRaw(!showRaw)}>
-                      {showRaw ? "隐藏原始响应" : "显示原始响应"}
-                    </button>
-                    {showRaw && (
-                      <pre className="mt-2 max-h-56 overflow-auto rounded bg-muted p-2 font-mono text-[10px] leading-4">{result.rawBodyPreview}</pre>
-                    )}
-                  </div>
-                )}
+                  {isEditing ? (
+                    <textarea
+                      className="input min-h-16 w-full resize-y text-xs leading-5"
+                      value={message.content}
+                      onChange={(event) =>
+                        updateHistoryMessage(index, event.target.value)
+                      }
+                      disabled={running}
+                    />
+                  ) : isUser ? (
+                    <div className="whitespace-pre-wrap break-words text-sm leading-6">
+                      {message.content}
+                    </div>
+                  ) : (
+                    <Markdown content={message.content} />
+                  )}
+                  {/* 每条气泡各自的原始请求/响应，默认收起。 */}
+                  {isUser && message.rawRequest && (
+                    <details className="mt-2 border-t border-border/60 pt-2">
+                      <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                        <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                        原始请求
+                      </summary>
+                      <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
+                        {message.rawRequest}
+                      </pre>
+                    </details>
+                  )}
+                  {!isUser && message.rawResponse && (
+                    <details className="mt-2 border-t border-border/60 pt-2">
+                      <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                        <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                        原始响应
+                      </summary>
+                      <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
+                        {message.rawResponse}
+                      </pre>
+                    </details>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          {/* 运行中加载气泡 */}
+          {running && (
+            <div className="flex justify-start">
+              <div className="rounded-2xl rounded-bl-sm bg-muted/40 px-4 py-2.5">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                  等待上游回复…
+                </div>
               </div>
             </div>
           )}
+
+          {/* 最近一次结果状态条 / 失败错误气泡 */}
+          {result && (
+            <div
+              className={cn(
+                "rounded-lg border px-3 py-2 text-[11px] leading-5",
+                result.ok
+                  ? "border-border bg-muted/30 text-muted-foreground"
+                  : "border-destructive/30 bg-destructive/5 text-destructive",
+              )}
+            >
+              {result.ok ? (
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                  <span className="font-medium text-emerald-600 dark:text-emerald-400">
+                    成功
+                  </span>
+                  {result.status > 0 && <span>· HTTP {result.status}</span>}
+                  <span>· {result.latencyMs}ms</span>
+                  <span>
+                    · {result.pathUsed === "gateway" ? "通过网关" : "直连"}
+                  </span>
+                  <span>
+                    ·{" "}
+                    {result.proxyEffective
+                      ? `代理 ${result.proxyEffective}`
+                      : "无代理"}
+                  </span>
+                  {result.finishReason && (
+                    <span>· 停止原因 {result.finishReason}</span>
+                  )}
+                  {usageSummary.length > 0 && (
+                    <span>· {usageSummary.join(" · ")}</span>
+                  )}
+                  {result.lengthTruncated && (
+                    <span className="text-amber-700 dark:text-amber-300">
+                      · 输出因长度上限被截断（{result.finishReason ?? "length"}
+                      ），可调高最大输出 token
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <div className="break-words">
+                  <span className="font-medium">失败</span>
+                  {result.status > 0 && <span> · HTTP {result.status}</span>}
+                  {result.error && <span> · {result.error}</span>}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* 底部输入区 */}
+        <div className="border-t p-4">
+          <textarea
+            className="input min-h-20 w-full resize-y"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            disabled={running}
+            placeholder="输入测试消息，Cmd/Ctrl + Enter 发送"
+            onKeyDown={(event) => {
+              if (
+                (event.metaKey || event.ctrlKey) &&
+                event.key === "Enter" &&
+                canSend
+              ) {
+                event.preventDefault();
+                void run();
+              }
+            }}
+          />
+          <div className="mt-2 flex items-center justify-between gap-2">
+            <button className="secondary-button" onClick={onClose}>
+              关闭
+            </button>
+            <button
+              className="primary-button"
+              disabled={!canSend}
+              onClick={() => void run()}
+            >
+              {running ? (
+                <RefreshCw className="h-4 w-4 animate-spin" />
+              ) : (
+                <Send className="h-4 w-4" />
+              )}
+              发送
+            </button>
+          </div>
         </div>
       </div>
     </div>
   );
 }
 
-function Dashboard({ status, baseUrl, config, enabledAliases, onStart, onStop, onCopy, onNavigate }: {
+function Dashboard({
+  status,
+  baseUrl,
+  config,
+  enabledAliases,
+  onStart,
+  onStop,
+  onCopy,
+  onNavigate,
+}: {
   status: ProxyStatus | null;
   baseUrl: string;
   config: GatewayConfig;
@@ -1423,58 +2566,296 @@ function Dashboard({ status, baseUrl, config, enabledAliases, onStart, onStop, o
   const endpoint = `${baseUrl}/v1`;
   const sampleAlias = enabledAliases[0] || "local-model";
   const sample = `curl ${baseUrl}/v1/chat/completions \\\n  -H "Authorization: Bearer ${config.localApiKey || "LOCAL_API_KEY"}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${sampleAlias}","messages":[{"role":"user","content":"Hello"}]}'`;
-  const hasModels = config.providers.some((p) => p.enabled && p.models.some((m) => m.enabled));
+  const hasModels = config.providers.some(
+    (p) => p.enabled && p.models.some((m) => m.enabled),
+  );
   const routingStatus = formatRoutingStatus(status);
   return (
     <section className="mx-auto max-w-5xl">
       <div className="mb-6 flex items-start justify-between gap-4">
-        <div><h1 className="text-2xl font-semibold tracking-tight">本地统一 API 网关</h1><p className="mt-1 text-sm text-muted-foreground">通过一个本地端口管理多个上游 API、模型别名和故障转移。</p></div>
-        {status?.running ? <button className="danger-button" onClick={onStop}><CircleStop className="h-4 w-4" />停止网关</button> : <button className="primary-button" onClick={onStart}><Play className="h-4 w-4" />启动网关</button>}
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            本地统一 API 网关
+          </h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            通过一个本地端口管理多个上游 API、模型别名和故障转移。
+          </p>
+        </div>
+        {status?.running ? (
+          <button className="danger-button" onClick={onStop}>
+            <CircleStop className="h-4 w-4" />
+            停止网关
+          </button>
+        ) : (
+          <button className="primary-button" onClick={onStart}>
+            <Play className="h-4 w-4" />
+            启动网关
+          </button>
+        )}
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard icon={Activity} label="运行状态" value={status?.running ? "运行中" : "已停止"} detail={status?.running ? formatDuration(status.uptime_seconds) : "点击右上角启动"} active={status?.running} />
-        <StatCard icon={Zap} label="请求总数" value={String(status?.total_requests ?? 0)} detail={`成功率 ${(status?.success_rate ?? 0).toFixed(1)}%`} />
-        <StatCard icon={RefreshCw} label="上游路由" value={`${status?.failover_count ?? 0} 次切换`} detail={routingStatus.detail} detailTitle={routingStatus.title} />
-        <StatCard icon={Database} label="模型别名" value={String(enabledAliases.length)} detail={`${config.providers.filter((provider) => provider.enabled).length} 个启用供应商`} />
+        <StatCard
+          icon={Activity}
+          label="运行状态"
+          value={status?.running ? "运行中" : "已停止"}
+          detail={
+            status?.running
+              ? formatDuration(status.uptime_seconds)
+              : "点击右上角启动"
+          }
+          active={status?.running}
+        />
+        <StatCard
+          icon={Zap}
+          label="请求总数"
+          value={String(status?.total_requests ?? 0)}
+          detail={`成功率 ${(status?.success_rate ?? 0).toFixed(1)}%`}
+        />
+        <StatCard
+          icon={RefreshCw}
+          label="上游路由"
+          value={`${status?.failover_count ?? 0} 次切换`}
+          detail={routingStatus.detail}
+          detailTitle={routingStatus.title}
+        />
+        <StatCard
+          icon={Database}
+          label="模型别名"
+          value={String(enabledAliases.length)}
+          detail={`${config.providers.filter((provider) => provider.enabled).length} 个启用供应商`}
+        />
       </div>
 
       <div className="mt-6 grid gap-4 lg:grid-cols-[1.15fr_0.85fr]">
         <div className="panel p-5">
-          <div className="flex items-center justify-between"><div><h2 className="font-semibold">接入信息</h2><p className="mt-1 text-xs text-muted-foreground">适用于 OpenAI SDK、Anthropic SDK、酒馆和其他兼容客户端。</p></div><ShieldCheck className="h-5 w-5 text-emerald-500" /></div>
-          <InfoLine label="OpenAI Base URL" value={`${endpoint}`} onCopy={() => onCopy(endpoint, "Base URL")} />
-          <InfoLine label="Anthropic Base URL" value={baseUrl} onCopy={() => onCopy(baseUrl, "Base URL")} />
-          <InfoLine label="本地 API Key" value={maskKey(config.localApiKey)} onCopy={() => onCopy(config.localApiKey, "API Key")} />
-          <div className="mt-4 rounded-lg bg-muted p-3"><pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[11px] leading-5">{sample}</pre><button className="secondary-button mt-3" onClick={() => onCopy(sample, "curl 示例")}><Copy className="h-4 w-4" />复制示例</button></div>
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="font-semibold">接入信息</h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                适用于 OpenAI SDK、Anthropic SDK、酒馆和其他兼容客户端。
+              </p>
+            </div>
+            <ShieldCheck className="h-5 w-5 text-emerald-500" />
+          </div>
+          <InfoLine
+            label="OpenAI Base URL"
+            value={`${endpoint}`}
+            onCopy={() => onCopy(endpoint, "Base URL")}
+          />
+          <InfoLine
+            label="Anthropic Base URL"
+            value={baseUrl}
+            onCopy={() => onCopy(baseUrl, "Base URL")}
+          />
+          <InfoLine
+            label="本地 API Key"
+            value={maskKey(config.localApiKey)}
+            onCopy={() => onCopy(config.localApiKey, "API Key")}
+          />
+          <div className="mt-4 rounded-lg bg-muted p-3">
+            <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[11px] leading-5">
+              {sample}
+            </pre>
+            <button
+              className="secondary-button mt-3"
+              onClick={() => onCopy(sample, "curl 示例")}
+            >
+              <Copy className="h-4 w-4" />
+              复制示例
+            </button>
+          </div>
         </div>
 
         <div className="space-y-4">
-          <div className="panel p-5"><h2 className="font-semibold">可用入口</h2><div className="mt-3 space-y-2"><Endpoint method="POST" path="/v1/chat/completions" note="OpenAI Chat" /><Endpoint method="POST" path="/v1/responses" note="OpenAI Responses" /><Endpoint method="POST" path="/v1/messages" note="Anthropic Messages" /><Endpoint method="GET" path="/v1/models" note="本地模型列表" /></div></div>
-          {(config.providers.length === 0 || !hasModels) && <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"><h3 className="font-medium">还差一点配置</h3><p className="mt-1 text-xs">至少需要一个供应商和一条启用的模型条目，API 才能转发请求。</p><button className="mt-3 flex items-center gap-1 text-xs font-semibold" onClick={() => onNavigate(config.providers.length ? "routes" : "providers")}>继续配置<ChevronRight className="h-3.5 w-3.5" /></button></div>}
-          {status?.last_error && <div className="rounded-xl border border-destructive/30 bg-destructive/5 p-4"><h3 className="text-sm font-medium text-destructive">最近错误</h3><p className="mt-1 break-words text-xs text-muted-foreground">{status.last_error}</p></div>}
+          <div className="panel p-5">
+            <h2 className="font-semibold">可用入口</h2>
+            <div className="mt-3 space-y-2">
+              <Endpoint
+                method="POST"
+                path="/v1/chat/completions"
+                note="OpenAI Chat"
+              />
+              <Endpoint
+                method="POST"
+                path="/v1/responses"
+                note="OpenAI Responses"
+              />
+              <Endpoint
+                method="POST"
+                path="/v1/messages"
+                note="Anthropic Messages"
+              />
+              <Endpoint method="GET" path="/v1/models" note="本地模型列表" />
+            </div>
+          </div>
+          {(config.providers.length === 0 || !hasModels) && (
+            <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+              <h3 className="font-medium">还差一点配置</h3>
+              <p className="mt-1 text-xs">
+                至少需要一个供应商和一条启用的模型条目，API 才能转发请求。
+              </p>
+              <button
+                className="mt-3 flex items-center gap-1 text-xs font-semibold"
+                onClick={() =>
+                  onNavigate(config.providers.length ? "routes" : "providers")
+                }
+              >
+                继续配置
+                <ChevronRight className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+          {status?.last_error && (
+            <div className="rounded-xl border border-destructive/30 bg-destructive/5 p-4">
+              <h3 className="text-sm font-medium text-destructive">最近错误</h3>
+              <p className="mt-1 break-words text-xs text-muted-foreground">
+                {status.last_error}
+              </p>
+            </div>
+          )}
         </div>
       </div>
     </section>
   );
 }
 
-function NavButton({ icon: Icon, label, active, onClick, badge }: { icon: typeof Activity; label: string; active: boolean; onClick: () => void; badge?: number }) {
-  return <button className={cn("flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm transition", active ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:bg-muted hover:text-foreground")} onClick={onClick}><Icon className="h-4 w-4" /><span className="flex-1">{label}</span>{badge !== undefined && <span className={cn("rounded-full px-1.5 text-[10px]", active ? "bg-white/20" : "bg-muted")}>{badge}</span>}</button>;
+function NavButton({
+  icon: Icon,
+  label,
+  active,
+  onClick,
+  badge,
+}: {
+  icon: typeof Activity;
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  badge?: number;
+}) {
+  return (
+    <button
+      className={cn(
+        "flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm transition",
+        active
+          ? "bg-primary text-primary-foreground shadow-sm"
+          : "text-muted-foreground hover:bg-muted hover:text-foreground",
+      )}
+      onClick={onClick}
+    >
+      <Icon className="h-4 w-4" />
+      <span className="flex-1">{label}</span>
+      {badge !== undefined && (
+        <span
+          className={cn(
+            "rounded-full px-1.5 text-[10px]",
+            active ? "bg-white/20" : "bg-muted",
+          )}
+        >
+          {badge}
+        </span>
+      )}
+    </button>
+  );
 }
 
-function PageHeader({ title, description, action }: { title: string; description: string; action?: ReactNode }) {
-  return <div className="mb-6 flex items-start justify-between gap-4"><div><h1 className="text-2xl font-semibold tracking-tight">{title}</h1><p className="mt-1 text-sm text-muted-foreground">{description}</p></div>{action}</div>;
+function PageHeader({
+  title,
+  description,
+  action,
+}: {
+  title: string;
+  description: string;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="mb-6 flex items-start justify-between gap-4">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
+        <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+      </div>
+      {action}
+    </div>
+  );
 }
 
-function EmptyState({ icon: Icon, title, description, action, onAction, disabled }: { icon: typeof Server; title: string; description: string; action: string; onAction: () => void; disabled?: boolean }) {
-  return <div className="panel flex min-h-80 flex-col items-center justify-center p-8 text-center"><div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-muted"><Icon className="h-7 w-7 text-muted-foreground" /></div><h3 className="font-semibold">{title}</h3><p className="mt-1 max-w-sm text-sm text-muted-foreground">{description}</p><button className="primary-button mt-5" disabled={disabled} onClick={onAction}><Plus className="h-4 w-4" />{action}</button></div>;
+function EmptyState({
+  icon: Icon,
+  title,
+  description,
+  action,
+  onAction,
+  disabled,
+}: {
+  icon: typeof Server;
+  title: string;
+  description: string;
+  action: string;
+  onAction: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="panel flex min-h-80 flex-col items-center justify-center p-8 text-center">
+      <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-muted">
+        <Icon className="h-7 w-7 text-muted-foreground" />
+      </div>
+      <h3 className="font-semibold">{title}</h3>
+      <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+        {description}
+      </p>
+      <button
+        className="primary-button mt-5"
+        disabled={disabled}
+        onClick={onAction}
+      >
+        <Plus className="h-4 w-4" />
+        {action}
+      </button>
+    </div>
+  );
 }
 
-function StatCard({ icon: Icon, label, value, detail, detailTitle, active }: { icon: typeof Activity; label: string; value: string; detail: string; detailTitle?: string; active?: boolean }) {
-  return <div className="panel p-4"><div className="flex items-center justify-between"><span className="text-xs text-muted-foreground">{label}</span><Icon className={cn("h-4 w-4", active ? "text-emerald-500" : "text-muted-foreground")} /></div><div className="mt-3 text-2xl font-semibold">{value}</div><div className="mt-1 truncate text-[11px] text-muted-foreground" title={detailTitle ?? detail}>{detail}</div></div>;
+function StatCard({
+  icon: Icon,
+  label,
+  value,
+  detail,
+  detailTitle,
+  active,
+}: {
+  icon: typeof Activity;
+  label: string;
+  value: string;
+  detail: string;
+  detailTitle?: string;
+  active?: boolean;
+}) {
+  return (
+    <div className="panel p-4">
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-muted-foreground">{label}</span>
+        <Icon
+          className={cn(
+            "h-4 w-4",
+            active ? "text-emerald-500" : "text-muted-foreground",
+          )}
+        />
+      </div>
+      <div className="mt-3 text-2xl font-semibold">{value}</div>
+      <div
+        className="mt-1 truncate text-[11px] text-muted-foreground"
+        title={detailTitle ?? detail}
+      >
+        {detail}
+      </div>
+    </div>
+  );
 }
 
-function formatRoutingStatus(status: ProxyStatus | null): { detail: string; title: string } {
+function formatRoutingStatus(status: ProxyStatus | null): {
+  detail: string;
+  title: string;
+} {
   const activeProviderMap = new Map<string, ActiveProvider>();
   for (const provider of status?.active_providers ?? []) {
     if (provider.request_count <= 0) continue;
@@ -1487,13 +2868,17 @@ function formatRoutingStatus(status: ProxyStatus | null): { detail: string; titl
     }
   }
   const activeProviders = Array.from(activeProviderMap.values());
-  const activeRequestCount = activeProviders.reduce((total, provider) => total + provider.request_count, 0);
+  const activeRequestCount = activeProviders.reduce(
+    (total, provider) => total + provider.request_count,
+    0,
+  );
 
   if (activeProviders.length === 1) {
     const provider = activeProviders[0];
-    const detail = activeRequestCount > 1
-      ? `当前：${provider.provider_name} · ${activeRequestCount} 个请求`
-      : `当前：${provider.provider_name}`;
+    const detail =
+      activeRequestCount > 1
+        ? `当前：${provider.provider_name} · ${activeRequestCount} 个请求`
+        : `当前：${provider.provider_name}`;
     return { detail, title: detail };
   }
 
@@ -1501,7 +2886,10 @@ function formatRoutingStatus(status: ProxyStatus | null): { detail: string; titl
     return {
       detail: `当前：${activeProviders.length} 个上游 · ${activeRequestCount} 个请求`,
       title: activeProviders
-        .map((provider) => `${provider.provider_name}：${provider.request_count} 个请求`)
+        .map(
+          (provider) =>
+            `${provider.provider_name}：${provider.request_count} 个请求`,
+        )
         .join("\n"),
     };
   }
@@ -1514,20 +2902,84 @@ function formatRoutingStatus(status: ProxyStatus | null): { detail: string; titl
   return { detail: "暂无请求", title: "暂无请求" };
 }
 
-function InfoLine({ label, value, onCopy }: { label: string; value: string; onCopy: () => void }) {
-  return <div className="mt-4 flex items-center gap-3"><div className="w-32 shrink-0 text-xs text-muted-foreground">{label}</div><code className="min-w-0 flex-1 truncate rounded bg-muted px-2.5 py-1.5 text-xs">{value}</code><button className="icon-button" onClick={onCopy}><Copy className="h-4 w-4" /></button></div>;
+function InfoLine({
+  label,
+  value,
+  onCopy,
+}: {
+  label: string;
+  value: string;
+  onCopy: () => void;
+}) {
+  return (
+    <div className="mt-4 flex items-center gap-3">
+      <div className="w-32 shrink-0 text-xs text-muted-foreground">{label}</div>
+      <code className="min-w-0 flex-1 truncate rounded bg-muted px-2.5 py-1.5 text-xs">
+        {value}
+      </code>
+      <button className="icon-button" onClick={onCopy}>
+        <Copy className="h-4 w-4" />
+      </button>
+    </div>
+  );
 }
 
-function Endpoint({ method, path, note }: { method: string; path: string; note: string }) {
-  return <div className="flex items-center gap-2 rounded-lg border px-3 py-2"><span className="w-10 text-[10px] font-bold text-primary">{method}</span><code className="min-w-0 flex-1 truncate text-xs">{path}</code><span className="text-[10px] text-muted-foreground">{note}</span></div>;
+function Endpoint({
+  method,
+  path,
+  note,
+}: {
+  method: string;
+  path: string;
+  note: string;
+}) {
+  return (
+    <div className="flex items-center gap-2 rounded-lg border px-3 py-2">
+      <span className="w-10 text-[10px] font-bold text-primary">{method}</span>
+      <code className="min-w-0 flex-1 truncate text-xs">{path}</code>
+      <span className="text-[10px] text-muted-foreground">{note}</span>
+    </div>
+  );
 }
 
-function SettingRow({ title, description, children, nested = false }: { title: string; description: string; children: ReactNode; nested?: boolean }) {
-  return <div className={cn("flex items-center justify-between gap-8 p-5", nested && "bg-muted/20 pl-10")}><div className="max-w-lg"><h3 className="text-sm font-medium">{title}</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p></div><div className="shrink-0">{children}</div></div>;
+function SettingRow({
+  title,
+  description,
+  children,
+  nested = false,
+}: {
+  title: string;
+  description: string;
+  children: ReactNode;
+  nested?: boolean;
+}) {
+  return (
+    <div
+      className={cn(
+        "flex items-center justify-between gap-8 p-5",
+        nested && "bg-muted/20 pl-10",
+      )}
+    >
+      <div className="max-w-lg">
+        <h3 className="text-sm font-medium">{title}</h3>
+        <p className="mt-1 text-xs leading-5 text-muted-foreground">
+          {description}
+        </p>
+      </div>
+      <div className="shrink-0">{children}</div>
+    </div>
+  );
 }
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
-  return <label className="block"><span className="mb-1.5 block text-xs font-medium text-muted-foreground">{label}</span>{children}</label>;
+  return (
+    <label className="block">
+      <span className="mb-1.5 block text-xs font-medium text-muted-foreground">
+        {label}
+      </span>
+      {children}
+    </label>
+  );
 }
 
 export default App;
