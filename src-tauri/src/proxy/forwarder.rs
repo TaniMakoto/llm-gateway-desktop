@@ -2213,7 +2213,7 @@ impl RequestForwarder {
             // 字节原样透传客户端的同时旁路收集副本，流结束后异步落盘。
             // 非流式（Buffered/整包读取）响应直接记录整包；流式响应经 tee。
             let response = if body_trace_id.is_some() {
-                record_success_response_before_return(
+                Self::record_success_response_before_return(
                     response,
                     provider,
                     body_trace_id.as_deref().unwrap_or(""),
