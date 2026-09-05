@@ -70,6 +70,10 @@ pub struct GatewayProviderModel {
     pub api_format: GatewayApiFormat,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 单模型级请求体录制开关：Some(true) 强制开启，Some(false) 强制关闭，
+    /// None 跟随供应商级 recordBodies。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_bodies: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +116,10 @@ pub struct GatewayProvider {
     /// 该供应商下的模型条目，协议下沉到条目上。
     #[serde(default)]
     pub models: Vec<GatewayProviderModel>,
+    /// 请求体录制（诊断用）：开启后把发往该供应商的最终请求体与
+    /// 上游最终响应体转储为 JSONL 文件，用于核对中转站实际收到的内容。
+    #[serde(default)]
+    pub record_bodies: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +332,7 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
                     upstream_model: target.upstream_model.clone(),
                     api_format: format,
                     enabled: route.enabled && target.enabled,
+                    record_bodies: None,
                 });
         }
     }
@@ -349,6 +358,7 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
             reasoning_history_mode: default_auto_mode(),
             adaptive_thinking_display: default_auto_mode(),
             notes: p.notes,
+            record_bodies: false,
             models: provider_models.remove(&p.id).unwrap_or_default(),
         })
         .collect();
@@ -573,6 +583,30 @@ fn provider_meta(
             headers: override_headers,
             body: None,
         });
+    }
+
+    // 请求体录制开关物化：None=关闭。开启时收集该 (供应商, 协议) 下启用模型的
+    // 上游模型名；空列表表示全量录制，非空表示仅录制命中的出站模型。
+    // 模型级 record_bodies 优先于供应商级开关（true 强制开，false 强制排除）。
+    let mut recording_models: Vec<String> = Vec::new();
+    let mut any_model_forced_on = false;
+    for model in &provider.models {
+        if !model.enabled || model.api_format != format {
+            continue;
+        }
+        let forced_on = model.record_bodies == Some(true);
+        let forced_off = model.record_bodies == Some(false);
+        if forced_on {
+            any_model_forced_on = true;
+        }
+        if provider.record_bodies || forced_on {
+            if !forced_off {
+                recording_models.push(model.upstream_model.trim().to_string());
+            }
+        }
+    }
+    if !recording_models.is_empty() || any_model_forced_on {
+        meta.body_recording_models = Some(recording_models);
     }
     meta
 }
@@ -1819,13 +1853,48 @@ mod tests {
             reasoning_history_mode: default_auto_mode(),
             adaptive_thinking_display: default_auto_mode(),
             notes: String::new(),
+            record_bodies: false,
             models: vec![GatewayProviderModel {
                 alias: "local".to_string(),
                 upstream_model: "model-a".to_string(),
                 api_format: format,
                 enabled: true,
+                record_bodies: None,
             }],
         }
+    }
+
+    #[test]
+    fn provider_meta_body_recording_scopes() {
+        // 未开启：None
+        let p = provider_with_format("a", GatewayApiFormat::OpenaiChat);
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiChat);
+        assert!(meta.body_recording_models.is_none());
+
+        // 供应商级开启：全量录制（空列表）
+        let mut p = provider_with_format("b", GatewayApiFormat::OpenaiChat);
+        p.record_bodies = true;
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiChat);
+        assert_eq!(meta.body_recording_models, Some(Vec::new()));
+
+        // 模型级强制开启：仅该模型，其他协议不受影响
+        let mut p = provider_with_format("c", GatewayApiFormat::OpenaiChat);
+        p.models[0].record_bodies = Some(true);
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiChat);
+        assert_eq!(
+            meta.body_recording_models,
+            Some(vec!["model-a".to_string()])
+        );
+        // Anthropic 协议下该模型条目不匹配（api_format 不同）→ 关闭
+        let meta = provider_meta(&p, GatewayApiFormat::Anthropic);
+        assert!(meta.body_recording_models.is_none());
+
+        // 供应商开启 + 模型级显式排除：列表为空 → 仍视为关闭该协议
+        let mut p = provider_with_format("d", GatewayApiFormat::OpenaiChat);
+        p.record_bodies = true;
+        p.models[0].record_bodies = Some(false);
+        let meta = provider_meta(&p, GatewayApiFormat::OpenaiChat);
+        assert!(meta.body_recording_models.is_none());
     }
 
     #[test]
@@ -1948,6 +2017,7 @@ mod tests {
             upstream_model: "model-b".to_string(),
             api_format: GatewayApiFormat::OpenaiResponses,
             enabled: true,
+            record_bodies: None,
         });
         config.providers.push(p);
         assert!(validate_config(&config).is_err());
@@ -1983,6 +2053,7 @@ mod tests {
             upstream_model: "gpt-5-preview".to_string(),
             api_format: GatewayApiFormat::OpenaiResponses,
             enabled: true,
+            record_bodies: None,
         });
         config.providers.push(p);
         let combos = iter_materialized_combos(&config);

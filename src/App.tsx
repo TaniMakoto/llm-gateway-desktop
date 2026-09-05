@@ -53,6 +53,7 @@ interface ProviderModel {
   upstreamModel: string;
   apiFormat: ApiFormat;
   enabled: boolean;
+  recordBodies?: boolean | null;
 }
 
 interface GatewayProvider {
@@ -73,6 +74,7 @@ interface GatewayProvider {
   reasoningHistoryMode: "auto" | "reasoning_content" | "disabled";
   adaptiveThinkingDisplay: "auto" | "summarized" | "omitted";
   notes: string;
+  recordBodies?: boolean;
   models: ProviderModel[];
 }
 
@@ -488,6 +490,7 @@ function App() {
       reasoningHistoryMode: "auto",
       adaptiveThinkingDisplay: "auto",
       notes: "",
+      recordBodies: false,
       models: [],
     };
     setEditingProviderId(null);
@@ -510,6 +513,7 @@ function App() {
       reasoningRequestMode: provider.reasoningRequestMode ?? "auto",
       reasoningHistoryMode: provider.reasoningHistoryMode ?? "auto",
       adaptiveThinkingDisplay: provider.adaptiveThinkingDisplay ?? "auto",
+      recordBodies: provider.recordBodies ?? false,
       models: provider.models ?? [],
     });
     setHeadersText(
@@ -667,6 +671,7 @@ function App() {
                   upstreamModel: initial?.upstreamModel ?? "",
                   apiFormat: initial?.apiFormat ?? "openai_chat",
                   enabled: initial?.enabled ?? true,
+                  recordBodies: initial?.recordBodies ?? null,
                 },
               ],
             }
@@ -1501,6 +1506,17 @@ function ModelRow({
         />
         启用
       </label>
+      <label className="switch-label">
+        <input
+          type="checkbox"
+          checked={model.recordBodies ?? false}
+          onChange={(event) =>
+            onPatch({ recordBodies: event.target.checked || null })
+          }
+          title="单独强制录制此模型的请求/响应体"
+        />
+        录制
+      </label>
       <div className="flex gap-1">
         <button className="icon-button" onClick={onTest} title="测试此模型">
           <Send className="h-4 w-4" />
@@ -1765,6 +1781,27 @@ function ProviderEditorModal({
                 </select>
               </Field>
             </div>
+          </div>
+          <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
+            <label className="switch-label">
+              <input
+                type="checkbox"
+                checked={provider.recordBodies ?? false}
+                onChange={(event) =>
+                  onChange({
+                    ...provider,
+                    recordBodies: event.target.checked,
+                  })
+                }
+              />
+              录制请求/响应体（诊断）
+            </label>
+            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+              把实际发往该供应商的最终请求体和上游响应体转储为 JSONL 文件
+              （日志目录下 <code>request-bodies/</code>），用于核对中转站实际
+              收到的内容。也可在下方单个模型上强制开启或排除。含完整对话内容，
+              排查完成后请及时关闭。
+            </p>
           </div>
           <div className="sm:col-span-2">
             <Field label="自定义请求头（每行一个 Header: Value）">

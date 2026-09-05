@@ -1561,6 +1561,25 @@ impl RequestForwarder {
         {
             outbound_model = Some(m.to_string());
         }
+        let request_is_streaming =
+            is_streaming_request(&effective_endpoint, &filtered_body, headers);
+        // 请求体录制（诊断）：发出前记录最终请求体（已完成协议转换/模型映射/私有字段过滤）。
+        // 命中录制范围时生成 trace id，与后续响应/错误记录配对。
+        let body_trace_id = super::body_recorder::request_trace_id(provider, outbound_model.as_deref());
+        if let Some(trace_id) = &body_trace_id {
+            super::body_recorder::record_request(
+                provider,
+                trace_id,
+                &effective_endpoint,
+                outbound_model.as_deref().unwrap_or(""),
+                filtered_body
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or(""),
+                &filtered_body,
+                request_is_streaming,
+            );
+        }
         log_prompt_cache_trace(
             app_type,
             provider,
@@ -1569,8 +1588,6 @@ impl RequestForwarder {
             &filtered_body,
             self.session_client_provided,
         );
-        let request_is_streaming =
-            is_streaming_request(&effective_endpoint, &filtered_body, headers);
         let force_identity_encoding = needs_transform
             || codex_responses_to_chat
             || codex_responses_to_anthropic
@@ -2192,6 +2209,20 @@ impl RequestForwarder {
         let status = response.status();
 
         if status.is_success() {
+            // 响应体录制：命中录制范围时，在成功出口把响应包装成 tee 流，
+            // 字节原样透传客户端的同时旁路收集副本，流结束后异步落盘。
+            // 非流式（Buffered/整包读取）响应直接记录整包；流式响应经 tee。
+            let response = if body_trace_id.is_some() {
+                record_success_response_before_return(
+                    response,
+                    provider,
+                    body_trace_id.as_deref().unwrap_or(""),
+                    outbound_model.as_deref().unwrap_or(""),
+                )
+                .await?
+            } else {
+                response
+            };
             let mut response = self
                 .prepare_success_response_for_failover(response, request_is_streaming)
                 .await?;
@@ -2237,6 +2268,17 @@ impl RequestForwarder {
             };
             let body_text = String::from_utf8(decoded).ok();
 
+            // 请求体录制：非 2xx 错误体一并落盘，与请求记录配对分析
+            if let Some(trace_id) = &body_trace_id {
+                super::body_recorder::record_upstream_error(
+                    provider,
+                    trace_id,
+                    outbound_model.as_deref().unwrap_or(""),
+                    status_code,
+                    body_text.as_deref(),
+                );
+            }
+
             Err(ProxyError::UpstreamError {
                 status: status_code,
                 body: body_text,
@@ -2274,6 +2316,90 @@ impl RequestForwarder {
             })??;
 
         Ok(ProxyResponse::buffered(status, headers, body))
+    }
+
+    /// 响应体录制（诊断）：把成功响应包装为「边透传边收集」的形态。
+    ///
+    /// - 流式响应：用 tee 流包裹字节流，客户端侧语义不变，收集满 16 MiB
+    ///   后只透传不再积累；流结束（或出错）时把已收集字节解压后落盘。
+    /// - 非流式响应：整包已在内存（Buffered）或需要主动读取，直接解压
+    ///   落盘后原样返回，不改变响应形状。
+    async fn record_success_response_before_return(
+        response: ProxyResponse,
+        provider: &Provider,
+        trace_id: &str,
+        outbound_model: &str,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let status = response.status().as_u16();
+        let content_type = response.content_type().map(str::to_string);
+        let encoding = get_content_encoding(response.headers());
+
+        // 连接级变体（Hyper/Reqwest/Streamed）：包装成 tee 流，客户端语义不变，
+        // 收集满 16 MiB 后只透传不再积累；流结束（或出错）时解压后落盘。
+        // Buffered 变体（上游验证步骤产物）：整包已在内存，克隆一份直接落盘。
+        if matches!(
+            response,
+            ProxyResponse::Hyper(_) | ProxyResponse::Reqwest(_) | ProxyResponse::Streamed { .. }
+        ) {
+            let headers = response.headers().clone();
+            let provider_name = provider.name.clone();
+            let provider_id = provider.id.clone();
+            let outbound_model = outbound_model.to_string();
+            let trace_id = trace_id.to_string();
+            // 闭包要求 'static：捕获所有权（克隆），而不是借用栈上的局部变量
+            let encoding = encoding.clone();
+            let content_type = content_type.clone();
+            let tee = super::body_recorder::tee_response_stream(
+                response.bytes_stream(),
+                move |collected| {
+                    let decoded = match encoding.as_deref() {
+                        Some(enc) => decompress_body(enc, &collected)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(collected),
+                        None => collected,
+                    };
+                    super::body_recorder::record_response_from_async(
+                        &provider_name,
+                        &provider_id,
+                        &trace_id,
+                        &outbound_model,
+                        status,
+                        content_type.as_deref(),
+                        decoded,
+                    );
+                },
+            );
+            Ok(ProxyResponse::Streamed {
+                status: http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::OK),
+                headers,
+                stream: Box::pin(tee),
+            })
+        } else if let ProxyResponse::Buffered {
+            status,
+            headers,
+            body,
+        } = response
+        {
+            let decoded = match &encoding {
+                Some(enc) => decompress_body(enc, &body)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| body.to_vec()),
+                None => body.to_vec(),
+            };
+            super::body_recorder::record_response(
+                provider,
+                trace_id,
+                outbound_model,
+                status.as_u16(),
+                content_type.as_deref(),
+                decoded,
+            );
+            Ok(ProxyResponse::buffered(status, headers, body))
+        } else {
+            Ok(response)
+        }
     }
 
     /// Some Anthropic-compatible gateways return an Anthropic error envelope with
