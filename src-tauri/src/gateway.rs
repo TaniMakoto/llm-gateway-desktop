@@ -585,29 +585,36 @@ fn provider_meta(
         });
     }
 
-    // 请求体录制开关物化：None=关闭。开启时收集该 (供应商, 协议) 下启用模型的
-    // 上游模型名；空列表表示全量录制，非空表示仅录制命中的出站模型。
-    // 模型级 record_bodies 优先于供应商级开关（true 强制开，false 强制排除）。
-    let mut recording_models: Vec<String> = Vec::new();
-    let mut any_model_forced_on = false;
+    // 请求体录制开关物化：None=关闭；Some(空列表)=全量录制；
+    // Some(非空列表)=仅录制命中的出站模型。模型级 record_bodies 优先于
+    // 供应商级开关（true 强制开，false 强制排除）。
+    let mut forced_on_models: Vec<String> = Vec::new();
+    let mut normal_models: Vec<String> = Vec::new();
+    let mut forced_off_count = 0usize;
     for model in &provider.models {
         if !model.enabled || model.api_format != format {
             continue;
         }
-        let forced_on = model.record_bodies == Some(true);
-        let forced_off = model.record_bodies == Some(false);
-        if forced_on {
-            any_model_forced_on = true;
-        }
-        if provider.record_bodies || forced_on {
-            if !forced_off {
-                recording_models.push(model.upstream_model.trim().to_string());
-            }
+        let upstream = model.upstream_model.trim().to_string();
+        match model.record_bodies {
+            Some(true) => forced_on_models.push(upstream),
+            Some(false) => forced_off_count += 1,
+            None => normal_models.push(upstream),
         }
     }
-    if !recording_models.is_empty() || any_model_forced_on {
-        meta.body_recording_models = Some(recording_models);
-    }
+    meta.body_recording_models = if provider.record_bodies {
+        if forced_off_count == 0 {
+            // 无排除项 → 全量录制
+            Some(Vec::new())
+        } else {
+            let mut models = normal_models;
+            models.extend(forced_on_models);
+            // 全部被排除 → 关闭该协议的录制（空列表语义是"全量"，不能复用）
+            (!models.is_empty()).then_some(models)
+        }
+    } else {
+        (!forced_on_models.is_empty()).then_some(forced_on_models)
+    };
     meta
 }
 
