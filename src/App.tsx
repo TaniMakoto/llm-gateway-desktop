@@ -14,6 +14,7 @@ import {
   Eraser,
   Eye,
   EyeOff,
+  FolderOpen,
   LayoutDashboard,
   Maximize2,
   Minus,
@@ -1464,14 +1465,14 @@ function ModelRow({
 }) {
   const listId = useMemo(() => `cached-models-${newId("dl")}`, []);
   return (
-    <div className="grid grid-cols-[minmax(140px,1fr)_minmax(160px,1.2fr)_minmax(140px,0.9fr)_auto_auto] items-center gap-2">
+    <div className="flex flex-wrap items-center gap-2">
       <input
-        className="input font-mono"
+        className="input min-w-[130px] flex-1 font-mono"
         value={model.alias}
         onChange={(event) => onPatch({ alias: event.target.value })}
         placeholder="本地别名，如 my-best-code"
       />
-      <div>
+      <div className="min-w-[150px] flex-[1.2]">
         <input
           className="input w-full font-mono"
           list={listId}
@@ -1488,7 +1489,7 @@ function ModelRow({
         </datalist>
       </div>
       <select
-        className="input"
+        className="input min-w-[140px] flex-[0.9]"
         value={model.apiFormat}
         onChange={(event) =>
           onPatch({ apiFormat: event.target.value as ApiFormat })
@@ -1506,18 +1507,29 @@ function ModelRow({
         />
         启用
       </label>
-      <label className="switch-label">
-        <input
-          type="checkbox"
-          checked={model.recordBodies ?? false}
-          onChange={(event) =>
-            onPatch({ recordBodies: event.target.checked || null })
-          }
-          title="单独强制录制此模型的请求/响应体"
-        />
-        录制
-      </label>
-      <div className="flex gap-1">
+      <select
+        className="input"
+        title="单独控制此模型的请求/响应体录制：跟随供应商 / 强制开启 / 强制排除"
+        value={
+          model.recordBodies === true
+            ? "on"
+            : model.recordBodies === false
+              ? "off"
+              : "follow"
+        }
+        onChange={(event) => {
+          // 三态直映后端 Option<bool>：null=跟随供应商，true=强制开，false=强制排除。
+          const next = event.target.value;
+          onPatch({
+            recordBodies: next === "on" ? true : next === "off" ? false : null,
+          });
+        }}
+      >
+        <option value="follow">录制：跟随供应商</option>
+        <option value="on">录制：强制开启</option>
+        <option value="off">录制：强制排除</option>
+      </select>
+      <div className="ml-auto flex gap-1">
         <button className="icon-button" onClick={onTest} title="测试此模型">
           <Send className="h-4 w-4" />
         </button>
@@ -1562,6 +1574,14 @@ function ProviderEditorModal({
   fetchingModels: boolean;
   onFetchModels: () => void;
 }) {
+  const openRecordingFolder = async () => {
+    try {
+      await invoke("open_gateway_recording_folder");
+    } catch (error) {
+      toast.error(`打开录制目录失败：${String(error)}`);
+    }
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
@@ -1783,24 +1803,33 @@ function ProviderEditorModal({
             </div>
           </div>
           <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
-            <label className="switch-label">
-              <input
-                type="checkbox"
-                checked={provider.recordBodies ?? false}
-                onChange={(event) =>
-                  onChange({
-                    ...provider,
-                    recordBodies: event.target.checked,
-                  })
-                }
-              />
-              录制请求/响应体（诊断）
-            </label>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="switch-label">
+                <input
+                  type="checkbox"
+                  checked={provider.recordBodies ?? false}
+                  onChange={(event) =>
+                    onChange({
+                      ...provider,
+                      recordBodies: event.target.checked,
+                    })
+                  }
+                />
+                录制请求/响应体（诊断）
+              </label>
+              <button
+                className="secondary-button"
+                onClick={() => void openRecordingFolder()}
+              >
+                <FolderOpen className="h-3.5 w-3.5" />
+                打开录制目录
+              </button>
+            </div>
             <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
               把实际发往该供应商的最终请求体和上游响应体转储为 JSONL 文件
               （日志目录下 <code>request-bodies/</code>），用于核对中转站实际
-              收到的内容。也可在下方单个模型上强制开启或排除。含完整对话内容，
-              排查完成后请及时关闭。
+              收到的内容。也可在下方单个模型上按“跟随供应商 / 强制开启 /
+              强制排除”三态单独控制。含完整对话内容，排查完成后请及时关闭。
             </p>
           </div>
           <div className="sm:col-span-2">

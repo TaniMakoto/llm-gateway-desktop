@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use tauri::menu::{Menu, MenuBuilder, MenuItem};
 use tauri::Manager;
+use tauri_plugin_opener::OpenerExt;
 
 const CONFIG_KEY: &str = "unified_gateway_config_v1";
 const GENERATED_CATEGORY: &str = "unified_gateway";
@@ -973,6 +974,27 @@ pub async fn fetch_gateway_provider_models(
 #[tauri::command]
 pub fn generate_gateway_api_key() -> String {
     generate_local_key()
+}
+
+/// 打开请求体录制目录（`<日志目录>/request-bodies`）。
+///
+/// 目录不存在时先建出来——用户常在开启录制后才想去看文件，此时目录可能
+/// 还没被第一次写入创建。路径口径复用 `body_recorder::recording_dir()`。
+#[tauri::command]
+pub async fn open_gateway_recording_folder(handle: tauri::AppHandle) -> Result<bool, String> {
+    let dir = crate::proxy::body_recorder::recording_dir()
+        .ok_or_else(|| "无法解析日志目录".to_string())?;
+
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+
+    handle
+        .opener()
+        .open_path(dir.to_string_lossy().to_string(), None::<String>)
+        .map_err(|e| format!("打开文件夹失败: {e}"))?;
+
+    Ok(true)
 }
 
 // ============================================================================

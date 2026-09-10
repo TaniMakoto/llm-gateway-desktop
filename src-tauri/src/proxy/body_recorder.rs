@@ -107,7 +107,9 @@ fn sanitize_component(raw: &str) -> String {
 
 /// 解析录制目录：`<日志目录>/request-bodies`。日志目录取
 /// `panic_hook::get_log_dir()`（已处理便携模式），失败时返回 None。
-fn recording_dir() -> Option<PathBuf> {
+///
+/// 对外可见是为了让“打开录制目录”命令复用同一口径，避免两处各拼一次路径。
+pub(crate) fn recording_dir() -> Option<PathBuf> {
     Some(crate::panic_hook::get_log_dir().join("request-bodies"))
 }
 
