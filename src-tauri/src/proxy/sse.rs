@@ -1,3 +1,6 @@
+use bytes::Bytes;
+use serde_json::json;
+
 #[inline]
 pub(crate) fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
     line.strip_prefix(&format!("{field}: "))
@@ -85,9 +88,280 @@ pub(crate) fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, new
     }
 }
 
+/// 客户端侧 SSE 协议：决定"正常结束标记"以及断流时回发给客户端的 error 事件形状。
+///
+/// 透传层（`create_logged_passthrough_stream`）只做字节级转发，不解析各协议的
+/// 完整状态机，因此这里只按客户端协议区分最小必要的两种信息。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientSseProtocol {
+    /// Anthropic Messages SSE（Claude / Claude Desktop 客户端）
+    Anthropic,
+    /// OpenAI Responses SSE（Codex 客户端）
+    Responses,
+    /// OpenAI Chat Completions / Gemini 的 data-only SSE
+    Chat,
+}
+
+/// Anthropic 流的正常终态：`message_stop` 事件，或 message_delta 里非 null 的
+/// `stop_reason`（部分上游/转换层在流末尾省略 message_stop，见 streaming.rs:684）。
+const COMPLETED_ANTHROPIC: &[&str] = &["event: message_stop", r#""stop_reason":""#];
+/// Anthropic 流的失败终态：上游/转换层已经报过错（streaming.rs:653），透传层不再重复补发。
+const FAILED_ANTHROPIC: &[&str] = &["event: error"];
+
+/// Responses 流的正常终态事件（`response.incomplete` 是 token 上限截断，仍属正常收尾）。
+const COMPLETED_RESPONSES: &[&str] = &["event: response.completed", "event: response.incomplete"];
+/// Responses 流的失败终态：转换层发现上游截断时发的也是 response.failed。
+const FAILED_RESPONSES: &[&str] = &["event: response.failed", "event: error"];
+
+/// Chat Completions 流的正常终态：`[DONE]` 或非 null 的 `finish_reason`。
+const COMPLETED_CHAT: &[&str] = &["data: [DONE]", r#""finish_reason":""#];
+/// Chat 流的失败终态。
+const FAILED_CHAT: &[&str] = &["event: error"];
+
+impl ClientSseProtocol {
+    /// 协议名，用于断流日志。
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            ClientSseProtocol::Anthropic => "Anthropic",
+            ClientSseProtocol::Responses => "Responses",
+            ClientSseProtocol::Chat => "Chat",
+        }
+    }
+
+    fn completed_markers(self) -> &'static [&'static str] {
+        match self {
+            ClientSseProtocol::Anthropic => COMPLETED_ANTHROPIC,
+            ClientSseProtocol::Responses => COMPLETED_RESPONSES,
+            ClientSseProtocol::Chat => COMPLETED_CHAT,
+        }
+    }
+
+    fn failed_markers(self) -> &'static [&'static str] {
+        match self {
+            ClientSseProtocol::Anthropic => FAILED_ANTHROPIC,
+            ClientSseProtocol::Responses => FAILED_RESPONSES,
+            ClientSseProtocol::Chat => FAILED_CHAT,
+        }
+    }
+
+    /// 断流时补发给客户端的 SSE error 事件字节。
+    ///
+    /// 形状沿用仓库既有写法，不发明新 schema：
+    /// - Anthropic / Responses：`event: error` + `{"type":"error","error":{...}}`
+    ///   （同 streaming.rs:653 与 streaming_responses.rs:53 的 anthropic_error_sse）。
+    /// - Chat（含 Gemini 的 data-only SSE）：`data: {"error":{...}}`，即 error.rs
+    ///   里网关错误体的形状（部分 OpenAI 兼容网关也把错误当普通 data chunk 下发，
+    ///   见 handlers.rs 对 `{"error":{...}}` data chunk 的识别）。
+    pub(crate) fn error_event(self, message: &str) -> Bytes {
+        match self {
+            ClientSseProtocol::Anthropic | ClientSseProtocol::Responses => {
+                let payload = json!({
+                    "type": "error",
+                    "error": {"type": "stream_error", "message": message}
+                });
+                Bytes::from(format!(
+                    "event: error\ndata: {}\n\n",
+                    serde_json::to_string(&payload).unwrap_or_default()
+                ))
+            }
+            ClientSseProtocol::Chat => {
+                let payload = json!({
+                    "error": {"message": message, "type": "stream_error"}
+                });
+                Bytes::from(format!(
+                    "data: {}\n\n",
+                    serde_json::to_string(&payload).unwrap_or_default()
+                ))
+            }
+        }
+    }
+}
+
+/// 客户端侧 SSE 流已观察到的终态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SseTerminalState {
+    /// 尚未见到任何协议终态标记（流被中途掐断时停在这里）
+    Pending,
+    /// 已见到正常结束标记（message_stop / [DONE] / response.completed ...）
+    Completed,
+    /// 已见到失败终态（event: error / response.failed），上游或转换层已自行报错
+    Failed,
+}
+
+/// 检测客户端侧 SSE 流是否已经出现过本协议的终态标记。
+///
+/// 调用方必须喂入**完整的 SSE 事件块**（以空行分隔，见 [`take_sse_block`]），
+/// 这样标记不会被 TCP 分片切断，无需额外的跨块缓冲。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TerminalMarkerScanner {
+    protocol: ClientSseProtocol,
+    state: SseTerminalState,
+}
+
+impl TerminalMarkerScanner {
+    pub(crate) fn new(protocol: ClientSseProtocol) -> Self {
+        Self {
+            protocol,
+            state: SseTerminalState::Pending,
+        }
+    }
+
+    /// 已观察到的终态。`Pending` 表示流结束时仍未见到任何协议终态标记。
+    pub(crate) fn state(&self) -> SseTerminalState {
+        self.state
+    }
+
+    /// 喂入一个完整的 SSE 事件块，返回当前已观察到的终态（首个命中的标记生效）。
+    pub(crate) fn push(&mut self, block: &str) -> SseTerminalState {
+        if self.state != SseTerminalState::Pending {
+            return self.state;
+        }
+        if self
+            .protocol
+            .completed_markers()
+            .iter()
+            .any(|m| block.contains(m))
+        {
+            self.state = SseTerminalState::Completed;
+        } else if self
+            .protocol
+            .failed_markers()
+            .iter()
+            .any(|m| block.contains(m))
+        {
+            self.state = SseTerminalState::Failed;
+        }
+        self.state
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{append_utf8_safe, strip_sse_field, take_sse_block};
+    use super::{
+        append_utf8_safe, strip_sse_field, take_sse_block, ClientSseProtocol, SseTerminalState,
+        TerminalMarkerScanner,
+    };
+
+    // ------------------------------------------------------------------
+    // 断流判定 / error 事件
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn terminal_scanner_accepts_anthropic_message_stop() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Anthropic);
+        assert_eq!(
+            scanner.push("event: message_start\ndata: {\"type\":\"message_start\"}"),
+            SseTerminalState::Pending
+        );
+        assert_eq!(
+            scanner.push("event: message_stop\ndata: {\"type\":\"message_stop\"}"),
+            SseTerminalState::Completed
+        );
+    }
+
+    #[test]
+    fn terminal_scanner_accepts_anthropic_non_null_stop_reason() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Anthropic);
+        assert_eq!(
+            scanner.push(
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}"
+            ),
+            SseTerminalState::Completed
+        );
+    }
+
+    #[test]
+    fn terminal_scanner_rejects_null_stop_reason() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Anthropic);
+        assert_eq!(
+            scanner.push(
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null}}"
+            ),
+            SseTerminalState::Pending
+        );
+    }
+
+    #[test]
+    fn terminal_scanner_chat_requires_done_or_non_null_finish_reason() {
+        let mut chat = TerminalMarkerScanner::new(ClientSseProtocol::Chat);
+        assert_eq!(
+            chat.push("data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}]}"),
+            SseTerminalState::Pending
+        );
+        assert_eq!(chat.push("data: [DONE]"), SseTerminalState::Completed);
+    }
+
+    #[test]
+    fn terminal_scanner_responses_failed_is_terminal_but_not_completed() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Responses);
+        assert_eq!(
+            scanner.push("event: response.created\ndata: {\"type\":\"response.created\"}"),
+            SseTerminalState::Pending
+        );
+        assert_eq!(
+            scanner.push(
+                "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}"
+            ),
+            SseTerminalState::Failed
+        );
+    }
+
+    #[test]
+    fn terminal_scanner_treats_upstream_error_event_as_failed_terminal() {
+        for protocol in [
+            ClientSseProtocol::Anthropic,
+            ClientSseProtocol::Responses,
+            ClientSseProtocol::Chat,
+        ] {
+            let mut scanner = TerminalMarkerScanner::new(protocol);
+            assert_eq!(
+                scanner.push("event: error\ndata: {\"type\":\"error\"}"),
+                SseTerminalState::Failed
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_scanner_completed_wins_over_later_failed_marker() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Responses);
+        assert_eq!(
+            scanner.push("event: response.completed\ndata: {\"type\":\"response.completed\"}"),
+            SseTerminalState::Completed
+        );
+        assert_eq!(
+            scanner.push("event: error\ndata: {\"type\":\"error\"}"),
+            SseTerminalState::Completed
+        );
+    }
+
+    #[test]
+    fn error_event_shapes_match_existing_precedent() {
+        // Anthropic：event: error + {"type":"error","error":{...}}（streaming.rs:653 同款）
+        let anthropic =
+            String::from_utf8(ClientSseProtocol::Anthropic.error_event("boom").to_vec()).unwrap();
+        let data = anthropic
+            .strip_prefix("event: error\ndata: ")
+            .expect("Anthropic error event must use event: error framing");
+        let parsed: serde_json::Value = serde_json::from_str(data.trim_end()).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "stream_error");
+        assert_eq!(parsed["error"]["message"], "boom");
+        assert!(anthropic.ends_with("\n\n"));
+
+        // Chat：data-only 的 {"error":{...}}（error.rs 的错误体形状）
+        let chat = String::from_utf8(ClientSseProtocol::Chat.error_event("boom").to_vec()).unwrap();
+        assert!(!chat.contains("event:"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(chat.trim_start_matches("data: ").trim_end()).unwrap();
+        assert_eq!(parsed["error"]["type"], "stream_error");
+        assert_eq!(parsed["error"]["message"], "boom");
+
+        // Responses 与 Anthropic 同形状（同一个 error 事件封装）
+        assert_eq!(
+            ClientSseProtocol::Responses.error_event("boom"),
+            ClientSseProtocol::Anthropic.error_event("boom")
+        );
+    }
 
     #[test]
     fn strip_sse_field_accepts_optional_space() {

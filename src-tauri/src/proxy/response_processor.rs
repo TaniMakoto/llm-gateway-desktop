@@ -9,7 +9,10 @@ use super::{
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::ProxyResponse,
     server::ProxyState,
-    sse::{strip_sse_field, take_sse_block},
+    sse::{
+        strip_sse_field, take_sse_block, ClientSseProtocol, SseTerminalState,
+        TerminalMarkerScanner,
+    },
     usage::parser::TokenUsage,
     ProxyError,
 };
@@ -24,7 +27,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
 
@@ -188,7 +191,15 @@ pub async fn handle_streaming(
     // 创建带日志和超时的透传流
     let logged_stream = create_logged_passthrough_stream(
         stream,
-        ctx.tag,
+        PassthroughDiagnostics {
+            tag: ctx.tag,
+            protocol: client_sse_protocol_for_app(ctx.app_type_str),
+            provider_id: ctx.provider.id.clone(),
+            model: ctx
+                .outbound_model
+                .clone()
+                .unwrap_or_else(|| ctx.request_model.clone()),
+        },
         usage_collector,
         timeout_config,
         connection_guard,
@@ -673,16 +684,49 @@ async fn log_usage_internal(
     }
 }
 
+/// 透传流的诊断上下文：上游中途断流时用于 ERROR 日志与给客户端的 SSE error 事件。
+pub(crate) struct PassthroughDiagnostics {
+    /// 日志前缀，沿用既有 `[{tag}]` 格式（如 "Claude"、"Codex"）
+    pub tag: &'static str,
+    /// 客户端侧 SSE 协议（决定正常结束标记与 error 事件形状）
+    pub protocol: ClientSseProtocol,
+    /// 上游 provider id
+    pub provider_id: String,
+    /// 出站模型名（路由映射后的真值，缺失时调用方用请求别名兜底）
+    pub model: String,
+}
+
+/// 按应用类型推断客户端侧 SSE 协议。
+///
+/// Claude / Claude Desktop 客户端说 Anthropic Messages，Codex 说 OpenAI Responses，
+/// 其余（Gemini 以及透传的 OpenAI 兼容客户端）按 data-only SSE 处理。
+pub(crate) fn client_sse_protocol_for_app(app_type_str: &str) -> ClientSseProtocol {
+    match app_type_str {
+        "claude" | "claude-desktop" => ClientSseProtocol::Anthropic,
+        "codex" => ClientSseProtocol::Responses,
+        _ => ClientSseProtocol::Chat,
+    }
+}
+
 /// 创建带日志记录和超时控制的透传流
 pub fn create_logged_passthrough_stream(
     stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
-    tag: &'static str,
+    diagnostics: PassthroughDiagnostics,
     usage_collector: Option<SseUsageCollector>,
     timeout_config: StreamingTimeoutConfig,
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let _conn_guard = connection_guard;
+        let tag = diagnostics.tag;
+        let protocol = diagnostics.protocol;
+        let provider_id = diagnostics.provider_id;
+        let model = diagnostics.model;
+        let stream_start = Instant::now();
+        // 已下发的 SSE 事件数 / 字节数：只用于断流日志与"响应是否已开始"判定
+        let mut forwarded_events: u64 = 0;
+        let mut forwarded_bytes: u64 = 0;
+        let mut terminal = TerminalMarkerScanner::new(protocol);
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut collector = usage_collector;
@@ -739,12 +783,18 @@ pub fn create_logged_passthrough_stream(
                         );
                     }
                     is_first_chunk = false;
-                    if inspect_sse_events {
-                        crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    forwarded_bytes += bytes.len() as u64;
+                    // 无条件累积并切块：既供 usage collector / debug 日志使用，也用于
+                    // 统计已下发事件数并检测协议正常结束标记（中途断流判定）。
+                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
 
-                        // 尝试解析并记录完整的 SSE 事件
-                        while let Some(event_text) = take_sse_block(&mut buffer) {
-                            if !event_text.trim().is_empty() {
+                    // 尝试解析并记录完整的 SSE 事件
+                    while let Some(event_text) = take_sse_block(&mut buffer) {
+                        if !event_text.trim().is_empty() {
+                            forwarded_events += 1;
+                            terminal.push(&event_text);
+
+                            if inspect_sse_events {
                                 // 提取 data 部分；只有 usage collector 存在时才解析 JSON。
                                 for line in event_text.lines() {
                                     if let Some(data) = strip_sse_field(line, "data") {
@@ -778,12 +828,54 @@ pub fn create_logged_passthrough_stream(
                     yield Ok(bytes);
                 }
                 Some(Err(e)) => {
-                    log::error!("[{tag}] 流错误: {e}");
-                    yield Err(std::io::Error::other(e.to_string()));
+                    // 上游流中途断开：响应已经开始，无法再回退到故障转移，只能记录
+                    // 断流日志并（在没人报过错时）给客户端补发 SSE error，避免客户端
+                    // 把截断当成正常结束（表现为静默中断）。
+                    log::error!(
+                        "[{tag}] 上游流式中断: provider={provider_id}, model={model}, 协议={}, 终态={:?}, 已转发 {forwarded_events} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms, error={e}",
+                        protocol.name(),
+                        terminal.state(),
+                        stream_start.elapsed().as_millis()
+                    );
+                    // 只在确实已开始下发、且没有任何协议终态时补发，避免对上游报错后
+                    // 已自行收尾（event: error / response.failed）的流重复报错
+                    if forwarded_events > 0 && terminal.state() == SseTerminalState::Pending {
+                        yield Ok(protocol.error_event(&format!(
+                            "上游流式中断（已转发 {forwarded_events} 个 SSE 事件后连接断开）: {e}"
+                        )));
+                    }
+                    // 不再 yield Err：yield Err 会让 hyper 重置连接，客户端可能读不到
+                    // 上面的 error 事件；改为正常 EOF 收尾，由客户端按 error 事件判失败。
                     break;
                 }
                 None => {
-                    // 流正常结束
+                    match terminal.state() {
+                        // 协议正常收尾：什么都不用做
+                        SseTerminalState::Completed => {}
+                        // 上游或转换层已自行报错（event: error / response.failed），
+                        // 只补一条带上下文的 ERROR 日志，不再重复补发 error 事件
+                        SseTerminalState::Failed => {
+                            log::error!(
+                                "[{tag}] 上游流式响应以失败终态结束: provider={provider_id}, model={model}, 协议={}, 已转发 {forwarded_events} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms",
+                                protocol.name(),
+                                stream_start.elapsed().as_millis()
+                            );
+                        }
+                        // 完全没有终态标记 = 上游提前 EOF（close-delimited 响应在字节层
+                        // 不可检测），按中途断流处理
+                        SseTerminalState::Pending => {
+                            if forwarded_events > 0 {
+                                log::error!(
+                                    "[{tag}] 上游流式响应提前结束（未收到 {} 正常结束标记）: provider={provider_id}, model={model}, 已转发 {forwarded_events} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms",
+                                    protocol.name(),
+                                    stream_start.elapsed().as_millis()
+                                );
+                                yield Ok(protocol.error_event(&format!(
+                                    "上游流式响应中途断开（已转发 {forwarded_events} 个 SSE 事件，未收到正常结束标记）"
+                                )));
+                            }
+                        }
+                    }
                     break;
                 }
             }

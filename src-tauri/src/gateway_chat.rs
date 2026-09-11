@@ -5,7 +5,7 @@
 //! Anthropic upstreams with failover, so this module only translates the local
 //! Chat request/response surface.
 
-use crate::proxy::{handlers, server::ProxyState, ProxyError};
+use crate::proxy::{handlers, server::ProxyState, sse::ClientSseProtocol, ProxyError};
 use async_stream::stream;
 use axum::{
     body::{Body, Bytes},
@@ -17,6 +17,7 @@ use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::time::Instant;
 
 pub async fn handle_chat_completions(
     State(state): State<ProxyState>,
@@ -529,24 +530,41 @@ fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
 fn responses_sse_to_chat_response(response: Response, requested_model: String) -> Response {
     let (mut parts, body) = response.into_parts();
     let mut upstream = body.into_data_stream();
+    let log_model = requested_model.clone();
     let converted = stream! {
         let mut buffer = String::new();
         let mut converter = ResponsesChatSseConverter::new(requested_model);
+        let stream_start = Instant::now();
+        // 已下发的 chunk 数 / 字节数：只用于断流日志
+        let mut forwarded_chunks: u64 = 0;
+        let mut forwarded_bytes: u64 = 0;
 
         while let Some(next) = upstream.next().await {
             match next {
                 Ok(bytes) => {
+                    forwarded_bytes += bytes.len() as u64;
                     buffer.push_str(&String::from_utf8_lossy(&bytes).replace("\r\n", "\n"));
                     while let Some(position) = buffer.find("\n\n") {
                         let event = buffer[..position].to_string();
                         buffer.drain(..position + 2);
                         for output in converter.process_sse_event(&event) {
+                            forwarded_chunks += 1;
                             yield Ok::<Bytes, axum::Error>(Bytes::from(output));
                         }
                     }
                 }
                 Err(error) => {
-                    yield Err(error);
+                    // 上游流中途断开：此时响应已开始下发，无法再回退到故障转移，
+                    // 只能记录断流日志并给客户端补发 Chat 形状的 error chunk，
+                    // 避免客户端把截断当成正常结束。
+                    log::error!(
+                        "[Chat] 上游流式中断: model={log_model}, 已转发 {forwarded_chunks} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms, error={error}",
+                        stream_start.elapsed().as_millis()
+                    );
+                    yield Ok::<Bytes, axum::Error>(ClientSseProtocol::Chat.error_event(&format!(
+                        "上游流式中断（已转发 {forwarded_chunks} 个 SSE 事件后连接断开）: {error}"
+                    )));
+                    // 不再 yield Err：那会让 hyper 重置连接，客户端可能读不到上面的 error 事件
                     return;
                 }
             }
@@ -554,13 +572,21 @@ fn responses_sse_to_chat_response(response: Response, requested_model: String) -
 
         if !buffer.trim().is_empty() {
             for output in converter.process_sse_event(&buffer) {
+                forwarded_chunks += 1;
                 yield Ok::<Bytes, axum::Error>(Bytes::from(output));
             }
         }
         if !converter.finished {
-            for output in converter.finish(None) {
-                yield Ok::<Bytes, axum::Error>(Bytes::from(output));
-            }
+            // 上游提前 EOF（未收到 response.completed / response.failed 等终态）。
+            // 此前会经 finish(None) 补一个 finish_reason="stop" + [DONE]，把截断
+            // 伪装成正常结束；这里改为报错，让客户端能识别失败而不是静默半条消息。
+            log::error!(
+                "[Chat] 上游流式响应提前结束（未收到 Responses 正常结束标记）: model={log_model}, 已转发 {forwarded_chunks} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms",
+                stream_start.elapsed().as_millis()
+            );
+            yield Ok::<Bytes, axum::Error>(ClientSseProtocol::Chat.error_event(&format!(
+                "上游流式响应中途断开（已转发 {forwarded_chunks} 个 SSE 事件，未收到正常结束标记）"
+            )));
         }
     };
 
