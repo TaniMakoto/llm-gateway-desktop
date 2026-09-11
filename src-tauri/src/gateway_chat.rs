@@ -17,6 +17,7 @@ use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::time::Instant;
 
 pub async fn handle_chat_completions(
     State(state): State<ProxyState>,
@@ -529,23 +530,36 @@ fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
 fn responses_sse_to_chat_response(response: Response, requested_model: String) -> Response {
     let (mut parts, body) = response.into_parts();
     let mut upstream = body.into_data_stream();
+    let log_model = requested_model.clone();
     let converted = stream! {
         let mut buffer = String::new();
         let mut converter = ResponsesChatSseConverter::new(requested_model);
+        // 只喂给断流日志，不影响下发的字节。
+        let stream_start = Instant::now();
+        let mut forwarded_chunks: u64 = 0;
+        let mut forwarded_bytes: u64 = 0;
 
         while let Some(next) = upstream.next().await {
             match next {
                 Ok(bytes) => {
+                    forwarded_bytes += bytes.len() as u64;
                     buffer.push_str(&String::from_utf8_lossy(&bytes).replace("\r\n", "\n"));
                     while let Some(position) = buffer.find("\n\n") {
                         let event = buffer[..position].to_string();
                         buffer.drain(..position + 2);
                         for output in converter.process_sse_event(&event) {
+                            forwarded_chunks += 1;
                             yield Ok::<Bytes, axum::Error>(Bytes::from(output));
                         }
                     }
                 }
                 Err(error) => {
+                    // 行为不变（仍然 yield Err）：只补上可定位的上下文，此前这里连
+                    // 一条日志都没有，上游半途断开时日志里完全看不出来。
+                    log::error!(
+                        "[Chat] 上游流式中断: model={log_model}, 已转发 {forwarded_chunks} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms, error={error}",
+                        stream_start.elapsed().as_millis()
+                    );
                     yield Err(error);
                     return;
                 }
@@ -554,10 +568,17 @@ fn responses_sse_to_chat_response(response: Response, requested_model: String) -
 
         if !buffer.trim().is_empty() {
             for output in converter.process_sse_event(&buffer) {
+                forwarded_chunks += 1;
                 yield Ok::<Bytes, axum::Error>(Bytes::from(output));
             }
         }
         if !converter.finished {
+            // 行为不变（仍然用 finish(None) 补一个正常收尾）：只记一条 ERROR，方便
+            // 事后把"上游提前 EOF 被补成正常结束"和真正的正常结束区分开。
+            log::error!(
+                "[Chat] 上游流式响应提前结束（未收到 Responses 正常结束标记）: model={log_model}, 已转发 {forwarded_chunks} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms",
+                stream_start.elapsed().as_millis()
+            );
             for output in converter.finish(None) {
                 yield Ok::<Bytes, axum::Error>(Bytes::from(output));
             }
