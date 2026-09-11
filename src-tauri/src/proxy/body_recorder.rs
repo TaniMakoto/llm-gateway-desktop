@@ -81,9 +81,14 @@ pub fn request_trace_id(
         .as_ref()?
         .body_recording_models
         .as_ref()?;
-    match outbound_model {
-        Some(model) if !list.is_empty() && !list.iter().any(|m| m == model) => None,
-        _ => Some(next_trace_id()),
+    match (outbound_model, list.is_empty()) {
+        // 全量录制（Some(空列表)）：所有请求都录，含出站模型未知。
+        (_, true) => Some(next_trace_id()),
+        // 按模型录制：出站模型未知/缺失时无法命中列表，不录——避免把
+        // 无 model 字段的请求（URL 内嵌模型等）当噪音录下来。
+        (None, false) => None,
+        (Some(model), false) if list.iter().any(|m| m == model) => Some(next_trace_id()),
+        _ => None,
     }
 }
 

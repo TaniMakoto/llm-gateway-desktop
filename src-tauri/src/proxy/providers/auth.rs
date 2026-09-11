@@ -136,7 +136,9 @@ mod tests {
 
     #[test]
     fn test_masked_key_long() {
-        let auth = AuthInfo::new("test-api-key-1234567890abcdef".to_string(), AuthStrategy::Bearer);
+        // 期望值 "sk-1...cdef" 对应 sk- 前缀钥匙（历史遗留：输入后来被改成
+        // test-api-key-… 但期望没更新，CI 全量跑测试前一直未执行过）。
+        let auth = AuthInfo::new("sk-1234567890abcdef".to_string(), AuthStrategy::Bearer);
         assert_eq!(auth.masked_key(), "sk-1...cdef");
     }
 
