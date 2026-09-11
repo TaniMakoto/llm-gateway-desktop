@@ -1328,7 +1328,8 @@ mod tests {
             msg["reasoning_content"],
             "Need the current date before calling weather."
         );
-        assert_eq!(msg["tool_calls"][0]["id"], "call_date");
+        // 回程保留的是网关发号的 id，而不是上游原始的 call_date。
+        assert_eq!(msg["tool_calls"][0]["id"], tool_id);
         assert_eq!(msg["tool_calls"][0]["function"]["name"], "get_date");
     }
 
