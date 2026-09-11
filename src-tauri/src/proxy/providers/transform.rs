@@ -1247,8 +1247,16 @@ mod tests {
             assert_eq!(result["content"][0]["name"], "Grep");
         }
         // 两个 id 互不相同（全局发号）。
-        let a = openai_to_anthropic(chat_tool_calls_input()).unwrap()["content"][0]["id"];
-        let b = openai_to_anthropic(chat_tool_calls_input()).unwrap()["content"][0]["id"];
+        let a: String = openai_to_anthropic(chat_tool_calls_input())
+            .unwrap()["content"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let b: String = openai_to_anthropic(chat_tool_calls_input())
+            .unwrap()["content"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert_ne!(a, b);
     }
 

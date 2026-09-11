@@ -945,31 +945,51 @@ mod tests {
         // tool_use 与历史重复而整段丢弃（表现为 [Tool use interrupted]），
         // 所以网关必须给每条响应的 tool_use 发新的 id。
         let upstream_input = |id: &str| {
-            concat!(
-                "data: {\"id\":\"chatcmpl_k\",\"model\":\"moonshotai/kimi-k3\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"",
-                id,
-                "\",\"type\":\"function\",\"function\":{\"name\":\"Grep\",\"arguments\":\"{\\\"pattern\\\":\\\"x\\\"}\"}}]}}]}\n\n",
-                "data: {\"id\":\"chatcmpl_k\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
-                "data: [DONE]\n\n"
+            format!(
+                concat!(
+                    "data: {{\"id\":\"chatcmpl_k\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"",
+                    "{id}",
+                    "\",\"type\":\"function\",\"function\":{\"name\":\"Grep\",\"arguments\":\"{\\\"pattern\\\":\\\"x\\\"}\"}}]}}]}}\n\n",
+                    "data: {{\"id\":\"chatcmpl_k\",\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                id = id
             )
         };
 
-        let collect_emitted_id = async |id: &str| {
-            let events = collect_anthropic_events(&upstream_input(id)).await;
-            events
-                .iter()
-                .filter(|event| {
-                    event_type(event) == Some("content_block_start")
-                        && event.pointer("/content_block/type").and_then(Value::as_str)
-                            == Some("tool_use")
-                })
-                .find_map(|event| {
-                    event
-                        .pointer("/content_block/id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .expect("tool_use content_block_start 必须带 id")
+        let collect_emitted_id = |id: &'static str| {
+            let input = upstream_input(id);
+            async move {
+                let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(
+                    input.as_bytes().to_vec(),
+                ))]);
+                let converted = create_anthropic_sse_stream(upstream);
+                let chunks: Vec<_> = converted.collect().await;
+                let merged = chunks
+                    .into_iter()
+                    .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+                    .collect::<String>();
+                merged
+                    .split("\n\n")
+                    .filter_map(|block| {
+                        let data = block
+                            .lines()
+                            .find_map(|line| strip_sse_field(line, "data"))?;
+                        serde_json::from_str::<Value>(data).ok()
+                    })
+                    .filter(|event| {
+                        event_type(event) == Some("content_block_start")
+                            && event.pointer("/content_block/type").and_then(Value::as_str)
+                                == Some("tool_use")
+                    })
+                    .find_map(|event| {
+                        event
+                            .pointer("/content_block/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .expect("tool_use content_block_start 必须带 id")
+            }
         };
 
         let first = collect_emitted_id("Grep:0").await;
@@ -977,7 +997,10 @@ mod tests {
 
         assert_ne!(first, second, "同一上游 id 在两次响应里必须映射到不同 id");
         assert_ne!(first, "Grep:0");
-        assert!(first.starts_with("call_"), "网关发号的 id 形如 call_N，实际 {first}");
+        assert!(
+            first.starts_with("call_"),
+            "网关发号的 id 形如 call_N，实际 {first}"
+        );
     }
 
     #[tokio::test]

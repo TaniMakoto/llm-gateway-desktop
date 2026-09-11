@@ -1281,16 +1281,16 @@ mod tests {
         };
 
         // 干净收尾：message_stop 之后既不加字节也不报错。
-        let clean: Vec<Result<Bytes, std::io::Error>> = vec![
-            Ok(Bytes::from_static(
-                b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
-            )),
-            Ok(Bytes::from_static(
-                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-            )),
-        ];
+        let expected_len = 2;
         let out = create_logged_passthrough_stream(
-            futures::stream::iter(clean.clone()),
+            futures::stream::iter(vec![
+                Ok(Bytes::from_static(
+                    b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+                )),
+                Ok(Bytes::from_static(
+                    b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                )),
+            ]),
             diagnostics(),
             None,
             timeout_config,
@@ -1298,7 +1298,7 @@ mod tests {
         )
         .collect::<Vec<_>>()
         .await;
-        assert_eq!(out.len(), clean.len(), "干净收尾不得追加任何字节");
+        assert_eq!(out.len(), expected_len, "干净收尾不得追加任何字节");
         assert!(out.iter().all(|result| result.is_ok()));
 
         // 上游半途断开：错误必须原样传播（仍然 yield Err），不做 in-band 转换。
@@ -1308,8 +1308,9 @@ mod tests {
             )),
             Err(std::io::Error::other("upstream reset mid-stream")),
         ];
+        let expected_len = broken.len();
         let out = create_logged_passthrough_stream(
-            futures::stream::iter(broken.clone()),
+            futures::stream::iter(broken),
             diagnostics(),
             None,
             timeout_config,
@@ -1317,7 +1318,7 @@ mod tests {
         )
         .collect::<Vec<_>>()
         .await;
-        assert_eq!(out.len(), broken.len());
+        assert_eq!(out.len(), expected_len);
         assert!(out[0].is_ok());
         assert!(
             out[1].is_err(),
