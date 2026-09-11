@@ -945,16 +945,13 @@ mod tests {
         // tool_use 与历史重复而整段丢弃（表现为 [Tool use interrupted]），
         // 所以网关必须给每条响应的 tool_use 发新的 id。
         let upstream_input = |id: &str| {
-            format!(
-                concat!(
-                    "data: {{\"id\":\"chatcmpl_k\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"",
-                    "{id}",
-                    "\",\"type\":\"function\",\"function\":{\"name\":\"Grep\",\"arguments\":\"{\\\"pattern\\\":\\\"x\\\"}\"}}]}}]}}\n\n",
-                    "data: {{\"id\":\"chatcmpl_k\",\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
-                    "data: [DONE]\n\n"
-                ),
-                id = id
+            // 唯一动态片段是 id：塞 `{ID}` 占位符再替换，避免 format!/concat! 嵌套的花括号转义。
+            concat!(
+                "data: {\"id\":\"chatcmpl_k\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"{ID}\",\"type\":\"function\",\"function\":{\"name\":\"Grep\",\"arguments\":\"{\\\"pattern\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+                "data: {\"id\":\"chatcmpl_k\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
             )
+            .replace("{ID}", id)
         };
 
         let collect_emitted_id = |id: &'static str| {
