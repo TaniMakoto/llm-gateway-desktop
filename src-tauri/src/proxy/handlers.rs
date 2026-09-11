@@ -34,10 +34,10 @@ use super::{
     response_processor::{
         create_logged_passthrough_stream, process_response, read_decoded_body,
         strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
-        usage_logging_enabled, PassthroughDiagnostics, SseUsageCollector,
+        usage_logging_enabled, SseUsageCollector,
     },
     server::ProxyState,
-    sse::{strip_sse_field, take_sse_block, ClientSseProtocol},
+    sse::{strip_sse_field, take_sse_block},
     types::*,
     usage::parser::TokenUsage,
     ProxyError,
@@ -474,15 +474,7 @@ async fn handle_claude_transform(
 
         let logged_stream = create_logged_passthrough_stream(
             sse_stream,
-            PassthroughDiagnostics {
-                tag: "Claude/OpenRouter",
-                protocol: ClientSseProtocol::Anthropic,
-                provider_id: ctx.provider.id.clone(),
-                model: ctx
-                    .outbound_model
-                    .clone()
-                    .unwrap_or_else(|| ctx.request_model.clone()),
-            },
+            "Claude/OpenRouter",
             usage_collector,
             timeout_config,
             connection_guard,
@@ -963,15 +955,7 @@ async fn handle_codex_chat_to_responses_transform(
 
         let logged_stream = create_logged_passthrough_stream(
             sse_stream,
-            PassthroughDiagnostics {
-                tag: ctx.tag,
-                protocol: ClientSseProtocol::Responses,
-                provider_id: ctx.provider.id.clone(),
-                model: ctx
-                    .outbound_model
-                    .clone()
-                    .unwrap_or_else(|| ctx.request_model.clone()),
-            },
+            ctx.tag,
             usage_collector,
             ctx.streaming_timeout_config(),
             connection_guard,
@@ -1337,15 +1321,7 @@ fn build_codex_anthropic_sse_response(
 
     let logged_stream = create_logged_passthrough_stream(
         sse_stream,
-        PassthroughDiagnostics {
-            tag: ctx.tag,
-            protocol: ClientSseProtocol::Responses,
-            provider_id: ctx.provider.id.clone(),
-            model: ctx
-                .outbound_model
-                .clone()
-                .unwrap_or_else(|| ctx.request_model.clone()),
-        },
+        ctx.tag,
         usage_collector,
         ctx.streaming_timeout_config(),
         connection_guard,
