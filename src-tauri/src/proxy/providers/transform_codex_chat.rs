@@ -962,9 +962,11 @@ fn next_item_takes_reasoning(next_item: Option<&Value>) -> bool {
     };
     match next.get("type").and_then(|v| v.as_str()) {
         Some("function_call" | "custom_tool_call" | "tool_search_call") => true,
-        Some("message") | None => {
-            next.get("role").and_then(|v| v.as_str()) == Some("assistant")
-        }
+        // 顶层 input_* 项在带 role=assistant 时同样会被转成 assistant 消息，
+        // 与 message 项一样消费 pending reasoning，不能漏掉。
+        Some("message")
+        | Some("input_text" | "input_image" | "input_file" | "input_audio")
+        | None => next.get("role").and_then(|v| v.as_str()) == Some("assistant"),
         _ => false,
     }
 }
@@ -2756,6 +2758,26 @@ mod tests {
         assert_eq!(messages[1]["reasoning_content"], "R1");
         assert_eq!(messages[2]["role"], "assistant");
         assert_eq!(messages[2]["reasoning_content"], "R2");
+    }
+
+    #[test]
+    fn responses_request_to_chat_keeps_flat_input_text_assistant_reasoning() {
+        // 顶层 input_* item 带 role=assistant 时同样消费 pending reasoning，
+        // reasoning 归属必须跟上（peek 分支不能漏掉这类后续项）。
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "q"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "R"}]},
+                {"type": "input_text", "role": "assistant", "text": "a"}
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["reasoning_content"], "R");
     }
 
     #[test]
