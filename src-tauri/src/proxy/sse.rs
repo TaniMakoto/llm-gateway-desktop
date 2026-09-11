@@ -116,12 +116,15 @@ impl ClientSseProtocol {
     fn may_carry_terminal(self, block: &str) -> bool {
         match self {
             ClientSseProtocol::Anthropic => {
-                block.contains("message_stop") || block.contains("stop_reason")
+                block.contains("message_stop")
+                    || block.contains("stop_reason")
+                    || block.contains("event: error")
             }
             ClientSseProtocol::Responses => {
                 block.contains("response.completed")
                     || block.contains("response.incomplete")
                     || block.contains("response.failed")
+                    || block.contains("event: error")
             }
             ClientSseProtocol::Chat => {
                 block.contains("[DONE]")

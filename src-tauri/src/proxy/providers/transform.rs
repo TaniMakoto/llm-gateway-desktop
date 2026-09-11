@@ -1306,7 +1306,12 @@ mod tests {
         );
         assert_eq!(anthropic_response["content"][1]["type"], "text");
         assert_eq!(anthropic_response["content"][2]["type"], "tool_use");
-        assert_eq!(anthropic_response["content"][2]["id"], "call_date");
+        // tool id 现在由网关发号（唯一性要求），不再透传上游的 call_date。
+        let tool_id = anthropic_response["content"][2]["id"].as_str().unwrap();
+        assert!(
+            tool_id.starts_with("call_") && tool_id != "call_date",
+            "网关发号的 id 形如 call_N，实际 {tool_id}"
+        );
 
         let follow_up_request = json!({
             "model": "deepseek-v4-flash",
