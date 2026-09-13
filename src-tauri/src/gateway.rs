@@ -10,6 +10,7 @@
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::{LocalProxyRequestOverrides, Provider, ProviderMeta};
+use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 use crate::proxy::types::{ProxyServerInfo, ProxyStatus};
 use crate::services::model_fetch;
 use crate::store::AppState;
@@ -1104,6 +1105,20 @@ pub struct GatewayModelTestRequest {
     pub thinking_level: GatewayTestThinkingLevel,
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// 流式测试：向上游请求 SSE，并把增量通过 `on_event` channel 实时推给前端。
+    /// 关闭时仍走一次性的非流式请求。
+    #[serde(default)]
+    pub stream: bool,
+}
+
+/// 流式测试过程中推给前端的事件。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum GatewayModelTestStreamEvent {
+    /// 上游已返回响应头，流即将开始。`status` 为 HTTP 状态码。
+    Start { status: u16 },
+    /// 增量内容：正文与思考分开推送，同一事件里最多一个非空。
+    Delta { text: String, reasoning: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1486,6 +1501,231 @@ fn parse_test_response(format: GatewayApiFormat, body: &Value) -> ParsedTestResp
     }
 }
 
+/// 单个 SSE 事件块对累积结果与前端增量的贡献。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StreamBlockEffect {
+    /// 本块新增的正文
+    text: String,
+    /// 本块新增的思考内容
+    reasoning: String,
+    /// 本块的错误信息（上游在流内报错，如 Anthropic `event: error`）
+    error: Option<String>,
+    /// 本块是否就是本协议流的**最后一个**事件块。
+    ///
+    /// 注意只有真正的收尾标记才算：Chat 的 `finish_reason` 之后还有一条带 usage
+    /// 的 chunk，Anthropic 的 `message_delta` 之后还有 `message_stop`，
+    /// 提前收工会把 usage 丢掉。
+    is_terminal: bool,
+}
+
+impl StreamBlockEffect {
+    fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.reasoning.is_empty() && self.error.is_none()
+    }
+}
+
+/// 把增量 usage 合并进已有统计。流式响应会把 usage 拆到多个事件里
+/// （如 Anthropic 在 `message_start` 给 input_tokens、`message_delta` 给
+/// output_tokens），因此只填补缺失字段，不做整体覆盖。
+fn merge_test_usage(slot: &mut Option<GatewayModelTestUsage>, next: GatewayModelTestUsage) {
+    if next.is_empty() {
+        return;
+    }
+    let Some(current) = slot else {
+        *slot = Some(next);
+        return;
+    };
+    fn fill(target: &mut Option<u64>, value: Option<u64>) {
+        if value.is_some() {
+            *target = value;
+        }
+    }
+    fill(&mut current.input_tokens, next.input_tokens);
+    fill(&mut current.output_tokens, next.output_tokens);
+    fill(&mut current.total_tokens, next.total_tokens);
+    fill(
+        &mut current.cache_read_input_tokens,
+        next.cache_read_input_tokens,
+    );
+    fill(
+        &mut current.cache_creation_input_tokens,
+        next.cache_creation_input_tokens,
+    );
+    fill(&mut current.reasoning_tokens, next.reasoning_tokens);
+    if current.total_tokens.is_none() {
+        if let (Some(input), Some(output)) = (current.input_tokens, current.output_tokens) {
+            current.total_tokens = Some(input.saturating_add(output));
+        }
+    }
+}
+
+/// 按目标协议解析一个 SSE 事件块：把增量累加进 `parsed`，并把增量本身返回给调用方
+/// （用于实时推送给前端）。
+///
+/// 客户端协议与上游协议在这里是同一个，所以三种格式各写一份原生解析即可，
+/// 不需要走 `proxy/` 的跨协议转换。
+fn apply_stream_block(
+    format: GatewayApiFormat,
+    block: &str,
+    parsed: &mut ParsedTestResponse,
+) -> StreamBlockEffect {
+    let mut effect = StreamBlockEffect::default();
+
+    for payload in block.lines().filter_map(|line| strip_sse_field(line, "data")) {
+        let payload = payload.trim();
+        if payload.is_empty() {
+            continue;
+        }
+        // Chat 的结束标记是字面量 [DONE]，不是 JSON。
+        if payload == "[DONE]" {
+            effect.is_terminal = true;
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        match format {
+            GatewayApiFormat::OpenaiChat => {
+                if event.get("error").is_some_and(|value| !value.is_null()) {
+                    effect.error = Some(
+                        extract_structured_error(&event)
+                            .unwrap_or_else(|| "上游在流中返回错误".to_string()),
+                    );
+                }
+                if let Some(delta) = event.pointer("/choices/0/delta") {
+                    if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                        effect.text.push_str(text);
+                    }
+                    let reasoning = delta
+                        .get("reasoning_content")
+                        .or_else(|| delta.get("reasoning"))
+                        .and_then(Value::as_str);
+                    if let Some(text) = reasoning {
+                        effect.reasoning.push_str(text);
+                    }
+                }
+                if let Some(reason) = event
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    parsed.finish_reason = Some(reason.to_string());
+                    parsed.length_truncated = is_length_truncated(Some(reason));
+                }
+                if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
+                    merge_test_usage(&mut parsed.usage, parse_chat_usage(usage));
+                }
+            }
+            GatewayApiFormat::OpenaiResponses => {
+                match event.get("type").and_then(Value::as_str) {
+                    Some("response.output_text.delta") => {
+                        if let Some(text) = event.get("delta").and_then(Value::as_str) {
+                            effect.text.push_str(text);
+                        }
+                    }
+                    Some(
+                        "response.reasoning_summary_text.delta"
+                        | "response.reasoning_text.delta",
+                    ) => {
+                        if let Some(text) = event.get("delta").and_then(Value::as_str) {
+                            effect.reasoning.push_str(text);
+                        }
+                    }
+                    // 终态事件携带完整的 response 对象，usage/finish_reason 都在里面。
+                    Some("response.completed" | "response.incomplete") => {
+                        effect.is_terminal = true;
+                        if let Some(full) = event.get("response") {
+                            let done = parse_test_response(GatewayApiFormat::OpenaiResponses, full);
+                            if let Some(reason) = done.finish_reason {
+                                parsed.finish_reason = Some(reason);
+                            }
+                            parsed.length_truncated = done.length_truncated;
+                            if let Some(usage) = done.usage {
+                                merge_test_usage(&mut parsed.usage, usage);
+                            }
+                            // 少数上游只在终态里给全文，不逐字发 delta。
+                            if effect.text.is_empty() && parsed.reply_text.is_empty() {
+                                effect.text = done.reply_text;
+                            }
+                            if effect.reasoning.is_empty() && parsed.reasoning_text.is_empty() {
+                                effect.reasoning = done.reasoning_text;
+                            }
+                        }
+                    }
+                    Some("response.failed" | "error") => {
+                        effect.error = Some(
+                            event
+                                .pointer("/response/error/message")
+                                .or_else(|| event.pointer("/error/message"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("上游在流中返回错误")
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            GatewayApiFormat::Anthropic => match event.get("type").and_then(Value::as_str) {
+                Some("content_block_delta") => {
+                    let delta = event.get("delta");
+                    match delta.and_then(|value| value.get("type")).and_then(Value::as_str) {
+                        Some("text_delta") => {
+                            if let Some(text) = delta
+                                .and_then(|value| value.get("text"))
+                                .and_then(Value::as_str)
+                            {
+                                effect.text.push_str(text);
+                            }
+                        }
+                        Some("thinking_delta") => {
+                            if let Some(text) = delta
+                                .and_then(|value| value.get("thinking"))
+                                .and_then(Value::as_str)
+                            {
+                                effect.reasoning.push_str(text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some("message_start") => {
+                    if let Some(usage) = event.pointer("/message/usage") {
+                        merge_test_usage(&mut parsed.usage, parse_anthropic_usage(usage));
+                    }
+                }
+                Some("message_delta") => {
+                    if let Some(reason) = event
+                        .pointer("/delta/stop_reason")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    {
+                        parsed.finish_reason = Some(reason.to_string());
+                        parsed.length_truncated = is_length_truncated(Some(reason));
+                    }
+                    if let Some(usage) = event.get("usage") {
+                        merge_test_usage(&mut parsed.usage, parse_anthropic_usage(usage));
+                    }
+                }
+                Some("message_stop") => effect.is_terminal = true,
+                Some("error") => {
+                    effect.error = Some(
+                        event
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("上游在流中返回错误")
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            },
+        }
+    }
+
+    parsed.reply_text.push_str(&effect.text);
+    parsed.reasoning_text.push_str(&effect.reasoning);
+    effect
+}
+
 fn chat_messages_value(messages: &[GatewayModelTestMessage]) -> Value {
     Value::Array(
         messages
@@ -1622,6 +1862,22 @@ fn build_test_payload(
     }
 }
 
+/// 在非流式 payload 的基础上打开流式开关。
+///
+/// 只改这两个字段，其余请求体与非流式路径保持逐字节一致——避免"流式/非流式"
+/// 两条链路各自演化出不同的参数组合。
+fn apply_test_stream(payload: &mut Value, format: GatewayApiFormat, stream: bool) {
+    if !stream {
+        return;
+    }
+    payload["stream"] = json!(true);
+    if format == GatewayApiFormat::OpenaiChat {
+        // Chat 流式默认不返回 usage；让上游在最后一个 chunk 里带上，
+        // 否则测试页拿不到 token 统计。OpenAI 兼容上游普遍支持该字段。
+        payload["stream_options"] = json!({ "include_usage": true });
+    }
+}
+
 async fn read_response_text(response: reqwest::Response) -> Result<String, String> {
     let mut body = response.bytes_stream();
     let mut collected = Vec::new();
@@ -1637,6 +1893,86 @@ async fn read_response_text(response: reqwest::Response) -> Result<String, Strin
         collected.extend_from_slice(bytes);
     }
     String::from_utf8(collected).map_err(|e| format!("响应不是有效 UTF-8: {e}"))
+}
+
+/// 读取 SSE 流：边收边解析，把增量推给前端，同时累积成与非流式一致的结果。
+///
+/// 返回 `(原始响应文本, 解析结果, 流内错误)`。原始文本保留 SSE 帧原貌，
+/// 便于在测试页里直接排查上游到底发了什么。
+async fn read_stream_response(
+    format: GatewayApiFormat,
+    response: reqwest::Response,
+    status: u16,
+    sink: &tauri::ipc::Channel<GatewayModelTestStreamEvent>,
+) -> Result<(String, ParsedTestResponse, Option<String>), String> {
+    let emit = |event: GatewayModelTestStreamEvent| {
+        // 前端窗口已关闭时 send 会失败；这不该中断本次测试。
+        let _ = sink.send(event);
+    };
+    emit(GatewayModelTestStreamEvent::Start { status });
+
+    let mut raw = String::new();
+    let mut buffer = String::new();
+    let mut remainder: Vec<u8> = Vec::new();
+    let mut parsed = ParsedTestResponse::default();
+    let mut stream_error: Option<String> = None;
+    let mut saw_any_block = false;
+    let mut terminal = false;
+    let mut body = response.bytes_stream();
+
+    'stream: while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| format!("读取响应失败: {e}"))?;
+        let bytes: &[u8] = chunk.as_ref();
+        if raw.len().saturating_add(bytes.len()) > TEST_RESPONSE_BYTES_MAX {
+            return Err(format!("响应体超过 {} 字节上限", TEST_RESPONSE_BYTES_MAX));
+        }
+        raw.push_str(&String::from_utf8_lossy(bytes));
+        append_utf8_safe(&mut buffer, &mut remainder, bytes);
+
+        while let Some(block) = take_sse_block(&mut buffer) {
+            saw_any_block = true;
+            let effect = apply_stream_block(format, &block, &mut parsed);
+            if stream_error.is_none() {
+                stream_error = effect.error.clone();
+            }
+            if !effect.is_empty() {
+                emit(GatewayModelTestStreamEvent::Delta {
+                    text: effect.text,
+                    reasoning: effect.reasoning,
+                });
+            }
+            // 见到收尾标记就收工：部分上游发完 [DONE] 仍挂着连接不关，
+            // 继续等只会一直耗到整体超时。
+            if effect.is_terminal {
+                terminal = true;
+                break;
+            }
+        }
+        if stream_error.is_some() || terminal {
+            break 'stream;
+        }
+    }
+
+    // 流末尾可能残留一个没有空行收尾的事件块（如直接以 `data: [DONE]` 结束）。
+    if !terminal && stream_error.is_none() && !buffer.trim().is_empty() {
+        saw_any_block = true;
+        let effect = apply_stream_block(format, &buffer, &mut parsed);
+        if !effect.is_empty() {
+            emit(GatewayModelTestStreamEvent::Delta {
+                text: effect.text,
+                reasoning: effect.reasoning,
+            });
+        }
+    }
+
+    // 上游忽略 stream:true、直接回了一整个 JSON：按非流式解析，别让测试页白跑。
+    if !saw_any_block {
+        if let Ok(body) = serde_json::from_str::<Value>(&raw) {
+            parsed = parse_test_response(format, &body);
+        }
+    }
+
+    Ok((raw, parsed, stream_error))
 }
 
 fn endpoint_path(format: GatewayApiFormat) -> &'static str {
@@ -1657,12 +1993,14 @@ fn join_url(base: &str, path: &str) -> String {
     }
 }
 
+/// 发送直连测试请求。返回响应（尚未读取响应体）与已发送的原始请求体，
+/// 由调用方决定按流式还是非流式读取。
 async fn run_direct_test(
     request: &GatewayModelTestRequest,
     client: &reqwest::Client,
-) -> Result<(u16, String, String), String> {
+) -> Result<(reqwest::Response, String), String> {
     let url = join_url(&request.provider.base_url, endpoint_path(request.api_format));
-    let payload = build_test_payload(
+    let mut payload = build_test_payload(
         request.api_format,
         &request.upstream_model,
         &request.messages,
@@ -1670,6 +2008,7 @@ async fn run_direct_test(
         request.thinking_level,
         request.system_prompt.as_deref(),
     )?;
+    apply_test_stream(&mut payload, request.api_format, request.stream);
     let raw_request = pretty_json_value(&payload);
 
     let mut req = client.post(&url).json(&payload);
@@ -1712,16 +2051,14 @@ async fn run_direct_test(
     }
 
     let response = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
-    let status = response.status().as_u16();
-    let text = read_response_text(response).await?;
-    Ok((status, text, raw_request))
+    Ok((response, raw_request))
 }
 
 async fn run_gateway_test(
     state: &AppState,
     request: &GatewayModelTestRequest,
     client: &reqwest::Client,
-) -> Result<(u16, String, String), String> {
+) -> Result<(reqwest::Response, String), String> {
     let config = load_config(&state.db).map_err(|e| e.to_string())?;
     let alias = if request.alias.trim().is_empty() {
         request.upstream_model.trim()
@@ -1740,7 +2077,7 @@ async fn run_gateway_test(
     };
     let base = format!("http://{}:{}", address, config.listen_port);
     let url = format!("{}{}", base, endpoint_path(request.api_format));
-    let payload = build_test_payload(
+    let mut payload = build_test_payload(
         request.api_format,
         alias,
         &request.messages,
@@ -1748,6 +2085,7 @@ async fn run_gateway_test(
         request.thinking_level,
         request.system_prompt.as_deref(),
     )?;
+    apply_test_stream(&mut payload, request.api_format, request.stream);
     let raw_request = pretty_json_value(&payload);
 
     let mut req = client.post(&url).json(&payload);
@@ -1764,9 +2102,7 @@ async fn run_gateway_test(
     }
 
     let response = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
-    let status = response.status().as_u16();
-    let text = read_response_text(response).await?;
-    Ok((status, text, raw_request))
+    Ok((response, raw_request))
 }
 
 fn empty_test_result(
@@ -1792,10 +2128,22 @@ fn empty_test_result(
     }
 }
 
+/// 单次测试的结果载荷：非流式与流式两条路径最终都归一到这里。
+struct TestOutcome {
+    status: u16,
+    /// 展示用的原始响应文本（非流式是完整 JSON，流式是 SSE 帧串）
+    text: String,
+    raw_request: String,
+    parsed: ParsedTestResponse,
+    /// 流内错误（上游在 SSE 中报错）；非流式路径恒为 None
+    stream_error: Option<String>,
+}
+
 #[tauri::command]
 pub async fn test_gateway_model(
     state: tauri::State<'_, AppState>,
     request: GatewayModelTestRequest,
+    on_event: tauri::ipc::Channel<GatewayModelTestStreamEvent>,
 ) -> Result<GatewayModelTestResult, String> {
     validate_test_request(&request)?;
 
@@ -1822,28 +2170,69 @@ pub async fn test_gateway_model(
         .as_ref()
         .map(|url| crate::proxy::http_client::mask_url(url));
 
-    let result = if request.via_gateway {
+    let sent = if request.via_gateway {
         run_gateway_test(&state, &request, &client).await
     } else {
         run_direct_test(&request, &client).await
     };
 
+    // 只有 2xx 才值得按 SSE 解析；错误响应体一律作为整体文本读出来，
+    // 好让上游的结构化报错原样呈现。
+    let outcome: Result<TestOutcome, String> = match sent {
+        Err(err) => Err(err),
+        Ok((response, raw_request)) => {
+            let status = response.status().as_u16();
+            if request.stream && (200..300).contains(&status) {
+                match read_stream_response(request.api_format, response, status, &on_event).await {
+                    Ok((text, parsed, stream_error)) => Ok(TestOutcome {
+                        status,
+                        text,
+                        raw_request,
+                        parsed,
+                        stream_error,
+                    }),
+                    Err(err) => Err(err),
+                }
+            } else {
+                match read_response_text(response).await {
+                    Ok(text) => {
+                        let parsed = serde_json::from_str::<Value>(&text)
+                            .ok()
+                            .map(|value| parse_test_response(request.api_format, &value))
+                            .unwrap_or_default();
+                        Ok(TestOutcome {
+                            status,
+                            text,
+                            raw_request,
+                            parsed,
+                            stream_error: None,
+                        })
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        }
+    };
+
     let latency_ms = start.elapsed().as_millis() as u64;
 
-    match result {
-        Ok((status, text, raw_request)) => {
-            let ok = (200..300).contains(&status);
+    match outcome {
+        Ok(outcome) => {
+            let TestOutcome {
+                status,
+                text,
+                raw_request,
+                parsed,
+                stream_error,
+            } = outcome;
+            let ok = (200..300).contains(&status) && stream_error.is_none();
             let raw_body = pretty_raw_body(&text);
             let body: Option<Value> = serde_json::from_str(&text).ok();
-            let parsed = body
-                .as_ref()
-                .map(|value| parse_test_response(request.api_format, value))
-                .unwrap_or_default();
             let error = if ok {
                 None
             } else {
-                body.as_ref()
-                    .and_then(extract_structured_error)
+                stream_error
+                    .or_else(|| body.as_ref().and_then(extract_structured_error))
                     .or_else(|| {
                         let trimmed = text.trim();
                         (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -2354,6 +2743,7 @@ mod tests {
             custom_proxy_url: String::new(),
             thinking_level: GatewayTestThinkingLevel::Disabled,
             system_prompt: None,
+            stream: false,
         }
     }
 
@@ -2546,6 +2936,264 @@ mod tests {
         let parsed = parse_test_response(GatewayApiFormat::Anthropic, &body);
         assert_eq!(parsed.reply_text, "截断的回复");
         assert_eq!(parsed.reasoning_text, "推理内容");
+    }
+
+    // ------------------------------------------------------------------
+    // 流式测试：请求体开关与 SSE 增量解析
+    // ------------------------------------------------------------------
+
+    /// 把一段 JSON 包成一个 SSE 事件块（`data: {...}`）。
+    fn sse_data(payload: &str) -> String {
+        format!("data: {payload}")
+    }
+
+    fn sse_json(payload: Value) -> String {
+        sse_data(&payload.to_string())
+    }
+
+    #[test]
+    fn apply_test_stream_only_flips_the_stream_switch() {
+        let base = build_test_payload(
+            GatewayApiFormat::OpenaiChat,
+            "model-a",
+            &[user_message("hi")],
+            4096,
+            GatewayTestThinkingLevel::Disabled,
+            None,
+        )
+        .expect("payload");
+
+        let mut off = base.clone();
+        apply_test_stream(&mut off, GatewayApiFormat::OpenaiChat, false);
+        assert_eq!(off, base, "非流式不应改动 payload");
+
+        let mut on = base.clone();
+        apply_test_stream(&mut on, GatewayApiFormat::OpenaiChat, true);
+        assert_eq!(on["stream"], true);
+        assert_eq!(on["stream_options"]["include_usage"], true);
+        // 除了流式开关，其余字段必须与非流式逐字一致。
+        assert_eq!(on["model"], base["model"]);
+        assert_eq!(on["messages"], base["messages"]);
+        assert_eq!(on["max_tokens"], base["max_tokens"]);
+    }
+
+    #[test]
+    fn apply_test_stream_skips_chat_usage_flag_for_other_formats() {
+        // Anthropic / Responses 的 usage 本来就在流里，不需要 Chat 的
+        // stream_options；多写一个未知字段可能被上游直接拒绝。
+        for format in [GatewayApiFormat::Anthropic, GatewayApiFormat::OpenaiResponses] {
+            let mut payload = json!({ "model": "m", "stream": false });
+            apply_test_stream(&mut payload, format, true);
+            assert_eq!(payload["stream"], true);
+            assert!(payload.get("stream_options").is_none());
+        }
+    }
+
+    #[test]
+    fn stream_chat_deltas_accumulate_and_keep_usage_after_finish_reason() {
+        let mut parsed = ParsedTestResponse::default();
+
+        let thinking = apply_stream_block(
+            GatewayApiFormat::OpenaiChat,
+            &sse_json(json!({
+                "choices": [{"delta": {"reasoning_content": "想"}}]
+            })),
+            &mut parsed,
+        );
+        assert_eq!(thinking.reasoning, "想");
+        assert_eq!(thinking.text, "");
+        assert!(!thinking.is_terminal);
+
+        let text = apply_stream_block(
+            GatewayApiFormat::OpenaiChat,
+            &sse_json(json!({ "choices": [{"delta": {"content": "你"}}] })),
+            &mut parsed,
+        );
+        assert_eq!(text.text, "你");
+
+        // finish_reason 之后还有一条带 usage 的 chunk，所以这里不能算收尾。
+        let finish = apply_stream_block(
+            GatewayApiFormat::OpenaiChat,
+            &sse_json(json!({
+                "choices": [{"delta": {}, "finish_reason": "length"}]
+            })),
+            &mut parsed,
+        );
+        assert!(
+            !finish.is_terminal,
+            "finish_reason 之后仍有 usage chunk，不能提前收工"
+        );
+        assert_eq!(parsed.finish_reason.as_deref(), Some("length"));
+        assert!(parsed.length_truncated);
+
+        apply_stream_block(
+            GatewayApiFormat::OpenaiChat,
+            &sse_json(json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 270,
+                    "completion_tokens": 16384,
+                    "completion_tokens_details": {"reasoning_tokens": 16384}
+                }
+            })),
+            &mut parsed,
+        );
+
+        let done = apply_stream_block(
+            GatewayApiFormat::OpenaiChat,
+            &sse_data("[DONE]"),
+            &mut parsed,
+        );
+        assert!(done.is_terminal);
+
+        assert_eq!(parsed.reply_text, "你");
+        assert_eq!(parsed.reasoning_text, "想");
+        let usage = parsed.usage.expect("usage 必须从流里保留下来");
+        assert_eq!(usage.total_tokens, Some(16654));
+        assert_eq!(usage.reasoning_tokens, Some(16384));
+    }
+
+    #[test]
+    fn stream_anthropic_merges_usage_split_across_events() {
+        let mut parsed = ParsedTestResponse::default();
+
+        // input_tokens 只在 message_start 出现。
+        apply_stream_block(
+            GatewayApiFormat::Anthropic,
+            &sse_json(json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 12, "cache_read_input_tokens": 3}}
+            })),
+            &mut parsed,
+        );
+        apply_stream_block(
+            GatewayApiFormat::Anthropic,
+            &sse_json(json!({
+                "type": "content_block_delta",
+                "delta": {"type": "thinking_delta", "thinking": "思考"}
+            })),
+            &mut parsed,
+        );
+        apply_stream_block(
+            GatewayApiFormat::Anthropic,
+            &sse_json(json!({
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "正文"}
+            })),
+            &mut parsed,
+        );
+        // output_tokens 与 stop_reason 在 message_delta 才到，仍不是最后一个事件。
+        let tail = apply_stream_block(
+            GatewayApiFormat::Anthropic,
+            &sse_json(json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "max_tokens"},
+                "usage": {"output_tokens": 4096}
+            })),
+            &mut parsed,
+        );
+        assert!(!tail.is_terminal, "message_delta 之后还有 message_stop");
+
+        let stop = apply_stream_block(
+            GatewayApiFormat::Anthropic,
+            &sse_json(json!({"type": "message_stop"})),
+            &mut parsed,
+        );
+        assert!(stop.is_terminal);
+
+        assert_eq!(parsed.reasoning_text, "思考");
+        assert_eq!(parsed.reply_text, "正文");
+        assert_eq!(parsed.finish_reason.as_deref(), Some("max_tokens"));
+        assert!(parsed.length_truncated);
+        let usage = parsed.usage.expect("两段 usage 必须合并");
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(4096));
+        assert_eq!(usage.cache_read_input_tokens, Some(3));
+        assert_eq!(usage.total_tokens, Some(4108));
+    }
+
+    #[test]
+    fn stream_responses_deltas_and_terminal_event() {
+        let mut parsed = ParsedTestResponse::default();
+
+        apply_stream_block(
+            GatewayApiFormat::OpenaiResponses,
+            &sse_json(json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "推理"
+            })),
+            &mut parsed,
+        );
+        apply_stream_block(
+            GatewayApiFormat::OpenaiResponses,
+            &sse_json(json!({
+                "type": "response.output_text.delta",
+                "delta": "正文"
+            })),
+            &mut parsed,
+        );
+        let tail = apply_stream_block(
+            GatewayApiFormat::OpenaiResponses,
+            &sse_json(json!({
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 100,
+                        "output_tokens_details": {"reasoning_tokens": 40}
+                    }
+                }
+            })),
+            &mut parsed,
+        );
+        assert!(tail.is_terminal);
+
+        assert_eq!(parsed.reasoning_text, "推理");
+        assert_eq!(parsed.reply_text, "正文");
+        assert_eq!(parsed.finish_reason.as_deref(), Some("max_output_tokens"));
+        assert!(parsed.length_truncated);
+        let usage = parsed.usage.expect("终态事件里的 usage");
+        assert_eq!(usage.output_tokens, Some(100));
+        assert_eq!(usage.reasoning_tokens, Some(40));
+    }
+
+    #[test]
+    fn stream_block_surfaces_in_band_errors() {
+        let mut parsed = ParsedTestResponse::default();
+        let anthropic = apply_stream_block(
+            GatewayApiFormat::Anthropic,
+            &sse_json(json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "上游过载"}
+            })),
+            &mut parsed,
+        );
+        assert_eq!(anthropic.error.as_deref(), Some("上游过载"));
+
+        let mut parsed = ParsedTestResponse::default();
+        let chat = apply_stream_block(
+            GatewayApiFormat::OpenaiChat,
+            &sse_json(json!({"error": {"message": "rate limited"}})),
+            &mut parsed,
+        );
+        assert_eq!(chat.error.as_deref(), Some("rate limited"));
+    }
+
+    #[test]
+    fn stream_block_ignores_non_data_lines_and_blank_blocks() {
+        let mut parsed = ParsedTestResponse::default();
+        // 只有 event: 行、没有 data: 行；以及 data: 后的空行都不应产生任何增量。
+        let effect = apply_stream_block(
+            GatewayApiFormat::OpenaiChat,
+            "event: ping\n\ndata: \n",
+            &mut parsed,
+        );
+        assert!(effect.is_empty());
+        assert!(parsed.reply_text.is_empty());
+        assert!(!effect.is_terminal);
     }
 
     #[test]

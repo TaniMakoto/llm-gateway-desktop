@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { toast } from "sonner";
 import {
@@ -169,6 +169,11 @@ interface ModelTestResult {
 type ModelTestRole = "user" | "assistant";
 
 type TestThinkingLevel = "disabled" | "low" | "medium" | "high";
+
+/** 流式测试期间后端推送的事件，与 gateway.rs 的 GatewayModelTestStreamEvent 对应。 */
+type ModelTestStreamEvent =
+  | { kind: "start"; status: number }
+  | { kind: "delta"; text: string; reasoning: string };
 
 interface ModelTestMessage {
   role: ModelTestRole;
@@ -1991,8 +1996,19 @@ function ModelTestModal({
   const [viaGateway, setViaGateway] = useState<"direct" | "gateway">("direct");
   const [proxyMode, setProxyMode] = useState<ProxyMode>("bypass");
   const [customProxyUrl, setCustomProxyUrl] = useState("");
+  const [streamEnabled, setStreamEnabled] = useState(false);
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<ModelTestResult | null>(null);
+  // 流式测试过程中已经上屏的增量。失败时这里保留着断流前收到的内容，
+  // 成功时由对话流里的助手气泡接管展示。
+  const [streamedText, setStreamedText] = useState("");
+  const [streamedReasoning, setStreamedReasoning] = useState("");
+  /** 流式请求已收到的 HTTP 状态；`null` 表示还没收到响应头。 */
+  const [streamStatus, setStreamStatus] = useState<number | null>(null);
+  // 流式思考面板默认展开（推理模型的价值就在于能看着它想），但允许用户收起。
+  // 必须受控：`<details open>` 写死为 true 时，每次增量重渲染都会把用户
+  // 手动折叠的状态顶回去。
+  const [showStreamedReasoning, setShowStreamedReasoning] = useState(true);
   const [showConfig, setShowConfig] = useState(false);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -2013,7 +2029,7 @@ function ModelTestModal({
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [history, running, result]);
+  }, [history, running, result, streamedText, streamedReasoning]);
 
   const maxOutputTokens = Number(maxOutputTokensText);
   const maxTokensValid =
@@ -2039,6 +2055,13 @@ function ModelTestModal({
   );
   const gatewayAllowed = gatewayRunning && aliasIsSaved && !!savedAlias;
 
+  const resetStreamedText = () => {
+    setStreamedText("");
+    setStreamedReasoning("");
+    setStreamStatus(null);
+    setShowStreamedReasoning(true);
+  };
+
   const updateHistoryMessage = (index: number, content: string) => {
     setHistory((current) =>
       current.map((message, i) =>
@@ -2054,6 +2077,7 @@ function ModelTestModal({
     setDraft("用一句话介绍你自己。");
     setResult(null);
     setEditingIndex(null);
+    resetStreamedText();
   };
 
   const run = async () => {
@@ -2083,6 +2107,24 @@ function ModelTestModal({
     ];
     setRunning(true);
     setResult(null);
+    resetStreamedText();
+    // 流式模式下后端会把增量推到这个 channel 上，回复逐字上屏；结束后仍以
+    // invoke 的返回值为准（usage、finish_reason、原始报文都在里面）。
+    // 后端把该参数声明为必填（Tauri 的 Channel 只能以 CommandArg 注入），
+    // 非流式模式下后端不会往里推任何事件。
+    const channel = new Channel<ModelTestStreamEvent>();
+    channel.onmessage = (event) => {
+      if (event.kind === "start") {
+        setStreamStatus(event.status);
+        return;
+      }
+      if (event.kind === "delta") {
+        if (event.text) setStreamedText((current) => current + event.text);
+        if (event.reasoning) {
+          setStreamedReasoning((current) => current + event.reasoning);
+        }
+      }
+    };
     try {
       const res = await invoke<ModelTestResult>("test_gateway_model", {
         request: {
@@ -2097,7 +2139,9 @@ function ModelTestModal({
           viaGateway: viaGateway === "gateway",
           proxyMode,
           customProxyUrl,
+          stream: streamEnabled,
         },
+        onEvent: channel,
       });
       setResult(res);
       if (res.ok) {
@@ -2352,6 +2396,21 @@ function ModelTestModal({
                   </SegmentedOption>
                 </div>
               </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-xs text-muted-foreground">流式传输</span>
+                <label
+                  className="switch-label min-h-10 rounded-lg border border-border bg-muted/30 px-3"
+                  title="向上游请求 SSE，回复逐字上屏；结束后仍会给出 usage 与停止原因"
+                >
+                  <input
+                    type="checkbox"
+                    checked={streamEnabled}
+                    disabled={running}
+                    onChange={(event) => setStreamEnabled(event.target.checked)}
+                  />
+                  启用
+                </label>
+              </div>
               {!maxTokensValid && maxOutputTokensText !== "" && (
                 <span className="text-[11px] text-destructive">
                   范围 1–{MODEL_TEST_MAX_OUTPUT_TOKENS}
@@ -2516,15 +2575,55 @@ function ModelTestModal({
             );
           })}
 
-          {/* 运行中加载气泡 */}
+          {/* 运行中加载气泡；流式模式下有内容后转为实时上屏的助手气泡 */}
           {running && (
             <div className="flex justify-start">
-              <div className="rounded-2xl rounded-bl-sm bg-muted/40 px-4 py-2.5">
-                <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                  等待上游回复…
+              {streamEnabled && (streamedText || streamedReasoning) ? (
+                <div className="group relative max-w-[85%] rounded-2xl rounded-bl-sm bg-muted/40 px-4 py-2.5">
+                  <div className="mb-1 flex items-center gap-2">
+                    <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                      助手
+                    </span>
+                    <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                      <RefreshCw className="h-3 w-3 animate-spin" />
+                      {streamStatus
+                        ? `已连接 · HTTP ${streamStatus}`
+                        : "接收中…"}
+                    </span>
+                  </div>
+                  {streamedReasoning ? (
+                    <details
+                      className="mb-2 border-b border-border/60 pb-2"
+                      open={showStreamedReasoning}
+                      onToggle={(event) =>
+                        setShowStreamedReasoning(event.currentTarget.open)
+                      }
+                    >
+                      <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                        <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                        思考过程
+                      </summary>
+                      <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[10px] leading-4 text-muted-foreground">
+                        {streamedReasoning}
+                      </pre>
+                    </details>
+                  ) : null}
+                  {streamedText ? (
+                    <Markdown content={streamedText} />
+                  ) : (
+                    <div className="text-xs italic text-muted-foreground">
+                      （模型尚未产出正文，正在输出思考内容）
+                    </div>
+                  )}
                 </div>
-              </div>
+              ) : (
+                <div className="rounded-2xl rounded-bl-sm bg-muted/40 px-4 py-2.5">
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                    {streamEnabled ? "等待上游首字…" : "等待上游回复…"}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -2573,6 +2672,25 @@ function ModelTestModal({
                   <span className="font-medium">失败</span>
                   {result.status > 0 && <span> · HTTP {result.status}</span>}
                   {result.error && <span> · {result.error}</span>}
+                </div>
+              )}
+              {/* 流式请求中途失败：把断流前已经收到的内容留下来，别让它随失败一起消失。 */}
+              {!result.ok && (streamedText || streamedReasoning) && (
+                <div className="mt-2 border-t border-border/60 pt-2">
+                  <div className="text-[11px] text-muted-foreground">
+                    断流前已收到（正文 {streamedText.length} 字 / 思考{" "}
+                    {streamedReasoning.length} 字）
+                  </div>
+                  {streamedReasoning && (
+                    <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[10px] leading-4 text-muted-foreground">
+                      {streamedReasoning}
+                    </pre>
+                  )}
+                  {streamedText && (
+                    <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[10px] leading-4">
+                      {streamedText}
+                    </pre>
+                  )}
                 </div>
               )}
               {/* 失败时没有助手气泡，这里补一个原始响应入口，方便排查。 */}
