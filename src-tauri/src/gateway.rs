@@ -1002,12 +1002,15 @@ pub async fn open_gateway_recording_folder(handle: tauri::AppHandle) -> Result<b
 // ============================================================================
 
 const TEST_MAX_OUTPUT_TOKENS_MIN: u32 = 1;
-const TEST_MAX_OUTPUT_TOKENS_MAX: u32 = 16_384;
+const TEST_MAX_OUTPUT_TOKENS_MAX: u32 = 131_072;
 const TEST_MESSAGE_COUNT_MAX: usize = 100;
 const TEST_MESSAGE_BYTES_MAX: usize = 64 * 1024;
 const TEST_MESSAGES_TOTAL_BYTES_MAX: usize = 1024 * 1024;
 const TEST_RESPONSE_BYTES_MAX: usize = 16 * 1024 * 1024;
-const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// 单次测试的整体超时。要放得下大 max_output_tokens 的推理请求：实测上游约
+/// 250 tok/s，128K 输出需要约 9 分钟，120s 会在返回结果前就掐断。取值与网关
+/// 自身对上游的超时（`proxy/http_client.rs`）保持一致。
+const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const TEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const TEST_GATEWAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2366,11 +2369,11 @@ mod tests {
         request.max_output_tokens = 0;
         assert!(validate_test_request(&request).is_err());
 
-        request.max_output_tokens = 16_385;
+        request.max_output_tokens = 131_073;
         assert!(validate_test_request(&request).is_err());
 
-        request.max_output_tokens = 16_384;
-        validate_test_request(&request).expect("16384 is the upper bound");
+        request.max_output_tokens = 131_072;
+        validate_test_request(&request).expect("131072 is the upper bound");
     }
 
     #[test]

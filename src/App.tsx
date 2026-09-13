@@ -203,6 +203,10 @@ const formatLabels: Record<ApiFormat, string> = {
   anthropic: "Anthropic Messages",
 };
 
+/** 模型测试页"最大输出 token"输入框的上限，需与后端 gateway.rs 的
+ *  TEST_MAX_OUTPUT_TOKENS_MAX 保持一致。 */
+const MODEL_TEST_MAX_OUTPUT_TOKENS = 131072;
+
 function newId(prefix: string): string {
   const value =
     globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
@@ -2015,7 +2019,7 @@ function ModelTestModal({
   const maxTokensValid =
     Number.isInteger(maxOutputTokens) &&
     maxOutputTokens >= 1 &&
-    maxOutputTokens <= 16384;
+    maxOutputTokens <= MODEL_TEST_MAX_OUTPUT_TOKENS;
   const draftTrimmed = draft.trim();
   const canSend = !running && maxTokensValid && draftTrimmed.length > 0;
 
@@ -2058,7 +2062,9 @@ function ModelTestModal({
       return;
     }
     if (!maxTokensValid) {
-      toast.error("最大输出 token 必须是 1 到 16384 之间的整数");
+      toast.error(
+        `最大输出 token 必须是 1 到 ${MODEL_TEST_MAX_OUTPUT_TOKENS} 之间的整数`,
+      );
       return;
     }
     if (!draftTrimmed) {
@@ -2305,7 +2311,7 @@ function ModelTestModal({
                   className="input w-32 font-mono"
                   type="number"
                   min={1}
-                  max={16384}
+                  max={MODEL_TEST_MAX_OUTPUT_TOKENS}
                   step={1}
                   value={maxOutputTokensText}
                   onChange={(event) =>
@@ -2348,7 +2354,7 @@ function ModelTestModal({
               </div>
               {!maxTokensValid && maxOutputTokensText !== "" && (
                 <span className="text-[11px] text-destructive">
-                  范围 1–16384
+                  范围 1–{MODEL_TEST_MAX_OUTPUT_TOKENS}
                 </span>
               )}
               <button
