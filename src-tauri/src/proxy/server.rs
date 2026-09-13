@@ -14,6 +14,7 @@ use super::{
     log_codes::srv as log_srv,
     provider_router::ProviderRouter,
     providers::{codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore},
+    session_affinity::SessionAffinityStore,
     types::*,
     ProxyError,
 };
@@ -47,6 +48,11 @@ pub struct ProxyState {
     pub gemini_shadow: Arc<GeminiShadowStore>,
     /// Codex Chat bridge history，用于恢复 previous_response_id 指向的 tool call
     pub codex_chat_history: Arc<CodexChatHistoryStore>,
+    /// 会话 → provider 绑定表（会话亲和，跨请求保持）
+    ///
+    /// 见 `proxy::session_affinity`。只对**稳定**会话键建立绑定：
+    /// 客户端显式提供的会话 ID，或由内容哈希派生的稳定键。
+    pub session_affinity: Arc<RwLock<SessionAffinityStore>>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
@@ -83,6 +89,7 @@ impl ProxyServer {
             provider_router,
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            session_affinity: Arc::new(RwLock::new(SessionAffinityStore::default())),
             app_handle,
             failover_manager,
         };

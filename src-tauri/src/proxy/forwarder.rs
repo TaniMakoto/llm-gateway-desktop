@@ -15,6 +15,7 @@ use super::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
         AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
     },
+    session_affinity::SessionAffinityStore,
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
         normalize_thinking_type, rectify_anthropic_request, should_rectify_thinking_signature,
@@ -195,6 +196,12 @@ pub struct RequestForwarder {
     session_id: String,
     /// Session ID 是否由客户端提供；生成值不能作为上游缓存身份。
     session_client_provided: bool,
+    /// 会话亲和的键；`None` 表示这个会话没有稳定标识，不做任何绑定
+    ///
+    /// 见 [`RequestForwarder::order_by_session_affinity`]。
+    session_affinity_key: Option<String>,
+    /// 共享的会话 → provider 绑定表
+    session_affinity: Arc<RwLock<SessionAffinityStore>>,
     /// 整流器配置
     rectifier_config: RectifierConfig,
     /// 优化器配置
@@ -219,11 +226,113 @@ impl RequestForwarder {
     /// 统计必须以当前请求收到的有序 provider 链为准，不能与遗留设置中的
     /// `current_provider_id` 比较：统一网关的内部 provider ID 带协议后缀，遗留
     /// 当前 ID 往往为空或属于另一套配置，会导致首选供应商的每次成功都被误计为故障转移。
-    fn route_used_fallback(providers: &[Provider], successful_provider_id: &str) -> bool {
+    ///
+    /// `affinity_provider_id` 是本次会话亲和命中的 provider：它排在配置顺序的第一位之外
+    /// 却并非「首选失败」，所以不算故障转移。[`Self::order_providers`] 把它提到最前，
+    /// 这一步必须同步排除，否则亲和每次命中都会在 UI 上记一次故障转移。
+    fn route_used_fallback(
+        providers: &[Provider],
+        successful_provider_id: &str,
+        affinity_provider_id: Option<&str>,
+    ) -> bool {
+        if affinity_provider_id == Some(successful_provider_id) {
+            return false;
+        }
+
         providers
             .first()
             .map(|primary| primary.id.as_str() != successful_provider_id)
             .unwrap_or(false)
+    }
+
+    /// 查询本次请求的会话亲和偏好：命中绑定则返回被绑定的 provider id
+    ///
+    /// 两种情况下返回 `None`（等价于「没有偏好，走配置顺序」）：
+    /// 这个会话没有稳定标识，或绑定指向的 provider 已不在本次路由链里
+    /// （配置改动 / 被禁用）——后者会顺手解绑，免得绑定一直挂着。
+    async fn session_affinity_preference(&self, providers: &[Provider]) -> Option<String> {
+        let key = self.session_affinity_key.clone()?;
+
+        // 用 `get` 而非 `get_and_refresh`：查询本身不续期。
+        // 绑定寿命只由真正成功的请求（`bind`）延长，
+        // 否则一个陈旧客户端反复发起失败请求也能让绑定一直活着。
+        let preferred = {
+            let mut store = self.session_affinity.write().await;
+            store.get(&key)
+        };
+
+        let preferred = preferred?;
+
+        if !providers.iter().any(|p| p.id == preferred) {
+            let mut store = self.session_affinity.write().await;
+            store.compare_and_delete(&key, &preferred);
+            return None;
+        }
+
+        Some(preferred)
+    }
+
+    /// 把命中亲和的 provider 提到最前；只改**尝试顺序**，不改配置顺序
+    ///
+    /// `providers` 本身仍是「首选 + 故障转移链」的权威定义，亲和只是叠在上面的偏好层。
+    /// 未命中或偏好不在链上时原样返回。
+    fn order_providers<'a>(
+        providers: &'a [Provider],
+        preferred: Option<&str>,
+    ) -> Vec<&'a Provider> {
+        let preferred = match preferred {
+            Some(preferred) => preferred,
+            None => return providers.iter().collect(),
+        };
+
+        let mut promoted = None;
+        let mut rest = Vec::with_capacity(providers.len());
+        for provider in providers {
+            if promoted.is_none() && provider.id == preferred {
+                promoted = Some(provider);
+            } else {
+                rest.push(provider);
+            }
+        }
+
+        match promoted {
+            Some(provider) => {
+                let mut result = Vec::with_capacity(rest.len() + 1);
+                result.push(provider);
+                result.extend(rest);
+                result
+            }
+            None => rest,
+        }
+    }
+
+    /// 成功转发后：把这个会话绑定到实际服务它的 provider
+    ///
+    /// `bind` 同时承担「首次建立」和「续期」两种职责——只续期的话，
+    /// 一个从未绑定过的会话永远无法开始亲和。并发请求下后者覆盖前者是可接受的：
+    /// 它们都成功了，指向哪一家都能提升缓存命中。
+    async fn bind_session_affinity(&self, provider_id: &str) {
+        let key = match self.session_affinity_key.clone() {
+            Some(key) => key,
+            None => return,
+        };
+
+        let mut store = self.session_affinity.write().await;
+        store.bind(&key, provider_id);
+    }
+
+    /// provider 真的故障时：解除它与本会话的绑定
+    ///
+    /// 只在「provider 自身故障」的路径上调用。请求级错误（客户端输入导致的 400 等）
+    /// 换 provider 也一样被拒，走到那里不会解绑——与熔断器的中性处理保持一致。
+    async fn release_session_affinity(&self, provider_id: &str) {
+        let key = match self.session_affinity_key.clone() {
+            Some(key) => key,
+            None => return,
+        };
+
+        let mut store = self.session_affinity.write().await;
+        store.compare_and_delete(&key, provider_id);
     }
 
     /// 预防式 media 降级：发送前对 text-only 模型把图片块替换为标记。
@@ -287,6 +396,8 @@ impl RequestForwarder {
         current_provider_id_at_start: String,
         session_id: String,
         session_client_provided: bool,
+        session_affinity_key: Option<String>,
+        session_affinity: Arc<RwLock<SessionAffinityStore>>,
         streaming_first_byte_timeout: u64,
         _streaming_idle_timeout: u64,
         rectifier_config: RectifierConfig,
@@ -309,6 +420,8 @@ impl RequestForwarder {
             current_provider_id_at_start,
             session_id,
             session_client_provided,
+            session_affinity_key,
+            session_affinity,
             rectifier_config,
             optimizer_config,
             copilot_optimizer_config,
@@ -358,11 +471,15 @@ impl RequestForwarder {
     ///
     /// `failover_count` 只在成功目标不是本次有序路由链的首选项时增加；
     /// 遗留当前供应商 ID 仅用于决定是否同步 UI/托盘。
+    ///
+    /// `affinity_provider_id` 是本次会话亲和命中的 provider（没有则为 `None`）：
+    /// 它会排在链首之外，但那不是「首选失败」，所以不计入 `failover_count`。
     async fn update_success_state(
         &self,
         provider: &Provider,
         providers: &[Provider],
         app_type: &str,
+        affinity_provider_id: Option<&str>,
     ) {
         {
             let mut current_providers = self.current_providers.write().await;
@@ -372,9 +489,16 @@ impl RequestForwarder {
             );
         }
 
-        let route_used_fallback = Self::route_used_fallback(providers, &provider.id);
+        let route_used_fallback =
+            Self::route_used_fallback(providers, &provider.id, affinity_provider_id);
         let should_sync_current =
             self.current_provider_id_at_start.as_str() != provider.id.as_str();
+
+        // 会话亲和：把这个会话绑定到实际服务它的 provider，并顺带续期。
+        // 失败路径（Retryable 分支）已经解除了坏上游的绑定，所以这里绑定的一定是
+        // 「这次成功的那一家」；并发场景下后者覆盖前者，两家都健康时指向谁都提升缓存命中。
+        self.bind_session_affinity(&provider.id).await;
+
         {
             let mut status = self.status.write().await;
             status.success_requests += 1;
@@ -558,11 +682,17 @@ impl RequestForwarder {
         let mut last_provider = None;
         let mut attempted_providers = 0usize;
 
+        // 会话亲和：命中绑定的 provider 提到最前。只重排尝试顺序，
+        // `providers` 本身（配置顺序）仍是首选与故障转移链的权威定义；
+        // affinity_preferred 同时传给成功路径，避免把亲和命中记成一次故障转移。
+        let affinity_preferred = self.session_affinity_preference(&providers).await;
+        let ordered_providers = Self::order_providers(&providers, affinity_preferred.as_deref());
+
         // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
         let bypass_circuit_breaker = providers.len() == 1;
 
         // 依次尝试每个供应商
-        for provider in providers.iter() {
+        for provider in ordered_providers {
             // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
             // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
             let mut rectifier_retried = false;
@@ -640,8 +770,13 @@ impl RequestForwarder {
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
                         .await;
 
-                    self.update_success_state(provider, &providers, app_type_str)
-                        .await;
+                    self.update_success_state(
+                        provider,
+                        &providers,
+                        app_type_str,
+                        affinity_preferred.as_deref(),
+                    )
+                    .await;
 
                     return Ok(ForwardResult {
                         response,
@@ -713,6 +848,7 @@ impl RequestForwarder {
                                         provider,
                                         &providers,
                                         app_type_str,
+                                        affinity_preferred.as_deref(),
                                     )
                                     .await;
 
@@ -827,6 +963,7 @@ impl RequestForwarder {
                                             provider,
                                             &providers,
                                             app_type_str,
+                                            affinity_preferred.as_deref(),
                                         )
                                         .await;
 
@@ -958,6 +1095,7 @@ impl RequestForwarder {
                                         provider,
                                         &providers,
                                         app_type_str,
+                                        affinity_preferred.as_deref(),
                                     )
                                     .await;
 
@@ -1047,6 +1185,12 @@ impl RequestForwarder {
                                 &e,
                             );
                             log::warn!("[{app_type_str}] [{log_code}] {log_message}");
+
+                            // 会话亲和：这一家是真的故障了，解除它与本会话的绑定，
+                            // 免得后续请求继续被粘到坏上游上。
+                            // 上面的 NonRetryable 分支是客户端层错误，不走到这里，
+                            // 所以「请求级错误不打断亲和」是自然成立的。
+                            self.release_session_affinity(&provider.id).await;
 
                             last_error = Some(e);
                             last_provider = Some(provider.clone());
@@ -3724,6 +3868,8 @@ mod tests {
             current_provider_id_at_start: String::new(),
             session_id: String::new(),
             session_client_provided: false,
+            session_affinity_key: None,
+            session_affinity: Arc::new(RwLock::new(SessionAffinityStore::default())),
             rectifier_config: RectifierConfig::default(),
             optimizer_config: OptimizerConfig::default(),
             copilot_optimizer_config: CopilotOptimizerConfig::default(),
@@ -3736,25 +3882,168 @@ mod tests {
     #[test]
     fn single_provider_success_is_not_failover() {
         let providers = vec![test_provider_with_id("only", None)];
-        assert!(!RequestForwarder::route_used_fallback(&providers, "only"));
+        assert!(!RequestForwarder::route_used_fallback(
+            &providers, "only", None
+        ));
     }
 
     #[test]
     fn primary_success_is_not_failover() {
-        let providers = vec![test_provider_with_id("primary", None), test_provider_with_id("backup", None)];
+        let providers = vec![
+            test_provider_with_id("primary", None),
+            test_provider_with_id("backup", None),
+        ];
         assert!(!RequestForwarder::route_used_fallback(
             &providers,
-            "primary"
+            "primary",
+            None
         ));
     }
 
     #[test]
     fn backup_success_is_failover() {
-        let providers = vec![test_provider_with_id("primary", None), test_provider_with_id("backup", None)];
+        let providers = vec![
+            test_provider_with_id("primary", None),
+            test_provider_with_id("backup", None),
+        ];
         assert!(RequestForwarder::route_used_fallback(
             &providers,
-            "backup"
+            "backup",
+            None
         ));
+    }
+
+    #[test]
+    fn affinity_promoted_success_is_not_failover() {
+        let providers = vec![
+            test_provider_with_id("primary", None),
+            test_provider_with_id("bound", None),
+        ];
+
+        // 亲和把 bound 提到最前并成功 —— 首选并没有失败，不该记一次故障转移
+        assert!(!RequestForwarder::route_used_fallback(
+            &providers,
+            "bound",
+            Some("bound")
+        ));
+        // 同一家不是靠亲和上去的，就仍然是故障转移
+        assert!(RequestForwarder::route_used_fallback(
+            &providers,
+            "bound",
+            None
+        ));
+    }
+
+    #[test]
+    fn order_providers_promotes_preferred_to_front() {
+        let providers = vec![
+            test_provider_with_id("a", None),
+            test_provider_with_id("b", None),
+            test_provider_with_id("c", None),
+        ];
+
+        let ids = |ordered: Vec<&Provider>| -> Vec<String> {
+            ordered
+                .iter()
+                .map(|provider| provider.id.clone())
+                .collect()
+        };
+
+        assert_eq!(
+            ids(RequestForwarder::order_providers(&providers, Some("c"))),
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
+        // 偏好不在链上：保持原顺序
+        assert_eq!(
+            ids(RequestForwarder::order_providers(&providers, Some("missing"))),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // 没有偏好：保持原顺序
+        assert_eq!(
+            ids(RequestForwarder::order_providers(&providers, None)),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    fn affinity_forwarder(key: Option<&str>) -> RequestForwarder {
+        let mut forwarder =
+            test_forwarder(Duration::from_secs(30), Duration::from_secs(30));
+        forwarder.session_affinity_key = key.map(|key| key.to_string());
+        forwarder
+    }
+
+    #[tokio::test]
+    async fn session_affinity_binds_and_releases() {
+        let forwarder = affinity_forwarder(Some("session-1"));
+        let providers = vec![
+            test_provider_with_id("a", None),
+            test_provider_with_id("b", None),
+        ];
+
+        // 还没绑定：没有偏好，走配置顺序
+        assert!(forwarder
+            .session_affinity_preference(&providers)
+            .await
+            .is_none());
+
+        forwarder.bind_session_affinity("b").await;
+        assert_eq!(
+            forwarder
+                .session_affinity_preference(&providers)
+                .await
+                .as_deref(),
+            Some("b")
+        );
+
+        // provider 自身故障 → 解绑 → 偏好消失
+        forwarder.release_session_affinity("b").await;
+        assert!(forwarder
+            .session_affinity_preference(&providers)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn session_affinity_release_is_compare_and_delete() {
+        let forwarder = affinity_forwarder(Some("session-1"));
+
+        forwarder.bind_session_affinity("b").await;
+        // 解绑一个不是当前绑定的 provider：不能误删
+        forwarder.release_session_affinity("a").await;
+
+        let mut store = forwarder.session_affinity.write().await;
+        assert_eq!(store.get("session-1").as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn session_affinity_drops_binding_outside_route_chain() {
+        let forwarder = affinity_forwarder(Some("session-1"));
+
+        forwarder.bind_session_affinity("gone").await;
+
+        // 绑定的 provider 已不在本次路由链里 → 无偏好，且绑定被解除
+        let providers = vec![test_provider_with_id("a", None)];
+        assert!(forwarder
+            .session_affinity_preference(&providers)
+            .await
+            .is_none());
+
+        let mut store = forwarder.session_affinity.write().await;
+        assert!(store.get("session-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_affinity_is_skipped_without_stable_key() {
+        let forwarder = affinity_forwarder(None);
+        let providers = vec![test_provider_with_id("a", None)];
+
+        forwarder.bind_session_affinity("a").await;
+
+        assert!(forwarder
+            .session_affinity_preference(&providers)
+            .await
+            .is_none());
+        assert!(forwarder.session_affinity.write().await.is_empty());
     }
 
     #[tokio::test]

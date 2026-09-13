@@ -64,6 +64,11 @@ pub struct RequestContext {
     pub session_id: String,
     /// Session ID 是否由客户端提供。生成的 UUID 不能作为上游缓存 key，否则每个请求都会换 key。
     pub session_client_provided: bool,
+    /// 会话亲和的键（仅当 Session ID 是**稳定**键时存在）
+    ///
+    /// `None` = 这个会话没有可复用的身份（客户端没提供标识、内容也推不出锚点），
+    /// 不参与粘性路由——绑一个一次性随机 UUID 只会污染绑定表。
+    pub session_affinity_key: Option<String>,
     /// 整流器配置
     pub rectifier_config: RectifierConfig,
     /// 优化器配置
@@ -182,6 +187,7 @@ impl RequestContext {
             tag,
             app_type_str,
             app_type,
+            session_affinity_key: session_result.is_stable().then(|| session_id.clone()),
             session_id,
             session_client_provided: session_result.client_provided,
             rectifier_config,
@@ -250,6 +256,8 @@ impl RequestContext {
             self.current_provider_id.clone(),
             self.session_id.clone(),
             self.session_client_provided,
+            self.session_affinity_key.clone(),
+            state.session_affinity.clone(),
             first_byte_timeout,
             idle_timeout,
             self.rectifier_config.clone(),

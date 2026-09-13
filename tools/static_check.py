@@ -35,6 +35,8 @@ RUST_FILES = [
     "src-tauri/src/proxy/handlers.rs",
     "src-tauri/src/proxy/handler_context.rs",
     "src-tauri/src/proxy/model_mapper.rs",
+    "src-tauri/src/proxy/session.rs",
+    "src-tauri/src/proxy/session_affinity.rs",
     "src-tauri/src/proxy/response_processor.rs",
     "src-tauri/src/proxy/providers/codex.rs",
     "src-tauri/src/provider.rs",
