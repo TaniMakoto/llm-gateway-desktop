@@ -1,4 +1,5 @@
 name: Package Windows
+# Rebuild marker: canonical capability registry
 
 on:
   workflow_dispatch:
