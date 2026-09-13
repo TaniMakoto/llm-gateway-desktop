@@ -394,7 +394,7 @@ mod tests {
             vec!["text"]
         );
         assert_eq!(deepseek.reasoning_levels, vec!["low", "high", "max"]);
-        assert_eq!(deepseek.context_length, Some(1_000_000));
+        assert_eq!(deepseek.context_length, Some(1_048_576));
         assert_eq!(deepseek.max_output_tokens, Some(384_000));
 
         let deepseek_responses =
