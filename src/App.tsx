@@ -2009,6 +2009,10 @@ function ModelTestModal({
   // 必须受控：`<details open>` 写死为 true 时，每次增量重渲染都会把用户
   // 手动折叠的状态顶回去。
   const [showStreamedReasoning, setShowStreamedReasoning] = useState(true);
+  // 上游每秒能推几百个 chunk，逐个 setState 会让 Markdown 每帧重解析几百遍。
+  // 增量先落进这个缓冲区，用一帧一次的方式合并上屏。
+  const streamBufferRef = useRef({ text: "", reasoning: "" });
+  const streamFrameRef = useRef<number | null>(null);
   const [showConfig, setShowConfig] = useState(false);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -2055,7 +2059,28 @@ function ModelTestModal({
   );
   const gatewayAllowed = gatewayRunning && aliasIsSaved && !!savedAlias;
 
+  /** 把本帧累积的增量一次性写入 state。 */
+  const flushStreamedText = () => {
+    streamFrameRef.current = null;
+    const pending = streamBufferRef.current;
+    if (pending.text) {
+      const chunk = pending.text;
+      pending.text = "";
+      setStreamedText((current) => current + chunk);
+    }
+    if (pending.reasoning) {
+      const chunk = pending.reasoning;
+      pending.reasoning = "";
+      setStreamedReasoning((current) => current + chunk);
+    }
+  };
+
   const resetStreamedText = () => {
+    if (streamFrameRef.current !== null) {
+      cancelAnimationFrame(streamFrameRef.current);
+      streamFrameRef.current = null;
+    }
+    streamBufferRef.current = { text: "", reasoning: "" };
     setStreamedText("");
     setStreamedReasoning("");
     setStreamStatus(null);
@@ -2119,9 +2144,14 @@ function ModelTestModal({
         return;
       }
       if (event.kind === "delta") {
-        if (event.text) setStreamedText((current) => current + event.text);
-        if (event.reasoning) {
-          setStreamedReasoning((current) => current + event.reasoning);
+        const pending = streamBufferRef.current;
+        pending.text += event.text;
+        pending.reasoning += event.reasoning;
+        if (
+          streamFrameRef.current === null &&
+          (pending.text || pending.reasoning)
+        ) {
+          streamFrameRef.current = requestAnimationFrame(flushStreamedText);
         }
       }
     };

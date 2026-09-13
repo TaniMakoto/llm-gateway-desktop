@@ -1531,8 +1531,13 @@ fn merge_test_usage(slot: &mut Option<GatewayModelTestUsage>, next: GatewayModel
     if next.is_empty() {
         return;
     }
-    let Some(current) = slot else {
+    if slot.is_none() {
         *slot = Some(next);
+        return;
+    }
+    // 用 `as_mut()` 拿到独立借用：`let Some(x) = slot else { .. }` 会在
+    // else 分支里和 `*slot` 的赋值打架。
+    let Some(current) = slot.as_mut() else {
         return;
     };
     fn fill(target: &mut Option<u64>, value: Option<u64>) {
