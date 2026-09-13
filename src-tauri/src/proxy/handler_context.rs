@@ -126,6 +126,12 @@ impl RequestContext {
         // 提取 Session ID
         let session_result = extract_session_id(headers, body, app_type_str);
         let session_id = session_result.session_id.clone();
+        let existing_affinity_provider = if session_result.is_stable() {
+            let mut store = state.session_affinity.write().await;
+            store.get(&session_id)
+        } else {
+            None
+        };
 
         log::debug!(
             "[{}] Session ID: {} (from {:?}, client_provided: {})",
@@ -145,7 +151,24 @@ impl RequestContext {
         )
         .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
         {
-            Some(providers) if !providers.is_empty() => providers,
+            Some((providers, routing_policy)) if !providers.is_empty() => {
+                let affinity_is_valid = existing_affinity_provider
+                    .as_deref()
+                    .is_some_and(|bound| providers.iter().any(|provider| provider.id == bound));
+                if affinity_is_valid {
+                    providers
+                } else {
+                    state
+                        .provider_router
+                        .apply_gateway_routing_policy(
+                            app_type_str,
+                            &request_model,
+                            routing_policy,
+                            providers,
+                        )
+                        .await
+                }
+            }
             Some(_) => return Err(ProxyError::NoAvailableProvider),
             None => state
                 .provider_router

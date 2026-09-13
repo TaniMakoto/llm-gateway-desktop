@@ -1,5 +1,58 @@
 use serde_json::Value;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RegistryModelCapabilities {
+    pub context_length: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub input_modalities: Vec<String>,
+    pub reasoning_levels: Vec<String>,
+}
+
+/// Conservative built-in capability fallback used only when upstream/user
+/// metadata leaves a field unknown. Keep this registry evidence-backed and
+/// exact: unknown models must stay unknown rather than inheriting family guesses.
+pub(crate) fn registry_model_capabilities(
+    model: &str,
+) -> Option<RegistryModelCapabilities> {
+    let normalized = normalize_model_id(model);
+    let tail = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    let base_tail = strip_known_reasoning_suffix(tail);
+
+    // Mirrors src/resources/gpt5_5_template.json, the project's bundled Codex
+    // catalog source for GPT-5.5.
+    if base_tail == "gpt-5.5" {
+        return Some(RegistryModelCapabilities {
+            context_length: Some(272_000),
+            max_output_tokens: None,
+            input_modalities: vec!["text".to_string(), "image".to_string()],
+            reasoning_levels: vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ],
+        });
+    }
+
+    if is_confirmed_text_only_model(base_tail) {
+        return Some(RegistryModelCapabilities {
+            input_modalities: vec!["text".to_string()],
+            ..Default::default()
+        });
+    }
+
+    None
+}
+
+fn strip_known_reasoning_suffix(model: &str) -> &str {
+    for suffix in ["-minimal", "-low", "-medium", "-high", "-xhigh"] {
+        if let Some(stripped) = model.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    model
+}
+
 /// Image-input capability shared by Codex catalog generation and proxy request
 /// rectification.
 ///
@@ -201,6 +254,28 @@ fn normalize_model_id(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn gateway_registry_uses_bundled_gpt55_catalog_and_text_only_registry() {
+        let gpt = registry_model_capabilities("openai/gpt-5.5-high").unwrap();
+        assert_eq!(gpt.context_length, Some(272_000));
+        assert_eq!(gpt.input_modalities, vec!["text", "image"]);
+        assert_eq!(
+            gpt.reasoning_levels,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+
+        let deepseek = registry_model_capabilities("deepseek-v4-pro").unwrap();
+        assert_eq!(deepseek.input_modalities, vec!["text"]);
+        assert!(deepseek.context_length.is_none());
+        assert_eq!(
+            registry_model_capabilities("deepseek-v4-pro-high")
+                .unwrap()
+                .input_modalities,
+            vec!["text"]
+        );
+        assert!(registry_model_capabilities("future-model-vision").is_none());
+    }
 
     #[test]
     fn gpt_and_unknown_models_remain_unknown_without_declarations() {

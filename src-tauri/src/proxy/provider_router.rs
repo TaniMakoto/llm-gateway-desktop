@@ -5,6 +5,7 @@
 use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
+use crate::gateway::GatewayRoutingPolicy;
 use crate::provider::Provider;
 use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
 use std::collections::HashMap;
@@ -22,6 +23,8 @@ pub struct ProviderRouter {
     /// Provider 临时冷却表（典型来源：HTTP 429 / Retry-After）。
     /// 与熔断器分离：限流/配额耗尽不等价于服务故障。
     cooldowns: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Round-robin cursor keyed by app_type + public model alias.
+    route_cursors: Arc<RwLock<HashMap<String, usize>>>,
 }
 
 impl ProviderRouter {
@@ -31,6 +34,25 @@ impl ProviderRouter {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
             cooldowns: Arc::new(RwLock::new(HashMap::new())),
+            route_cursors: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn provider_cooldown_remaining_seconds(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Option<u64> {
+        let key = Self::provider_key(app_type, provider_id);
+        let now = Instant::now();
+        let mut cooldowns = self.cooldowns.write().await;
+        match cooldowns.get(&key).copied() {
+            Some(until) if until > now => Some(until.duration_since(now).as_secs().max(1)),
+            Some(_) => {
+                cooldowns.remove(&key);
+                None
+            }
+            None => None,
         }
     }
 
@@ -76,6 +98,32 @@ impl ProviderRouter {
     pub async fn clear_provider_cooldown(&self, provider_id: &str, app_type: &str) {
         let key = Self::provider_key(app_type, provider_id);
         self.cooldowns.write().await.remove(&key);
+    }
+
+    /// Apply the configured scheduling policy to one gateway alias.
+    /// Session affinity is layered later by RequestForwarder and can still
+    /// promote an already-bound provider ahead of this order.
+    pub async fn apply_gateway_routing_policy(
+        &self,
+        app_type: &str,
+        alias: &str,
+        policy: GatewayRoutingPolicy,
+        mut providers: Vec<Provider>,
+    ) -> Vec<Provider> {
+        if policy == GatewayRoutingPolicy::Priority || providers.len() <= 1 {
+            return providers;
+        }
+
+        let key = format!("{app_type}:{}", alias.trim());
+        let start = {
+            let mut cursors = self.route_cursors.write().await;
+            let cursor = cursors.entry(key).or_insert(0);
+            let start = *cursor % providers.len();
+            *cursor = (*cursor + 1) % providers.len();
+            start
+        };
+        providers.rotate_left(start);
+        providers
     }
 
     /// 选择可用的供应商（支持故障转移）
@@ -409,6 +457,58 @@ mod tests {
         router.clear_provider_cooldown("p1", "claude").await;
         assert!(!router.is_provider_cooled_down("p1", "claude").await);
         assert!(router.allow_provider_request("p1", "claude").await.allowed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_round_robin_rotates_alias_chain_and_priority_stays_stable() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let router = ProviderRouter::new(db);
+        let providers = vec![
+            Provider::with_id("a".to_string(), "A".to_string(), json!({}), None),
+            Provider::with_id("b".to_string(), "B".to_string(), json!({}), None),
+            Provider::with_id("c".to_string(), "C".to_string(), json!({}), None),
+        ];
+
+        let priority = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "best-code",
+                GatewayRoutingPolicy::Priority,
+                providers.clone(),
+            )
+            .await;
+        assert_eq!(priority.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+
+        let first = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "best-code",
+                GatewayRoutingPolicy::RoundRobin,
+                providers.clone(),
+            )
+            .await;
+        let second = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "best-code",
+                GatewayRoutingPolicy::RoundRobin,
+                providers.clone(),
+            )
+            .await;
+        let third = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "best-code",
+                GatewayRoutingPolicy::RoundRobin,
+                providers,
+            )
+            .await;
+
+        assert_eq!(first[0].id, "a");
+        assert_eq!(second[0].id, "b");
+        assert_eq!(third[0].id, "c");
     }
 
     #[tokio::test]

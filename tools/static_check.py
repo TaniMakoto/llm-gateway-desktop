@@ -235,6 +235,7 @@ def main() -> None:
     server = (ROOT / "src-tauri/src/proxy/server.rs").read_text(encoding="utf-8")
     for route in [
         '"/health"',
+        '"/v1/gateway/status"',
         '"/v1/models"',
         '"/v1/messages"',
         '"/v1/chat/completions"',

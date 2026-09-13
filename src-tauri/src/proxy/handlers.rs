@@ -70,6 +70,26 @@ pub async fn get_status(State(state): State<ProxyState>) -> Result<Json<ProxySta
     Ok(Json(status))
 }
 
+/// Authenticated gateway runtime status for local API clients and diagnostics.
+pub async fn handle_gateway_status(
+    State(state): State<ProxyState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, ProxyError> {
+    crate::gateway::validate_local_auth(state.db.as_ref(), &headers)?;
+    let runtime = crate::gateway::gateway_runtime_statuses_for_router(
+        state.db.as_ref(),
+        state.provider_router.as_ref(),
+    )
+    .await
+    .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
+    let status = state.status.read().await.clone();
+    Ok(Json(json!({
+        "status": status,
+        "provider_runtime": runtime,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    })))
+}
+
 /// GET /v1/models — Codex model list (reachability check)
 ///
 /// Codex CLI probes this endpoint at startup and deserializes the response as a

@@ -2329,6 +2329,22 @@ impl ProxyService {
         }
     }
 
+    pub async fn get_provider_cooldown_remaining_seconds(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Option<u64> {
+        let server = self.server.read().await;
+        match server.as_ref() {
+            Some(server) => {
+                server
+                    .get_provider_cooldown_remaining_seconds(provider_id, app_type)
+                    .await
+            }
+            None => None,
+        }
+    }
+
     // ==================== Live 配置读写辅助方法 ====================
 
     /// 接管 Codex 时，本地客户端必须继续以 Responses wire API 访问代理。

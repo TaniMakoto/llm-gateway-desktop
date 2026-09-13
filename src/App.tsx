@@ -40,6 +40,7 @@ import { cn } from "@/lib/utils";
 import { Markdown } from "@/components/markdown";
 
 type ApiFormat = "openai_chat" | "openai_responses" | "anthropic";
+type RoutingPolicy = "priority" | "round_robin";
 type Tab = "dashboard" | "providers" | "routes" | "settings";
 type ProxyMode = "follow_global" | "bypass" | "custom";
 
@@ -100,6 +101,7 @@ interface GatewayConfig {
   localApiKey: string;
   autoStart: boolean;
   enableLogging: boolean;
+  routingPolicies: Record<string, RoutingPolicy>;
   providers: GatewayProvider[];
 }
 
@@ -119,6 +121,18 @@ interface ProxyStatus {
   active_providers?: ActiveProvider[];
 }
 
+interface ProviderRuntimeStatus {
+  sourceProviderId: string;
+  materializedProviderId: string;
+  providerName: string;
+  apiFormat: ApiFormat;
+  appType: string;
+  circuitState: "closed" | "open" | "half_open" | string;
+  cooldownSeconds?: number | null;
+  consecutiveFailures: number;
+  totalRequests: number;
+}
+
 interface ActiveProvider {
   app_type: string;
   provider_name: string;
@@ -129,6 +143,7 @@ interface ActiveProvider {
 interface GatewaySnapshot {
   config: GatewayConfig;
   status: ProxyStatus;
+  providerRuntime: ProviderRuntimeStatus[];
 }
 
 interface StartupPreferences {
@@ -208,6 +223,7 @@ const DEFAULT_CONFIG: GatewayConfig = {
   localApiKey: "",
   autoStart: false,
   enableLogging: true,
+  routingPolicies: {},
   providers: [],
 };
 
@@ -271,6 +287,7 @@ function App() {
   const [config, setConfig] = useState<GatewayConfig>(DEFAULT_CONFIG);
   const [savedConfig, setSavedConfig] = useState<GatewayConfig>(DEFAULT_CONFIG);
   const [status, setStatus] = useState<ProxyStatus | null>(null);
+  const [providerRuntime, setProviderRuntime] = useState<ProviderRuntimeStatus[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [startupPreferences, setStartupPreferences] =
@@ -315,6 +332,7 @@ function App() {
       setConfig(snapshot.config);
       setSavedConfig(snapshot.config);
       setStatus(snapshot.status);
+      setProviderRuntime(snapshot.providerRuntime ?? []);
     } catch (error) {
       toast.error(`读取网关配置失败：${String(error)}`);
     } finally {
@@ -378,6 +396,7 @@ function App() {
     try {
       const snapshot = await invoke<GatewaySnapshot>("get_gateway_snapshot");
       setStatus(snapshot.status);
+      setProviderRuntime(snapshot.providerRuntime ?? []);
     } catch {
       // 静默
     }
@@ -955,10 +974,53 @@ function App() {
                 />
               ) : (
                 <div className="space-y-4">
+                  {enabledAliases.length > 0 && (
+                    <div className="panel p-4">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold">路由策略</div>
+                          <div className="mt-0.5 text-xs text-muted-foreground">
+                            Priority 保持供应商顺序；Round Robin 为新会话轮换首选，已有会话仍保持亲和。
+                          </div>
+                        </div>
+                      </div>
+                      <div className="grid gap-2 md:grid-cols-2">
+                        {enabledAliases.map((alias) => (
+                          <div
+                            key={alias}
+                            className="flex items-center gap-3 rounded-md border px-3 py-2"
+                          >
+                            <span className="min-w-0 flex-1 truncate font-mono text-xs">
+                              {alias}
+                            </span>
+                            <select
+                              className="input w-40"
+                              value={config.routingPolicies?.[alias] ?? "priority"}
+                              onChange={(event) =>
+                                setConfig({
+                                  ...config,
+                                  routingPolicies: {
+                                    ...(config.routingPolicies ?? {}),
+                                    [alias]: event.target.value as RoutingPolicy,
+                                  },
+                                })
+                              }
+                            >
+                              <option value="priority">Priority</option>
+                              <option value="round_robin">Round Robin</option>
+                            </select>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   {config.providers.map((provider, providerIndex) => (
                     <ProviderRoutesCard
                       key={provider.id}
                       provider={provider}
+                      runtime={providerRuntime.filter(
+                        (entry) => entry.sourceProviderId === provider.id,
+                      )}
                       providerIndex={providerIndex}
                       canMoveUp={providerIndex > 0}
                       canMoveDown={providerIndex < config.providers.length - 1}
@@ -1346,6 +1408,7 @@ function App() {
 
 function ProviderRoutesCard({
   provider,
+  runtime,
   providerIndex,
   canMoveUp,
   canMoveDown,
@@ -1360,6 +1423,7 @@ function ProviderRoutesCard({
   onTestModel,
 }: {
   provider: GatewayProvider;
+  runtime: ProviderRuntimeStatus[];
   providerIndex: number;
   canMoveUp: boolean;
   canMoveDown: boolean;
@@ -1373,6 +1437,9 @@ function ProviderRoutesCard({
   onRemoveModel: (modelIndex: number) => void;
   onTestModel: (modelIndex: number) => void;
 }) {
+  const abnormalRuntime = runtime.filter(
+    (entry) => entry.cooldownSeconds || entry.circuitState !== "closed",
+  );
   return (
     <div className="panel overflow-hidden">
       <div className="flex items-center gap-3 border-b p-4">
@@ -1401,6 +1468,22 @@ function ProviderRoutesCard({
             <span className="text-[11px] text-muted-foreground">
               #{providerIndex + 1}
             </span>
+            {abnormalRuntime.length === 0 && runtime.length > 0 ? (
+              <span className="tag text-[10px] text-emerald-600">健康</span>
+            ) : (
+              abnormalRuntime.slice(0, 4).map((entry) => (
+                <span
+                  key={`${entry.appType}:${entry.materializedProviderId}`}
+                  className="tag text-[10px] text-amber-600"
+                  title={`${entry.appType} · ${formatLabels[entry.apiFormat]} · failures ${entry.consecutiveFailures} · requests ${entry.totalRequests}`}
+                >
+                  {entry.appType} · {formatLabels[entry.apiFormat]} ·{" "}
+                  {entry.cooldownSeconds
+                    ? `冷却 ${entry.cooldownSeconds}s`
+                    : entry.circuitState}
+                </span>
+              ))
+            )}
           </div>
           <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
             {provider.baseUrl}

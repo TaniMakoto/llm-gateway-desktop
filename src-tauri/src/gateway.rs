@@ -36,6 +36,14 @@ pub enum GatewayApiFormat {
     Anthropic,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayRoutingPolicy {
+    #[default]
+    Priority,
+    RoundRobin,
+}
+
 impl GatewayApiFormat {
     pub fn as_wire_name(&self) -> &'static str {
         match self {
@@ -90,6 +98,24 @@ impl GatewayModelMetadata {
         self.max_output_tokens = min_known(self.max_output_tokens, other.max_output_tokens);
         merge_known_intersection(&mut self.input_modalities, &other.input_modalities);
         merge_known_intersection(&mut self.reasoning_levels, &other.reasoning_levels);
+    }
+
+    fn apply_registry_fallback(&mut self, model_id: &str) {
+        let Some(fallback) = crate::model_capabilities::registry_model_capabilities(model_id) else {
+            return;
+        };
+        if self.context_length.is_none() {
+            self.context_length = fallback.context_length;
+        }
+        if self.max_output_tokens.is_none() {
+            self.max_output_tokens = fallback.max_output_tokens;
+        }
+        if self.input_modalities.is_empty() {
+            self.input_modalities = fallback.input_modalities;
+        }
+        if self.reasoning_levels.is_empty() {
+            self.reasoning_levels = fallback.reasoning_levels;
+        }
     }
 }
 
@@ -184,6 +210,8 @@ pub struct GatewayConfig {
     #[serde(default = "default_true")]
     pub enable_logging: bool,
     #[serde(default)]
+    pub routing_policies: HashMap<String, GatewayRoutingPolicy>,
+    #[serde(default)]
     pub providers: Vec<GatewayProvider>,
 }
 
@@ -196,6 +224,7 @@ impl Default for GatewayConfig {
             local_api_key: generate_local_key(),
             auto_start: false,
             enable_logging: true,
+            routing_policies: HashMap::new(),
             providers: Vec::new(),
         }
     }
@@ -206,6 +235,21 @@ impl Default for GatewayConfig {
 pub struct GatewaySnapshot {
     pub config: GatewayConfig,
     pub status: ProxyStatus,
+    pub provider_runtime: Vec<GatewayProviderRuntimeStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayProviderRuntimeStatus {
+    pub source_provider_id: String,
+    pub materialized_provider_id: String,
+    pub provider_name: String,
+    pub api_format: GatewayApiFormat,
+    pub app_type: String,
+    pub circuit_state: String,
+    pub cooldown_seconds: Option<u64>,
+    pub consecutive_failures: u32,
+    pub total_requests: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -419,6 +463,7 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
         local_api_key: legacy.local_api_key,
         auto_start: legacy.auto_start,
         enable_logging: legacy.enable_logging,
+        routing_policies: HashMap::new(),
         providers,
     })
 }
@@ -426,6 +471,14 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
 fn normalize_config(mut config: GatewayConfig) -> GatewayConfig {
     config.listen_address = config.listen_address.trim().to_string();
     config.local_api_key = config.local_api_key.trim().to_string();
+    config.routing_policies = config
+        .routing_policies
+        .into_iter()
+        .filter_map(|(alias, policy)| {
+            let alias = alias.trim().to_string();
+            (!alias.is_empty()).then_some((alias, policy))
+        })
+        .collect();
     for provider in &mut config.providers {
         provider.id = provider.id.trim().to_string();
         provider.name = provider.name.trim().to_string();
@@ -476,6 +529,14 @@ fn normalize_config(mut config: GatewayConfig) -> GatewayConfig {
         }
     }
     config
+}
+
+pub fn routing_policy_for_alias(config: &GatewayConfig, alias: &str) -> GatewayRoutingPolicy {
+    config
+        .routing_policies
+        .get(alias.trim())
+        .copied()
+        .unwrap_or_default()
 }
 
 fn validate_config(config: &GatewayConfig) -> Result<(), String> {
@@ -791,6 +852,46 @@ fn iter_materialized_combos(
     result
 }
 
+pub(crate) async fn gateway_runtime_statuses_for_router(
+    db: &Database,
+    router: &crate::proxy::ProviderRouter,
+) -> Result<Vec<GatewayProviderRuntimeStatus>, AppError> {
+    let config = load_config(db)?;
+    let mut result = Vec::new();
+    for (_, provider, format) in iter_materialized_combos(&config) {
+        if !provider.enabled {
+            continue;
+        }
+        let materialized_provider_id = generated_provider_id(&provider.id, format);
+        for app_type in ["claude", "codex"] {
+            let stats = router
+                .get_circuit_breaker_stats(&materialized_provider_id, app_type)
+                .await;
+            let cooldown_seconds = router
+                .provider_cooldown_remaining_seconds(&materialized_provider_id, app_type)
+                .await;
+            result.push(GatewayProviderRuntimeStatus {
+                source_provider_id: provider.id.clone(),
+                materialized_provider_id: materialized_provider_id.clone(),
+                provider_name: provider.name.clone(),
+                api_format: format,
+                app_type: app_type.to_string(),
+                circuit_state: stats
+                    .as_ref()
+                    .map(|value| value.state.to_string())
+                    .unwrap_or_else(|| "closed".to_string()),
+                cooldown_seconds,
+                consecutive_failures: stats
+                    .as_ref()
+                    .map(|value| value.consecutive_failures)
+                    .unwrap_or(0),
+                total_requests: stats.as_ref().map(|value| value.total_requests).unwrap_or(0),
+            });
+        }
+    }
+    Ok(result)
+}
+
 fn sync_generated_providers(db: &Database, config: &GatewayConfig) -> Result<(), AppError> {
     let combos = iter_materialized_combos(config);
     let wanted: HashSet<String> = combos
@@ -823,12 +924,13 @@ pub fn resolve_route_providers(
     app_type: &str,
     _downstream_format: Option<&str>,
     alias: &str,
-) -> Result<Option<Vec<Provider>>, AppError> {
+) -> Result<Option<(Vec<Provider>, GatewayRoutingPolicy)>, AppError> {
     let config = load_config(db)?;
     let alias = alias.trim();
     if alias.is_empty() {
         return Ok(None);
     }
+    let routing_policy = routing_policy_for_alias(&config, alias);
 
     let mut matched_ids: Vec<String> = Vec::new();
     let mut any_alias_defined = false;
@@ -863,7 +965,7 @@ pub fn resolve_route_providers(
             result.push(provider);
         }
     }
-    Ok(Some(result))
+    Ok(Some((result, routing_policy)))
 }
 
 pub fn validate_local_auth(db: &Database, headers: &HeaderMap) -> Result<(), crate::proxy::ProxyError> {
@@ -911,10 +1013,12 @@ pub fn openai_models_response(db: &Database) -> Result<Value, AppError> {
             if !model.enabled {
                 continue;
             }
+            let mut effective_metadata = model.metadata.clone();
+            effective_metadata.apply_registry_fallback(&model.upstream_model);
             aliases
                 .entry(model.alias.clone())
-                .and_modify(|metadata| metadata.merge_failover_capabilities(&model.metadata))
-                .or_insert_with(|| model.metadata.clone());
+                .and_modify(|metadata| metadata.merge_failover_capabilities(&effective_metadata))
+                .or_insert(effective_metadata);
         }
     }
     let data: Vec<Value> = aliases
@@ -964,7 +1068,51 @@ pub async fn get_gateway_snapshot(
 ) -> Result<GatewaySnapshot, String> {
     let config = load_config(&state.db).map_err(|e| e.to_string())?;
     let status = state.proxy_service.get_status().await?;
-    Ok(GatewaySnapshot { config, status })
+    let provider_runtime = gateway_runtime_statuses_for_service(&state.proxy_service, &config).await;
+    Ok(GatewaySnapshot {
+        config,
+        status,
+        provider_runtime,
+    })
+}
+
+async fn gateway_runtime_statuses_for_service(
+    proxy_service: &crate::services::ProxyService,
+    config: &GatewayConfig,
+) -> Vec<GatewayProviderRuntimeStatus> {
+    let mut result = Vec::new();
+    for (_, provider, format) in iter_materialized_combos(config) {
+        if !provider.enabled {
+            continue;
+        }
+        let materialized_provider_id = generated_provider_id(&provider.id, format);
+        for app_type in ["claude", "codex"] {
+            let stats = proxy_service
+                .get_circuit_breaker_stats(&materialized_provider_id, app_type)
+                .await;
+            let cooldown_seconds = proxy_service
+                .get_provider_cooldown_remaining_seconds(&materialized_provider_id, app_type)
+                .await;
+            result.push(GatewayProviderRuntimeStatus {
+                source_provider_id: provider.id.clone(),
+                materialized_provider_id: materialized_provider_id.clone(),
+                provider_name: provider.name.clone(),
+                api_format: format,
+                app_type: app_type.to_string(),
+                circuit_state: stats
+                    .as_ref()
+                    .map(|value| value.state.to_string())
+                    .unwrap_or_else(|| "closed".to_string()),
+                cooldown_seconds,
+                consecutive_failures: stats
+                    .as_ref()
+                    .map(|value| value.consecutive_failures)
+                    .unwrap_or(0),
+                total_requests: stats.as_ref().map(|value| value.total_requests).unwrap_or(0),
+            });
+        }
+    }
+    result
 }
 
 pub(crate) async fn apply_runtime_config(state: &AppState, config: &GatewayConfig) -> Result<(), String> {
@@ -1054,16 +1202,21 @@ pub async fn fetch_gateway_provider_models(
     )
     .await?
     .into_iter()
-    .map(|model| GatewayCachedModel {
-        id: model.id,
-        owned_by: model.owned_by,
-        display_name: model.display_name,
-        metadata: GatewayModelMetadata {
+    .map(|model| {
+        let id = model.id;
+        let mut metadata = GatewayModelMetadata {
             context_length: model.context_length,
             max_output_tokens: model.max_output_tokens,
             input_modalities: model.input_modalities,
             reasoning_levels: model.reasoning_levels,
-        },
+        };
+        metadata.apply_registry_fallback(&id);
+        GatewayCachedModel {
+            id,
+            owned_by: model.owned_by,
+            display_name: model.display_name,
+            metadata,
+        }
     })
     .collect();
 
@@ -2474,6 +2627,40 @@ mod tests {
         assert_eq!(merged.max_output_tokens, None);
         assert!(merged.input_modalities.is_empty());
         assert!(merged.reasoning_levels.is_empty());
+    }
+
+    #[test]
+    fn routing_policy_defaults_to_priority_and_supports_alias_override() {
+        let mut config = GatewayConfig::default();
+        assert_eq!(
+            routing_policy_for_alias(&config, "best-code"),
+            GatewayRoutingPolicy::Priority
+        );
+
+        config
+            .routing_policies
+            .insert("best-code".to_string(), GatewayRoutingPolicy::RoundRobin);
+        assert_eq!(
+            routing_policy_for_alias(&config, "best-code"),
+            GatewayRoutingPolicy::RoundRobin
+        );
+    }
+
+    #[test]
+    fn registry_fallback_fills_only_missing_metadata_fields() {
+        let mut metadata = GatewayModelMetadata {
+            context_length: Some(123_456),
+            max_output_tokens: Some(7_777),
+            input_modalities: Vec::new(),
+            reasoning_levels: vec!["high".to_string()],
+        };
+
+        metadata.apply_registry_fallback("gpt-5.5");
+
+        assert_eq!(metadata.context_length, Some(123_456));
+        assert_eq!(metadata.max_output_tokens, Some(7_777));
+        assert_eq!(metadata.input_modalities, vec!["text", "image"]);
+        assert_eq!(metadata.reasoning_levels, vec!["high"]);
     }
 
     fn provider_with_format(id: &str, format: GatewayApiFormat) -> GatewayProvider {

@@ -347,6 +347,7 @@ impl ProxyServer {
     fn build_router(&self) -> Router {
         Router::new()
             .route("/health", get(handlers::health_check))
+            .route("/v1/gateway/status", get(handlers::handle_gateway_status))
             .route("/v1/models", get(handlers::handle_models))
             .route("/v1/messages", post(handlers::handle_messages))
             .route(
@@ -405,6 +406,17 @@ impl ProxyServer {
         self.state
             .provider_router
             .get_circuit_breaker_stats(provider_id, app_type)
+            .await
+    }
+
+    pub async fn get_provider_cooldown_remaining_seconds(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Option<u64> {
+        self.state
+            .provider_router
+            .provider_cooldown_remaining_seconds(provider_id, app_type)
             .await
     }
 }
