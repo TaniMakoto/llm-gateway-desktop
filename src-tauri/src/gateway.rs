@@ -1526,7 +1526,12 @@ impl StreamBlockEffect {
 
 /// 把增量 usage 合并进已有统计。流式响应会把 usage 拆到多个事件里
 /// （如 Anthropic 在 `message_start` 给 input_tokens、`message_delta` 给
-/// output_tokens），因此只填补缺失字段，不做整体覆盖。
+/// output_tokens），而且这些数字是**累计值**、不是分片量。
+///
+/// 所以合并规则是按字段「后来者覆盖」，前提是后来者真的带了这个字段：
+/// 早期事件里可能是 0 或只有一半（`message_start` 的 output_tokens 常为 0），
+/// 若改成「只填补缺失字段」，那个早期 0 会永远压住最终的准确值。
+/// 字段缺失（`None`）时才保留上一次的值。
 fn merge_test_usage(slot: &mut Option<GatewayModelTestUsage>, next: GatewayModelTestUsage) {
     if next.is_empty() {
         return;
@@ -3056,6 +3061,68 @@ mod tests {
         let usage = parsed.usage.expect("usage 必须从流里保留下来");
         assert_eq!(usage.total_tokens, Some(16654));
         assert_eq!(usage.reasoning_tokens, Some(16384));
+    }
+
+    #[test]
+    fn merge_test_usage_lets_later_reports_overwrite_earlier_ones() {
+        // Anthropic 风格：message_start 先报 output_tokens = 0，message_delta 才给
+        // 最终值。这两个数是累计值而非分片量，所以后来者必须覆盖前者——若按“只填补
+        // 缺失字段”合并，那个早期 0 会永久生效，用户就会看到“输出 0”。
+        let mut slot = None;
+        merge_test_usage(
+            &mut slot,
+            GatewayModelTestUsage {
+                input_tokens: Some(35),
+                output_tokens: Some(0),
+                ..Default::default()
+            },
+        );
+        merge_test_usage(
+            &mut slot,
+            GatewayModelTestUsage {
+                input_tokens: Some(35),
+                output_tokens: Some(15),
+                reasoning_tokens: Some(15),
+                ..Default::default()
+            },
+        );
+
+        let usage = slot.expect("usage 必须被合并出来");
+        assert_eq!(usage.output_tokens, Some(15));
+        assert_eq!(usage.reasoning_tokens, Some(15));
+        // 上游没给 total_tokens，按 input + output 补算。
+        assert_eq!(usage.total_tokens, Some(50));
+    }
+
+    #[test]
+    fn merge_test_usage_keeps_fields_a_later_report_omits() {
+        let mut slot = None;
+        merge_test_usage(
+            &mut slot,
+            GatewayModelTestUsage {
+                input_tokens: Some(314),
+                output_tokens: Some(2861),
+                total_tokens: Some(3175),
+                cache_read_input_tokens: Some(0),
+                reasoning_tokens: Some(0),
+                ..Default::default()
+            },
+        );
+        // 后续事件只带 output_tokens；它没提到的字段不能被清空。
+        merge_test_usage(
+            &mut slot,
+            GatewayModelTestUsage {
+                output_tokens: Some(2900),
+                ..Default::default()
+            },
+        );
+
+        let usage = slot.expect("usage 必须被合并出来");
+        assert_eq!(usage.output_tokens, Some(2900));
+        assert_eq!(usage.input_tokens, Some(314));
+        assert_eq!(usage.reasoning_tokens, Some(0));
+        // 上游明确给了 total 就不再改算，避免和上游的口径打架。
+        assert_eq!(usage.total_tokens, Some(3175));
     }
 
     #[test]
