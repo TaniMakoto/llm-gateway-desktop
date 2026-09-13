@@ -341,13 +341,17 @@ pub fn responses_to_chat_completions_with_reasoning(
     // 全量回传（含未发生 tool call 的纯文本轮），缺失即 400。客户端若在回放
     // 历史时丢弃了 reasoning item，这里按供应商声明的 reasoning_content 回传
     // 格式给缺失的 assistant 消息补占位，保住请求。
-    // 仅在声明 reasoning_content 输出、请求开启 thinking 且携带 tools 时生效，
-    // 避免向严格上游（vLLM 等）引入它们不认识的字段。
+    // 仅在声明 reasoning_content 输出且携带 tools 时生效，避免向严格上游
+    // （vLLM 等）引入它们不认识的字段。客户端没有显式声明 `reasoning` 不算「关闭」：
+    // Codex/pi 这类客户端往往不带该字段，而上游（如 AgentRouter 的
+    // deepseek-v4-flash）仍默认开思考，缺失历史轮 reasoning_content 一样 400。
+    // 只有客户端显式表达关闭（reasoning 为 null 或 effort 为 none/off/disabled）
+    // 才跳过回填。
     let preserve_history_reasoning = reasoning_config
         .and_then(|config| config.output_format.as_deref())
         == Some("reasoning_content");
     if preserve_history_reasoning
-        && reasoning_requested(&body) == Some(true)
+        && reasoning_requested(&body) != Some(false)
         && has_tools
     {
         if let Some(messages) = result.get_mut("messages").and_then(|v| v.as_array_mut()) {
@@ -2835,6 +2839,61 @@ mod tests {
             Some(&deepseek_codex_reasoning_config()),
         )
         .unwrap();
+        assert!(result["messages"][1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_backfills_history_reasoning_without_explicit_reasoning_field() {
+        // Codex/pi 不带 `reasoning` 字段时，上游仍可能默认开思考；历史轮缺
+        // reasoning_content 依然要补占位，否则 AgentRouter + deepseek-v4-flash
+        // 返回 400「reasoning_content in the thinking mode must be passed back」。
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "q"},
+                {"type": "message", "role": "assistant", "content": "a"},
+                {"type": "message", "role": "user", "content": "q2"}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "get_date",
+                "parameters": {"type": "object"}
+            }]
+        });
+
+        let result = responses_to_chat_completions_with_reasoning(
+            input,
+            Some(&deepseek_codex_reasoning_config()),
+        )
+        .unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[1]["reasoning_content"], "(reasoning unavailable)");
+    }
+
+    #[test]
+    fn responses_request_to_chat_respects_explicitly_disabled_reasoning_backfill() {
+        // 客户端显式关闭 thinking 时上游不会进入思考模式，不得注入占位。
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "q"},
+                {"type": "message", "role": "assistant", "content": "a"}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "get_date",
+                "parameters": {"type": "object"}
+            }],
+            "reasoning": {"effort": "none"}
+        });
+
+        let result = responses_to_chat_completions_with_reasoning(
+            input,
+            Some(&deepseek_codex_reasoning_config()),
+        )
+        .unwrap();
+
         assert!(result["messages"][1].get("reasoning_content").is_none());
     }
 
