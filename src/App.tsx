@@ -47,6 +47,7 @@ interface CachedModel {
   id: string;
   ownedBy?: string | null;
   displayName?: string | null;
+  metadata?: ModelMetadata;
 }
 
 interface ProviderModel {
@@ -55,6 +56,14 @@ interface ProviderModel {
   apiFormat: ApiFormat;
   enabled: boolean;
   recordBodies?: boolean | null;
+  metadata?: ModelMetadata;
+}
+
+interface ModelMetadata {
+  contextLength?: number | null;
+  maxOutputTokens?: number | null;
+  inputModalities?: string[];
+  reasoningLevels?: string[];
 }
 
 interface GatewayProvider {
@@ -686,6 +695,10 @@ function App() {
                   apiFormat: initial?.apiFormat ?? "openai_chat",
                   enabled: initial?.enabled ?? true,
                   recordBodies: initial?.recordBodies ?? null,
+                  metadata: initial?.metadata ?? {
+                    inputModalities: [],
+                    reasoningLevels: [],
+                  },
                 },
               ],
             }
@@ -1449,7 +1462,11 @@ function ProviderRoutesCard({
                 key={cached.id}
                 className="tag hover:bg-primary hover:text-primary-foreground"
                 onClick={() =>
-                  onAddModel({ upstreamModel: cached.id, alias: cached.id })
+                  onAddModel({
+                    upstreamModel: cached.id,
+                    alias: cached.id,
+                    metadata: cached.metadata,
+                  })
                 }
                 title={cached.displayName || cached.id}
               >
@@ -1490,7 +1507,14 @@ function ModelRow({
           className="input w-full font-mono"
           list={listId}
           value={model.upstreamModel}
-          onChange={(event) => onPatch({ upstreamModel: event.target.value })}
+          onChange={(event) => {
+            const upstreamModel = event.target.value;
+            const cached = cachedModels.find((item) => item.id === upstreamModel);
+            onPatch({
+              upstreamModel,
+              ...(cached?.metadata ? { metadata: cached.metadata } : {}),
+            });
+          }}
           placeholder="上游真实模型名"
         />
         <datalist id={listId}>
@@ -1553,6 +1577,77 @@ function ModelRow({
         >
           <Trash2 className="h-4 w-4" />
         </button>
+      </div>
+      <div className="basis-full rounded-md border bg-muted/30 p-2">
+        <div className="mb-2 text-[11px] font-medium text-muted-foreground">
+          模型 Metadata（提供给本地 API 客户端）
+        </div>
+        <div className="grid gap-2 md:grid-cols-4">
+          <input
+            className="input font-mono"
+            type="number"
+            min={1}
+            value={model.metadata?.contextLength ?? ""}
+            onChange={(event) => {
+              const value = event.target.value.trim();
+              onPatch({
+                metadata: {
+                  ...model.metadata,
+                  contextLength: value ? Number(value) : null,
+                },
+              });
+            }}
+            placeholder="context length，如 1000000"
+          />
+          <input
+            className="input font-mono"
+            type="number"
+            min={1}
+            value={model.metadata?.maxOutputTokens ?? ""}
+            onChange={(event) => {
+              const value = event.target.value.trim();
+              onPatch({
+                metadata: {
+                  ...model.metadata,
+                  maxOutputTokens: value ? Number(value) : null,
+                },
+              });
+            }}
+            placeholder="max output，如 128000"
+          />
+          <input
+            className="input font-mono"
+            value={(model.metadata?.inputModalities ?? []).join(", ")}
+            onChange={(event) =>
+              onPatch({
+                metadata: {
+                  ...model.metadata,
+                  inputModalities: event.target.value
+                    .split(",")
+                    .map((value) => value.trim())
+                    .filter(Boolean),
+                },
+              })
+            }
+            placeholder="input: text, image"
+          />
+          <input
+            className="input font-mono"
+            value={(model.metadata?.reasoningLevels ?? []).join(", ")}
+            onChange={(event) =>
+              onPatch({
+                metadata: {
+                  ...model.metadata,
+                  reasoningLevels: event.target.value
+                    .split(",")
+                    .map((value) => value.trim())
+                    .filter(Boolean),
+                },
+              })
+            }
+            placeholder="reasoning: low, medium, high"
+          />
+        </div>
       </div>
     </div>
   );

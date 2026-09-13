@@ -62,6 +62,50 @@ pub struct GatewayCachedModel {
     pub owned_by: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub metadata: GatewayModelMetadata,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_modalities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_levels: Vec<String>,
+}
+
+impl GatewayModelMetadata {
+    /// Merge capabilities for one public alias that can fail over across several
+    /// upstream providers. Numeric limits use the minimum value only when every
+    /// target reports one; list capabilities use intersection. Unknown metadata
+    /// removes that public guarantee rather than over-advertising a capability
+    /// that a failover target may not actually support.
+    fn merge_failover_capabilities(&mut self, other: &Self) {
+        self.context_length = min_known(self.context_length, other.context_length);
+        self.max_output_tokens = min_known(self.max_output_tokens, other.max_output_tokens);
+        merge_known_intersection(&mut self.input_modalities, &other.input_modalities);
+        merge_known_intersection(&mut self.reasoning_levels, &other.reasoning_levels);
+    }
+}
+
+fn min_known(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        _ => None,
+    }
+}
+
+fn merge_known_intersection(left: &mut Vec<String>, right: &[String]) {
+    if left.is_empty() || right.is_empty() {
+        left.clear();
+        return;
+    }
+    left.retain(|value| right.iter().any(|candidate| candidate == value));
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +120,8 @@ pub struct GatewayProviderModel {
     /// None 跟随供应商级 recordBodies。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_bodies: Option<bool>,
+    #[serde(default)]
+    pub metadata: GatewayModelMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,6 +381,7 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
                     api_format: format,
                     enabled: route.enabled && target.enabled,
                     record_bodies: None,
+                    metadata: GatewayModelMetadata::default(),
                 });
         }
     }
@@ -408,6 +455,24 @@ fn normalize_config(mut config: GatewayConfig) -> GatewayConfig {
         for model in &mut provider.models {
             model.alias = model.alias.trim().to_string();
             model.upstream_model = model.upstream_model.trim().to_string();
+            model.metadata.input_modalities = model
+                .metadata
+                .input_modalities
+                .drain(..)
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .collect();
+            model.metadata.input_modalities.sort();
+            model.metadata.input_modalities.dedup();
+            model.metadata.reasoning_levels = model
+                .metadata
+                .reasoning_levels
+                .drain(..)
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .collect();
+            model.metadata.reasoning_levels.sort();
+            model.metadata.reasoning_levels.dedup();
         }
     }
     config
@@ -837,7 +902,7 @@ pub fn openai_models_response(db: &Database) -> Result<Value, AppError> {
     let config = load_config(db)?;
     let created = chrono::Utc::now().timestamp();
     // 用 BTreeMap 去重并稳定排序
-    let mut aliases: BTreeMap<String, ()> = BTreeMap::new();
+    let mut aliases: BTreeMap<String, GatewayModelMetadata> = BTreeMap::new();
     for provider in &config.providers {
         if !provider.enabled {
             continue;
@@ -846,18 +911,48 @@ pub fn openai_models_response(db: &Database) -> Result<Value, AppError> {
             if !model.enabled {
                 continue;
             }
-            aliases.insert(model.alias.clone(), ());
+            aliases
+                .entry(model.alias.clone())
+                .and_modify(|metadata| metadata.merge_failover_capabilities(&model.metadata))
+                .or_insert_with(|| model.metadata.clone());
         }
     }
     let data: Vec<Value> = aliases
-        .into_keys()
-        .map(|alias| {
-            json!({
+        .into_iter()
+        .map(|(alias, metadata)| {
+            let mut value = json!({
                 "id": alias,
                 "object": "model",
                 "created": created,
                 "owned_by": "local-gateway"
-            })
+            });
+            let object = value.as_object_mut().expect("model response is an object");
+            if let Some(context_length) = metadata.context_length {
+                object.insert("context_length".to_string(), json!(context_length));
+            }
+            if let Some(max_output_tokens) = metadata.max_output_tokens {
+                object.insert("max_output_tokens".to_string(), json!(max_output_tokens));
+                object.insert(
+                    "max_completion_tokens".to_string(),
+                    json!(max_output_tokens),
+                );
+            }
+            if !metadata.input_modalities.is_empty() {
+                object.insert(
+                    "input_modalities".to_string(),
+                    json!(metadata.input_modalities),
+                );
+            }
+            if !metadata.reasoning_levels.is_empty() {
+                object.insert(
+                    "reasoning".to_string(),
+                    json!({
+                        "supported": true,
+                        "levels": metadata.reasoning_levels,
+                    }),
+                );
+            }
+            value
         })
         .collect();
     Ok(json!({ "object": "list", "data": data }))
@@ -963,6 +1058,12 @@ pub async fn fetch_gateway_provider_models(
         id: model.id,
         owned_by: model.owned_by,
         display_name: model.display_name,
+        metadata: GatewayModelMetadata {
+            context_length: model.context_length,
+            max_output_tokens: model.max_output_tokens,
+            input_modalities: model.input_modalities,
+            reasoning_levels: model.reasoning_levels,
+        },
     })
     .collect();
 
@@ -2334,6 +2435,47 @@ pub fn handle_gateway_tray_menu_event(app: &tauri::AppHandle, id: &str) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn model_metadata_merge_is_conservative_across_failover_targets() {
+        let mut merged = GatewayModelMetadata {
+            context_length: Some(1_000_000),
+            max_output_tokens: Some(128_000),
+            input_modalities: vec!["text".to_string(), "image".to_string()],
+            reasoning_levels: vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+            ],
+        };
+        merged.merge_failover_capabilities(&GatewayModelMetadata {
+            context_length: Some(200_000),
+            max_output_tokens: Some(64_000),
+            input_modalities: vec!["text".to_string()],
+            reasoning_levels: vec!["medium".to_string(), "high".to_string()],
+        });
+
+        assert_eq!(merged.context_length, Some(200_000));
+        assert_eq!(merged.max_output_tokens, Some(64_000));
+        assert_eq!(merged.input_modalities, vec!["text"]);
+        assert_eq!(merged.reasoning_levels, vec!["medium", "high"]);
+    }
+
+    #[test]
+    fn unknown_metadata_removes_public_capability_guarantees() {
+        let mut merged = GatewayModelMetadata {
+            context_length: Some(200_000),
+            max_output_tokens: Some(32_000),
+            input_modalities: vec!["text".to_string(), "image".to_string()],
+            reasoning_levels: vec!["high".to_string()],
+        };
+        merged.merge_failover_capabilities(&GatewayModelMetadata::default());
+
+        assert_eq!(merged.context_length, None);
+        assert_eq!(merged.max_output_tokens, None);
+        assert!(merged.input_modalities.is_empty());
+        assert!(merged.reasoning_levels.is_empty());
+    }
+
     fn provider_with_format(id: &str, format: GatewayApiFormat) -> GatewayProvider {
         GatewayProvider {
             id: id.to_string(),
@@ -2360,6 +2502,7 @@ mod tests {
                 api_format: format,
                 enabled: true,
                 record_bodies: None,
+                metadata: GatewayModelMetadata::default(),
             }],
         }
     }
@@ -2518,6 +2661,7 @@ mod tests {
             api_format: GatewayApiFormat::OpenaiResponses,
             enabled: true,
             record_bodies: None,
+            metadata: GatewayModelMetadata::default(),
         });
         config.providers.push(p);
         assert!(validate_config(&config).is_err());
@@ -2554,6 +2698,7 @@ mod tests {
             api_format: GatewayApiFormat::OpenaiResponses,
             enabled: true,
             record_bodies: None,
+            metadata: GatewayModelMetadata::default(),
         });
         config.providers.push(p);
         let combos = iter_materialized_combos(&config);
