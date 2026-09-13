@@ -2040,8 +2040,34 @@ function ModelTestModal({
     }
   }, []);
 
-  // 对话流新增内容后自动滚到底部。
+  // 流式输出时不能无条件滚到底：每来一帧增量就把视口拽回底部，用户想往上翻
+  // 看前面说了什么就翻不动。所以只在“用户还停在底部”时跟随，一旦他滚上去就
+  // 停止跟随，直到他自己滚回底部或点“回到底部”。
+  const pinnedToBottomRef = useRef(true);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+
+  /** 距底部多少像素以内仍算“停在底部”；留一点余量给半行的高度。 */
+  const SCROLL_PIN_THRESHOLD = 32;
+
+  const handleStreamScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const pinned = distance <= SCROLL_PIN_THRESHOLD;
+    pinnedToBottomRef.current = pinned;
+    setShowScrollToBottom(!pinned);
+  };
+
+  const scrollToBottom = () => {
+    pinnedToBottomRef.current = true;
+    setShowScrollToBottom(false);
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  };
+
+  // 对话流新增内容后自动滚到底部（仅当用户没有往上翻）。
   useEffect(() => {
+    if (!pinnedToBottomRef.current) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [history, running, result, streamedText, streamedReasoning]);
@@ -2096,6 +2122,9 @@ function ModelTestModal({
     setStreamedReasoning("");
     setStreamStatus(null);
     setShowStreamedReasoning(true);
+    // 新一轮（或清空会话）默认重新跟随底部。
+    pinnedToBottomRef.current = true;
+    setShowScrollToBottom(false);
   };
 
   const updateHistoryMessage = (index: number, content: string) => {
@@ -2471,282 +2500,297 @@ function ModelTestModal({
         )}
 
         {/* 对话流 */}
-        <div
-          ref={scrollRef}
-          className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4"
-        >
-          {history.length === 0 && !running && (
-            <div className="py-10 text-center text-xs text-muted-foreground">
-              输入消息后按 Cmd/Ctrl + Enter 发送，回复会渲染 Markdown。
-            </div>
-          )}
-          {history.map((message, index) => {
-            const isUser = message.role === "user";
-            const isEditing = editingIndex === index;
-            return (
-              <div
-                key={index}
-                className={cn(
-                  "group flex",
-                  isUser ? "justify-end" : "justify-start",
-                )}
-              >
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <div
+            ref={scrollRef}
+            onScroll={handleStreamScroll}
+            className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4"
+          >
+            {history.length === 0 && !running && (
+              <div className="py-10 text-center text-xs text-muted-foreground">
+                输入消息后按 Cmd/Ctrl + Enter 发送，回复会渲染 Markdown。
+              </div>
+            )}
+            {history.map((message, index) => {
+              const isUser = message.role === "user";
+              const isEditing = editingIndex === index;
+              return (
                 <div
+                  key={index}
                   className={cn(
-                    "relative max-w-[85%] rounded-2xl px-4 py-2.5",
-                    isUser
-                      ? "rounded-br-sm bg-primary/10"
-                      : "rounded-bl-sm bg-muted/40",
+                    "group flex",
+                    isUser ? "justify-end" : "justify-start",
                   )}
                 >
-                  <div className="mb-1 flex items-center justify-between gap-2">
-                    <span
-                      className={cn(
-                        "text-[10px] font-medium",
-                        isUser
-                          ? "text-primary"
-                          : "text-emerald-600 dark:text-emerald-400",
-                      )}
-                    >
-                      {isUser ? "用户" : "助手"}
-                    </span>
-                    <div className="flex items-center gap-0.5 opacity-0 transition group-hover:opacity-100">
-                      {!isUser && (
+                  <div
+                    className={cn(
+                      "relative max-w-[85%] rounded-2xl px-4 py-2.5",
+                      isUser
+                        ? "rounded-br-sm bg-primary/10"
+                        : "rounded-bl-sm bg-muted/40",
+                    )}
+                  >
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <span
+                        className={cn(
+                          "text-[10px] font-medium",
+                          isUser
+                            ? "text-primary"
+                            : "text-emerald-600 dark:text-emerald-400",
+                        )}
+                      >
+                        {isUser ? "用户" : "助手"}
+                      </span>
+                      <div className="flex items-center gap-0.5 opacity-0 transition group-hover:opacity-100">
+                        {!isUser && (
+                          <button
+                            className="icon-button h-7 w-7"
+                            onClick={() => onCopy(message.content, "助手回复")}
+                            title="复制该回复"
+                            aria-label="复制该回复"
+                            disabled={running}
+                          >
+                            <Copy className="h-3.5 w-3.5" />
+                          </button>
+                        )}
                         <button
                           className="icon-button h-7 w-7"
-                          onClick={() => onCopy(message.content, "助手回复")}
-                          title="复制该回复"
-                          aria-label="复制该回复"
+                          onClick={() =>
+                            setEditingIndex(isEditing ? null : index)
+                          }
+                          title={isEditing ? "完成编辑" : "编辑该条"}
+                          aria-label={isEditing ? "完成编辑" : "编辑该条"}
                           disabled={running}
                         >
-                          <Copy className="h-3.5 w-3.5" />
+                          {isEditing ? (
+                            <Check className="h-3.5 w-3.5" />
+                          ) : (
+                            <Pencil className="h-3.5 w-3.5" />
+                          )}
                         </button>
-                      )}
-                      <button
-                        className="icon-button h-7 w-7"
-                        onClick={() =>
-                          setEditingIndex(isEditing ? null : index)
+                        <button
+                          className="icon-button h-7 w-7 text-destructive"
+                          onClick={() => {
+                            deleteHistoryMessage(index);
+                            setEditingIndex(null);
+                          }}
+                          title="删除该条"
+                          aria-label="删除该条"
+                          disabled={running}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                    {isEditing ? (
+                      <textarea
+                        className="input min-h-16 w-full resize-y text-xs leading-5"
+                        value={message.content}
+                        onChange={(event) =>
+                          updateHistoryMessage(index, event.target.value)
                         }
-                        title={isEditing ? "完成编辑" : "编辑该条"}
-                        aria-label={isEditing ? "完成编辑" : "编辑该条"}
                         disabled={running}
-                      >
-                        {isEditing ? (
-                          <Check className="h-3.5 w-3.5" />
+                      />
+                    ) : isUser ? (
+                      <div className="whitespace-pre-wrap break-words text-sm leading-6">
+                        {message.content}
+                      </div>
+                    ) : (
+                      <>
+                        {message.reasoningContent?.trim() ? (
+                          <details className="mb-2 border-b border-border/60 pb-2">
+                            <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                              <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                              思考过程
+                            </summary>
+                            <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[10px] leading-4 text-muted-foreground">
+                              {message.reasoningContent}
+                            </pre>
+                          </details>
+                        ) : null}
+                        {message.content.trim() ? (
+                          <Markdown content={message.content} />
                         ) : (
-                          <Pencil className="h-3.5 w-3.5" />
+                          <div className="text-xs italic text-muted-foreground">
+                            {message.reasoningContent?.trim()
+                              ? "（模型未产出正式回复，仅返回了思考内容）"
+                              : "（模型未返回任何文本内容）"}
+                          </div>
                         )}
-                      </button>
-                      <button
-                        className="icon-button h-7 w-7 text-destructive"
-                        onClick={() => {
-                          deleteHistoryMessage(index);
-                          setEditingIndex(null);
-                        }}
-                        title="删除该条"
-                        aria-label="删除该条"
-                        disabled={running}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
+                      </>
+                    )}
+                    {/* 每条气泡各自的原始请求/响应，默认收起。 */}
+                    {isUser && message.rawRequest && (
+                      <details className="mt-2 border-t border-border/60 pt-2">
+                        <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                          <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                          原始请求
+                        </summary>
+                        <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
+                          {message.rawRequest}
+                        </pre>
+                      </details>
+                    )}
+                    {!isUser && message.rawResponse && (
+                      <details className="mt-2 border-t border-border/60 pt-2">
+                        <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                          <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                          原始响应
+                        </summary>
+                        <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
+                          {message.rawResponse}
+                        </pre>
+                      </details>
+                    )}
                   </div>
-                  {isEditing ? (
-                    <textarea
-                      className="input min-h-16 w-full resize-y text-xs leading-5"
-                      value={message.content}
-                      onChange={(event) =>
-                        updateHistoryMessage(index, event.target.value)
-                      }
-                      disabled={running}
-                    />
-                  ) : isUser ? (
-                    <div className="whitespace-pre-wrap break-words text-sm leading-6">
-                      {message.content}
-                    </div>
-                  ) : (
-                    <>
-                      {message.reasoningContent?.trim() ? (
-                        <details className="mb-2 border-b border-border/60 pb-2">
-                          <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
-                            <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
-                            思考过程
-                          </summary>
-                          <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[10px] leading-4 text-muted-foreground">
-                            {message.reasoningContent}
-                          </pre>
-                        </details>
-                      ) : null}
-                      {message.content.trim() ? (
-                        <Markdown content={message.content} />
-                      ) : (
-                        <div className="text-xs italic text-muted-foreground">
-                          {message.reasoningContent?.trim()
-                            ? "（模型未产出正式回复，仅返回了思考内容）"
-                            : "（模型未返回任何文本内容）"}
-                        </div>
-                      )}
-                    </>
-                  )}
-                  {/* 每条气泡各自的原始请求/响应，默认收起。 */}
-                  {isUser && message.rawRequest && (
-                    <details className="mt-2 border-t border-border/60 pt-2">
-                      <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
-                        <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
-                        原始请求
-                      </summary>
-                      <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
-                        {message.rawRequest}
-                      </pre>
-                    </details>
-                  )}
-                  {!isUser && message.rawResponse && (
-                    <details className="mt-2 border-t border-border/60 pt-2">
-                      <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
-                        <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
-                        原始响应
-                      </summary>
-                      <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
-                        {message.rawResponse}
-                      </pre>
-                    </details>
-                  )}
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
 
-          {/* 运行中加载气泡；流式模式下有内容后转为实时上屏的助手气泡 */}
-          {running && (
-            <div className="flex justify-start">
-              {streamEnabled && (streamedText || streamedReasoning) ? (
-                <div className="group relative max-w-[85%] rounded-2xl rounded-bl-sm bg-muted/40 px-4 py-2.5">
-                  <div className="mb-1 flex items-center gap-2">
-                    <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-                      助手
-                    </span>
-                    <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
-                      <RefreshCw className="h-3 w-3 animate-spin" />
-                      {streamStatus
-                        ? `已连接 · HTTP ${streamStatus}`
-                        : "接收中…"}
-                    </span>
+            {/* 运行中加载气泡；流式模式下有内容后转为实时上屏的助手气泡 */}
+            {running && (
+              <div className="flex justify-start">
+                {streamEnabled && (streamedText || streamedReasoning) ? (
+                  <div className="group relative max-w-[85%] rounded-2xl rounded-bl-sm bg-muted/40 px-4 py-2.5">
+                    <div className="mb-1 flex items-center gap-2">
+                      <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                        助手
+                      </span>
+                      <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                        <RefreshCw className="h-3 w-3 animate-spin" />
+                        {streamStatus
+                          ? `已连接 · HTTP ${streamStatus}`
+                          : "接收中…"}
+                      </span>
+                    </div>
+                    {streamedReasoning ? (
+                      <details
+                        className="mb-2 border-b border-border/60 pb-2"
+                        open={showStreamedReasoning}
+                        onToggle={(event) =>
+                          setShowStreamedReasoning(event.currentTarget.open)
+                        }
+                      >
+                        <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                          <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                          思考过程
+                        </summary>
+                        <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[10px] leading-4 text-muted-foreground">
+                          {streamedReasoning}
+                        </pre>
+                      </details>
+                    ) : null}
+                    {streamedText ? (
+                      <Markdown content={streamedText} />
+                    ) : (
+                      <div className="text-xs italic text-muted-foreground">
+                        （模型尚未产出正文，正在输出思考内容）
+                      </div>
+                    )}
                   </div>
-                  {streamedReasoning ? (
-                    <details
-                      className="mb-2 border-b border-border/60 pb-2"
-                      open={showStreamedReasoning}
-                      onToggle={(event) =>
-                        setShowStreamedReasoning(event.currentTarget.open)
-                      }
-                    >
-                      <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
-                        <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
-                        思考过程
-                      </summary>
+                ) : (
+                  <div className="rounded-2xl rounded-bl-sm bg-muted/40 px-4 py-2.5">
+                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                      {streamEnabled ? "等待上游首字…" : "等待上游回复…"}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 最近一次结果状态条 / 失败错误气泡 */}
+            {result && (
+              <div
+                className={cn(
+                  "rounded-lg border px-3 py-2 text-[11px] leading-5",
+                  result.ok
+                    ? "border-border bg-muted/30 text-muted-foreground"
+                    : "border-destructive/30 bg-destructive/5 text-destructive",
+                )}
+              >
+                {result.ok ? (
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                    <span className="font-medium text-emerald-600 dark:text-emerald-400">
+                      成功
+                    </span>
+                    {result.status > 0 && <span>· HTTP {result.status}</span>}
+                    <span>· {result.latencyMs}ms</span>
+                    <span>
+                      · {result.pathUsed === "gateway" ? "通过网关" : "直连"}
+                    </span>
+                    <span>
+                      ·{" "}
+                      {result.proxyEffective
+                        ? `代理 ${result.proxyEffective}`
+                        : "无代理"}
+                    </span>
+                    {result.finishReason && (
+                      <span>· 停止原因 {result.finishReason}</span>
+                    )}
+                    {usageSummary.length > 0 && (
+                      <span>· {usageSummary.join(" · ")}</span>
+                    )}
+                    {result.lengthTruncated && (
+                      <span className="text-amber-700 dark:text-amber-300">
+                        {reasoningExhausted
+                          ? `· 输出因长度上限被截断（${result.finishReason ?? "length"}）：思考已占用全部 ${result.usage?.outputTokens} token，模型未产出正文`
+                          : `· 输出因长度上限被截断（${result.finishReason ?? "length"}），可调高最大输出 token`}
+                      </span>
+                    )}
+                  </div>
+                ) : (
+                  <div className="break-words">
+                    <span className="font-medium">失败</span>
+                    {result.status > 0 && <span> · HTTP {result.status}</span>}
+                    {result.error && <span> · {result.error}</span>}
+                  </div>
+                )}
+                {/* 流式请求中途失败：把断流前已经收到的内容留下来，别让它随失败一起消失。 */}
+                {!result.ok && (streamedText || streamedReasoning) && (
+                  <div className="mt-2 border-t border-border/60 pt-2">
+                    <div className="text-[11px] text-muted-foreground">
+                      断流前已收到（正文 {streamedText.length} 字 / 思考{" "}
+                      {streamedReasoning.length} 字）
+                    </div>
+                    {streamedReasoning && (
                       <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[10px] leading-4 text-muted-foreground">
                         {streamedReasoning}
                       </pre>
-                    </details>
-                  ) : null}
-                  {streamedText ? (
-                    <Markdown content={streamedText} />
-                  ) : (
-                    <div className="text-xs italic text-muted-foreground">
-                      （模型尚未产出正文，正在输出思考内容）
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="rounded-2xl rounded-bl-sm bg-muted/40 px-4 py-2.5">
-                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                    {streamEnabled ? "等待上游首字…" : "等待上游回复…"}
+                    )}
+                    {streamedText && (
+                      <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[10px] leading-4">
+                        {streamedText}
+                      </pre>
+                    )}
                   </div>
-                </div>
-              )}
-            </div>
-          )}
+                )}
+                {/* 失败时没有助手气泡，这里补一个原始响应入口，方便排查。 */}
+                {!result.ok && result.rawBody && (
+                  <details className="mt-2 border-t border-border/60 pt-2">
+                    <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                      <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                      原始响应
+                    </summary>
+                    <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
+                      {result.rawBody}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            )}
+          </div>
 
-          {/* 最近一次结果状态条 / 失败错误气泡 */}
-          {result && (
-            <div
-              className={cn(
-                "rounded-lg border px-3 py-2 text-[11px] leading-5",
-                result.ok
-                  ? "border-border bg-muted/30 text-muted-foreground"
-                  : "border-destructive/30 bg-destructive/5 text-destructive",
-              )}
+          {showScrollToBottom && (
+            <button
+              type="button"
+              onClick={scrollToBottom}
+              title="跳回最新内容并恢复自动跟随"
+              className="secondary-button absolute bottom-3 left-1/2 h-auto -translate-x-1/2 rounded-full px-3 py-1.5 shadow-lg"
             >
-              {result.ok ? (
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                  <span className="font-medium text-emerald-600 dark:text-emerald-400">
-                    成功
-                  </span>
-                  {result.status > 0 && <span>· HTTP {result.status}</span>}
-                  <span>· {result.latencyMs}ms</span>
-                  <span>
-                    · {result.pathUsed === "gateway" ? "通过网关" : "直连"}
-                  </span>
-                  <span>
-                    ·{" "}
-                    {result.proxyEffective
-                      ? `代理 ${result.proxyEffective}`
-                      : "无代理"}
-                  </span>
-                  {result.finishReason && (
-                    <span>· 停止原因 {result.finishReason}</span>
-                  )}
-                  {usageSummary.length > 0 && (
-                    <span>· {usageSummary.join(" · ")}</span>
-                  )}
-                  {result.lengthTruncated && (
-                    <span className="text-amber-700 dark:text-amber-300">
-                      {reasoningExhausted
-                        ? `· 输出因长度上限被截断（${result.finishReason ?? "length"}）：思考已占用全部 ${result.usage?.outputTokens} token，模型未产出正文`
-                        : `· 输出因长度上限被截断（${result.finishReason ?? "length"}），可调高最大输出 token`}
-                    </span>
-                  )}
-                </div>
-              ) : (
-                <div className="break-words">
-                  <span className="font-medium">失败</span>
-                  {result.status > 0 && <span> · HTTP {result.status}</span>}
-                  {result.error && <span> · {result.error}</span>}
-                </div>
-              )}
-              {/* 流式请求中途失败：把断流前已经收到的内容留下来，别让它随失败一起消失。 */}
-              {!result.ok && (streamedText || streamedReasoning) && (
-                <div className="mt-2 border-t border-border/60 pt-2">
-                  <div className="text-[11px] text-muted-foreground">
-                    断流前已收到（正文 {streamedText.length} 字 / 思考{" "}
-                    {streamedReasoning.length} 字）
-                  </div>
-                  {streamedReasoning && (
-                    <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[10px] leading-4 text-muted-foreground">
-                      {streamedReasoning}
-                    </pre>
-                  )}
-                  {streamedText && (
-                    <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[10px] leading-4">
-                      {streamedText}
-                    </pre>
-                  )}
-                </div>
-              )}
-              {/* 失败时没有助手气泡，这里补一个原始响应入口，方便排查。 */}
-              {!result.ok && result.rawBody && (
-                <details className="mt-2 border-t border-border/60 pt-2">
-                  <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
-                    <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
-                    原始响应
-                  </summary>
-                  <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
-                    {result.rawBody}
-                  </pre>
-                </details>
-              )}
-            </div>
+              <ChevronDown className="h-3.5 w-3.5" />
+              回到底部
+            </button>
           )}
         </div>
 
