@@ -179,7 +179,14 @@ def check_public_branding() -> None:
         ".lock", ".plist", ".wxs", ".xml", ".sh", ".ps1",
     }
     matches: list[str] = []
+    ignored_roots = {".git", "node_modules", "dist", "target", "_refs"}
+    ignored_prefixes = {("docs", "history-session")}
     for path in ROOT.rglob("*"):
+        rel_parts = path.relative_to(ROOT).parts
+        if any(part in ignored_roots for part in rel_parts):
+            continue
+        if any(rel_parts[: len(prefix)] == prefix for prefix in ignored_prefixes):
+            continue
         if not path.is_file() or path in allowed:
             continue
         if path.suffix.lower() not in text_suffixes and path.name not in {

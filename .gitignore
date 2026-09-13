@@ -33,3 +33,5 @@ copilot-api
 .history
 CODEBUDDY.md
 mainWindow.js
+/_refs/
+/docs/history-session/
