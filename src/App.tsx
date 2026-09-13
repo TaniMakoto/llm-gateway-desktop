@@ -154,6 +154,8 @@ interface ModelTestResult {
   status: number;
   latencyMs: number;
   replyText: string;
+  /** 上游单独返回的思考/推理内容；与正文分开，正文可能为空。 */
+  reasoningText?: string;
   rawBody: string;
   rawRequest?: string;
   error?: string | null;
@@ -171,6 +173,8 @@ type TestThinkingLevel = "disabled" | "low" | "medium" | "high";
 interface ModelTestMessage {
   role: ModelTestRole;
   content: string;
+  /** 助手消息：上游单独返回的思考内容（正文为空时仍予以展示）。 */
+  reasoningContent?: string;
   /** 当次发送给上游/网关的整段请求 payload（用户与助手消息共享同一次调用）。 */
   rawRequest?: string;
   /** 助手消息：当次返回的原始响应体。 */
@@ -2061,8 +2065,14 @@ function ModelTestModal({
       toast.error("请输入测试消息");
       return;
     }
+    // 只回放带正文的助手轮次：思考耗尽预算、content 为空的轮次若原样回传，
+    // 后端会以“测试消息内容不能为空”拒绝。这类轮次仍会展示在对话流里。
     const outgoingHistory = [
-      ...history,
+      ...history
+        .filter(
+          (message) => message.role === "user" || message.content.trim() !== "",
+        )
+        .map((message) => ({ role: message.role, content: message.content })),
       { role: "user" as ModelTestRole, content: draft },
     ];
     setRunning(true);
@@ -2084,7 +2094,7 @@ function ModelTestModal({
         },
       });
       setResult(res);
-      if (res.ok && res.replyText.trim()) {
+      if (res.ok) {
         const rawRequest = res.rawRequest ?? "";
         setHistory([
           ...history,
@@ -2092,6 +2102,7 @@ function ModelTestModal({
           {
             role: "assistant",
             content: res.replyText,
+            reasoningContent: res.reasoningText ?? "",
             rawRequest,
             rawResponse: res.rawBody,
           },
@@ -2135,6 +2146,15 @@ function ModelTestModal({
           : null,
       ].filter(Boolean)
     : [];
+
+  // 思考占满全部输出预算：截断的根因不是“输出 token 不够”，而是模型把预算
+  // 全花在推理上、没产出正文。此时提示“调高最大输出 token”会误导用户。
+  const resultUsage = result?.usage;
+  const reasoningExhausted =
+    !!result?.lengthTruncated &&
+    resultUsage?.reasoningTokens != null &&
+    resultUsage.outputTokens != null &&
+    resultUsage.reasoningTokens >= resultUsage.outputTokens;
 
   return (
     <div
@@ -2439,7 +2459,28 @@ function ModelTestModal({
                       {message.content}
                     </div>
                   ) : (
-                    <Markdown content={message.content} />
+                    <>
+                      {message.reasoningContent?.trim() ? (
+                        <details className="mb-2 border-b border-border/60 pb-2">
+                          <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                            <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                            思考过程
+                          </summary>
+                          <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[10px] leading-4 text-muted-foreground">
+                            {message.reasoningContent}
+                          </pre>
+                        </details>
+                      ) : null}
+                      {message.content.trim() ? (
+                        <Markdown content={message.content} />
+                      ) : (
+                        <div className="text-xs italic text-muted-foreground">
+                          {message.reasoningContent?.trim()
+                            ? "（模型未产出正式回复，仅返回了思考内容）"
+                            : "（模型未返回任何文本内容）"}
+                        </div>
+                      )}
+                    </>
                   )}
                   {/* 每条气泡各自的原始请求/响应，默认收起。 */}
                   {isUser && message.rawRequest && (
@@ -2515,8 +2556,9 @@ function ModelTestModal({
                   )}
                   {result.lengthTruncated && (
                     <span className="text-amber-700 dark:text-amber-300">
-                      · 输出因长度上限被截断（{result.finishReason ?? "length"}
-                      ），可调高最大输出 token
+                      {reasoningExhausted
+                        ? `· 输出因长度上限被截断（${result.finishReason ?? "length"}）：思考已占用全部 ${result.usage?.outputTokens} token，模型未产出正文`
+                        : `· 输出因长度上限被截断（${result.finishReason ?? "length"}），可调高最大输出 token`}
                     </span>
                   )}
                 </div>
@@ -2526,6 +2568,18 @@ function ModelTestModal({
                   {result.status > 0 && <span> · HTTP {result.status}</span>}
                   {result.error && <span> · {result.error}</span>}
                 </div>
+              )}
+              {/* 失败时没有助手气泡，这里补一个原始响应入口，方便排查。 */}
+              {!result.ok && result.rawBody && (
+                <details className="mt-2 border-t border-border/60 pt-2">
+                  <summary className="flex cursor-pointer list-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+                    <ChevronRight className="h-3 w-3 transition [[open]>&]:rotate-90" />
+                    原始响应
+                  </summary>
+                  <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[10px] leading-4">
+                    {result.rawBody}
+                  </pre>
+                </details>
               )}
             </div>
           )}

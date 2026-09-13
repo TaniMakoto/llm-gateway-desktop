@@ -1138,6 +1138,11 @@ pub struct GatewayModelTestResult {
     pub status: u16,
     pub latency_ms: u64,
     pub reply_text: String,
+    /// 上游单独返回的思考/推理内容（OpenAI `reasoning_content`、Responses
+    /// reasoning item、Anthropic thinking block）。与 `reply_text` 分开保存，
+    /// 便于在“思考耗尽预算、未产出正文”时仍能看到模型实际返回了什么。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reasoning_text: String,
     pub raw_body: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub raw_request: String,
@@ -1152,6 +1157,7 @@ pub struct GatewayModelTestResult {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ParsedTestResponse {
     reply_text: String,
+    reasoning_text: String,
     finish_reason: Option<String>,
     length_truncated: bool,
     usage: Option<GatewayModelTestUsage>,
@@ -1359,6 +1365,64 @@ fn extract_anthropic_reply(body: &Value) -> String {
     out
 }
 
+/// OpenAI Chat 风格思考内容：优先 `reasoning_content`，兼容部分上游的
+/// `reasoning` 字符串字段。返回 `content` 之外单独存放，避免二者混淆。
+fn extract_openai_chat_reasoning(body: &Value) -> String {
+    body.pointer("/choices/0/message/reasoning_content")
+        .or_else(|| body.pointer("/choices/0/message/reasoning"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// OpenAI Responses 风格思考内容：`output` 中 `type == "reasoning"` 的条目，
+/// 汇总其 `summary`（summary_text）与 `content` 中的文本。
+fn extract_responses_reasoning(body: &Value) -> String {
+    let mut out = String::new();
+    if let Some(outputs) = body.get("output").and_then(Value::as_array) {
+        for item in outputs {
+            if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                continue;
+            }
+            if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+                for part in summary {
+                    if let Some(text) = part
+                        .get("text")
+                        .or_else(|| part.get("summary_text"))
+                        .and_then(Value::as_str)
+                    {
+                        out.push_str(text);
+                    }
+                }
+            }
+            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                for part in content {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        out.push_str(text);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Anthropic 风格思考内容：`content` 中 `type == "thinking"` 的 `thinking` 字段。
+/// `redacted_thinking` 只有加密载荷，无法展示，跳过。
+fn extract_anthropic_reasoning(body: &Value) -> String {
+    let mut out = String::new();
+    if let Some(parts) = body.get("content").and_then(Value::as_array) {
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("thinking") {
+                if let Some(text) = part.get("thinking").and_then(Value::as_str) {
+                    out.push_str(text);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn parse_test_response(format: GatewayApiFormat, body: &Value) -> ParsedTestResponse {
     match format {
         GatewayApiFormat::OpenaiChat => {
@@ -1373,6 +1437,7 @@ fn parse_test_response(format: GatewayApiFormat, body: &Value) -> ParsedTestResp
                 .filter(|usage| !usage.is_empty());
             ParsedTestResponse {
                 reply_text: extract_openai_chat_reply(body),
+                reasoning_text: extract_openai_chat_reasoning(body),
                 length_truncated: is_length_truncated(finish_reason.as_deref()),
                 finish_reason,
                 usage,
@@ -1391,6 +1456,7 @@ fn parse_test_response(format: GatewayApiFormat, body: &Value) -> ParsedTestResp
                 .filter(|usage| !usage.is_empty());
             ParsedTestResponse {
                 reply_text: extract_responses_reply(body),
+                reasoning_text: extract_responses_reasoning(body),
                 length_truncated: is_length_truncated(finish_reason.as_deref()),
                 finish_reason,
                 usage,
@@ -1408,6 +1474,7 @@ fn parse_test_response(format: GatewayApiFormat, body: &Value) -> ParsedTestResp
                 .filter(|usage| !usage.is_empty());
             ParsedTestResponse {
                 reply_text: extract_anthropic_reply(body),
+                reasoning_text: extract_anthropic_reasoning(body),
                 length_truncated: is_length_truncated(finish_reason.as_deref()),
                 finish_reason,
                 usage,
@@ -1710,6 +1777,7 @@ fn empty_test_result(
         status: 0,
         latency_ms,
         reply_text: String::new(),
+        reasoning_text: String::new(),
         raw_body: String::new(),
         raw_request: String::new(),
         error,
@@ -1784,6 +1852,7 @@ pub async fn test_gateway_model(
                 status,
                 latency_ms,
                 reply_text: parsed.reply_text,
+                reasoning_text: parsed.reasoning_text,
                 raw_body,
                 raw_request,
                 error,
@@ -2410,6 +2479,70 @@ mod tests {
         assert_eq!(parsed.finish_reason.as_deref(), Some("stop"));
         assert!(!parsed.length_truncated);
         assert_eq!(parsed.usage.unwrap().total_tokens, Some(8));
+    }
+
+    #[test]
+    fn parse_chat_response_extracts_reasoning_content_separately() {
+        // 复现 deepseek 等推理模型：content 为 null、思考占满预算、finish_reason=length。
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "让我想想……"
+                },
+                "finish_reason": "length"
+            }],
+            "usage": {
+                "prompt_tokens": 270,
+                "completion_tokens": 16384,
+                "total_tokens": 16654,
+                "completion_tokens_details": {"reasoning_tokens": 16384}
+            }
+        });
+        let parsed = parse_test_response(GatewayApiFormat::OpenaiChat, &body);
+        assert_eq!(parsed.reply_text, "");
+        assert_eq!(parsed.reasoning_text, "让我想想……");
+        assert!(parsed.length_truncated);
+        let usage = parsed.usage.expect("usage present");
+        assert_eq!(usage.reasoning_tokens, Some(16384));
+        assert_eq!(usage.output_tokens, Some(16384));
+    }
+
+    #[test]
+    fn parse_responses_response_extracts_reasoning_summary() {
+        let body = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "推理摘要"}]
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "回复片段"}]
+                }
+            ]
+        });
+        let parsed = parse_test_response(GatewayApiFormat::OpenaiResponses, &body);
+        assert_eq!(parsed.reply_text, "回复片段");
+        assert_eq!(parsed.reasoning_text, "推理摘要");
+    }
+
+    #[test]
+    fn parse_anthropic_response_extracts_thinking_block() {
+        let body = json!({
+            "stop_reason": "max_tokens",
+            "content": [
+                {"type": "thinking", "thinking": "推理内容"},
+                {"type": "text", "text": "截断的回复"}
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 4096}
+        });
+        let parsed = parse_test_response(GatewayApiFormat::Anthropic, &body);
+        assert_eq!(parsed.reply_text, "截断的回复");
+        assert_eq!(parsed.reasoning_text, "推理内容");
     }
 
     #[test]
