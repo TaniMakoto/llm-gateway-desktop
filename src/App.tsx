@@ -2247,6 +2247,11 @@ function ModelTestModal({
   };
 
   const proxyDisabled = viaGateway === "gateway";
+  // 有些聚合上游会把 reasoning_tokens 恒报为 0（实测 kimi-k3 那条路由），此时它
+  // 给的“推理 0”不是事实——我们确实收到了思考正文。标注一下，别让人以为模型没思考。
+  const reasoningTokens = result?.usage?.reasoningTokens;
+  const reasoningUncounted =
+    (reasoningTokens ?? 0) === 0 && !!result?.reasoningText;
   const usageSummary = result?.usage
     ? [
         result.usage.inputTokens != null
@@ -2261,9 +2266,13 @@ function ModelTestModal({
         result.usage.cacheReadInputTokens != null
           ? `缓存读 ${result.usage.cacheReadInputTokens}`
           : null,
-        result.usage.reasoningTokens != null
-          ? `推理 ${result.usage.reasoningTokens}`
-          : null,
+        reasoningTokens != null
+          ? reasoningUncounted
+            ? "推理 0（上游未单独计数）"
+            : `推理 ${reasoningTokens}`
+          : reasoningUncounted
+            ? "推理 上游未上报"
+            : null,
       ].filter(Boolean)
     : [];
 
@@ -2272,9 +2281,12 @@ function ModelTestModal({
   const resultUsage = result?.usage;
   const reasoningExhausted =
     !!result?.lengthTruncated &&
-    resultUsage?.reasoningTokens != null &&
-    resultUsage.outputTokens != null &&
-    resultUsage.reasoningTokens >= resultUsage.outputTokens;
+    ((resultUsage?.reasoningTokens != null &&
+      resultUsage.outputTokens != null &&
+      resultUsage.reasoningTokens >= resultUsage.outputTokens) ||
+      // 计数不可信时的兜底：「截断 + 只收到思考、正文为空」本身就是预算被思考吃光的
+      // 形状，比上游给的那个数更可靠。
+      (!!result.reasoningText && !result.replyText.trim()));
 
   return (
     <div
