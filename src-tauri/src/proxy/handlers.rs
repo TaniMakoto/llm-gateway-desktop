@@ -1527,9 +1527,9 @@ fn codex_proxy_error_json(
         let cause = error_obj
             .get("message")
             .and_then(|value| value.as_str())
-            .map(ToString::to_string)
+            .map(summarize_upstream_error_cause)
             .filter(|message| !message.trim().is_empty())
-            .unwrap_or_else(|| get_error_message(error));
+            .unwrap_or_else(|| summarize_upstream_error_cause(&get_error_message(error)));
         let status_fragment = upstream_status
             .map(|status| format!("; upstream_status: HTTP {status}"))
             .unwrap_or_default();
@@ -1620,6 +1620,24 @@ fn compact_error_message(message: &str, max_chars: usize) -> String {
         .trim_end()
         .to_string();
     format!("{truncated}…(truncated)")
+}
+
+fn summarize_upstream_error_cause(message: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = normalized.to_ascii_lowercase();
+    if lower.contains("<html") || lower.contains("<!doctype html") {
+        if let (Some(start), Some(end)) = (lower.find("<title>"), lower.find("</title>")) {
+            let content_start = start + "<title>".len();
+            if end > content_start {
+                let title = normalized[content_start..end].trim();
+                if !title.is_empty() {
+                    return format!("upstream HTML error page: {}", compact_error_message(title, 240));
+                }
+            }
+        }
+        return "upstream returned an HTML error page".to_string();
+    }
+    compact_error_message(&normalized, 1200)
 }
 
 // ============================================================================
@@ -3022,5 +3040,28 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         assert_eq!(body["error"]["provider"], "HCAI");
         assert_eq!(body["error"]["model"], "gpt-5.5");
         assert_eq!(body["error"]["endpoint"], "/responses");
+    }
+
+    #[test]
+    fn codex_proxy_html_error_keeps_title_and_drops_embedded_payload() {
+        let error = ProxyError::UpstreamError {
+            status: 504,
+            body: Some(
+                r#"<html><head><title>无法连接到服务器</title><style>@font-face{src:url(data:font/woff2;base64,AAAAAAAAAAAAAAAA)}</style></head><body>gateway timeout</body></html>"#
+                    .to_string(),
+            ),
+        };
+
+        let body = codex_proxy_error_json(
+            "黑与白默认 · openai_chat",
+            "deepseek-v4-flash",
+            "/responses",
+            &error,
+        );
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("HTTP 504"));
+        assert!(message.contains("无法连接到服务器"));
+        assert!(!message.contains("base64"));
+        assert!(!message.contains("@font-face"));
     }
 }

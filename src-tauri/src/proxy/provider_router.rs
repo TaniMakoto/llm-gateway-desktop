@@ -10,6 +10,7 @@ use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerC
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// 供应商路由器
@@ -18,6 +19,9 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// Provider 临时冷却表（典型来源：HTTP 429 / Retry-After）。
+    /// 与熔断器分离：限流/配额耗尽不等价于服务故障。
+    cooldowns: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl ProviderRouter {
@@ -26,7 +30,52 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            cooldowns: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    fn provider_key(app_type: &str, provider_id: &str) -> String {
+        format!("{app_type}:{provider_id}")
+    }
+
+    /// 暂时把 Provider 从调度候选中移除；重复冷却只延长、不缩短已有期限。
+    pub async fn cooldown_provider(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        duration: Duration,
+    ) {
+        let until = Instant::now() + duration.max(Duration::from_secs(1));
+        let key = Self::provider_key(app_type, provider_id);
+        let mut cooldowns = self.cooldowns.write().await;
+        cooldowns
+            .entry(key)
+            .and_modify(|existing| {
+                if until > *existing {
+                    *existing = until;
+                }
+            })
+            .or_insert(until);
+    }
+
+    /// Provider 是否仍处于临时冷却；到期记录会惰性清理。
+    pub async fn is_provider_cooled_down(&self, provider_id: &str, app_type: &str) -> bool {
+        let key = Self::provider_key(app_type, provider_id);
+        let now = Instant::now();
+        let mut cooldowns = self.cooldowns.write().await;
+        match cooldowns.get(&key).copied() {
+            Some(until) if until > now => true,
+            Some(_) => {
+                cooldowns.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    pub async fn clear_provider_cooldown(&self, provider_id: &str, app_type: &str) {
+        let key = Self::provider_key(app_type, provider_id);
+        self.cooldowns.write().await.remove(&key);
     }
 
     /// 选择可用的供应商（支持故障转移）
@@ -117,6 +166,12 @@ impl ProviderRouter {
     /// 注意：调用方必须在请求结束后通过 `record_result()` 释放 HalfOpen 名额，
     /// 否则会导致该 Provider 长时间无法进入探测状态。
     pub async fn allow_provider_request(&self, provider_id: &str, app_type: &str) -> AllowResult {
+        if self.is_provider_cooled_down(provider_id, app_type).await {
+            return AllowResult {
+                allowed: false,
+                used_half_open_permit: false,
+            };
+        }
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
         breaker.allow_request().await
@@ -173,6 +228,7 @@ impl ProviderRouter {
     pub async fn reset_provider_breaker(&self, provider_id: &str, app_type: &str) {
         let circuit_key = format!("{app_type}:{provider_id}");
         self.reset_circuit_breaker(&circuit_key).await;
+        self.clear_provider_cooldown(provider_id, app_type).await;
     }
 
     /// 仅释放 HalfOpen permit，不影响健康统计（neutral 接口）
@@ -335,6 +391,24 @@ mod tests {
 
         let breaker = router.get_or_create_circuit_breaker("claude:test").await;
         assert!(breaker.allow_request().await.allowed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_rate_limit_cooldown_blocks_admission_until_cleared() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let router = ProviderRouter::new(db);
+
+        router
+            .cooldown_provider("p1", "claude", Duration::from_secs(30))
+            .await;
+        assert!(router.is_provider_cooled_down("p1", "claude").await);
+        assert!(!router.allow_provider_request("p1", "claude").await.allowed);
+
+        router.clear_provider_cooldown("p1", "claude").await;
+        assert!(!router.is_provider_cooled_down("p1", "claude").await);
+        assert!(router.allow_provider_request("p1", "claude").await.allowed);
     }
 
     #[tokio::test]

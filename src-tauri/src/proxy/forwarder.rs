@@ -35,10 +35,45 @@ use futures::StreamExt;
 use http::Extensions;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::Manager;
 use tokio::sync::RwLock;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
+const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(30);
+const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn retry_after_duration(headers: &http::HeaderMap) -> Duration {
+    let Some(raw) = headers
+        .get(http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return DEFAULT_RATE_LIMIT_COOLDOWN;
+    };
+
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Duration::from_secs(seconds.max(1)).min(MAX_RATE_LIMIT_COOLDOWN);
+    }
+
+    let parsed_date = chrono::DateTime::parse_from_rfc2822(raw)
+        .map(|date| date.with_timezone(&chrono::Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%a, %d %b %Y %H:%M:%S GMT")
+                .ok()
+                .map(|date| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(date, chrono::Utc))
+        });
+    if let Some(date) = parsed_date {
+        let seconds = (date - chrono::Utc::now())
+            .num_seconds()
+            .max(1) as u64;
+        return Duration::from_secs(seconds).min(MAX_RATE_LIMIT_COOLDOWN);
+    }
+
+    DEFAULT_RATE_LIMIT_COOLDOWN
+}
 
 fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
     let authorization = headers
@@ -553,23 +588,37 @@ impl RequestForwarder {
     ) -> Option<ForwardError> {
         // Provider 错误：本家上游/网络确实出问题，下一家 provider 可能可用 → 继续故障转移。
         // 客户端错误：整流后请求仍违法，下一家也修不好 → 直接返回。
+        let rate_limited = matches!(
+            &retry_err,
+            ProxyError::UpstreamError { status: 429, .. }
+        );
         let is_provider_error = match &retry_err {
             ProxyError::Timeout(_) | ProxyError::ForwardFailed(_) => true,
-            ProxyError::UpstreamError { status, .. } => *status >= 500,
+            ProxyError::UpstreamError { status, .. } => *status == 429 || *status >= 500,
             _ => false,
         };
 
         if is_provider_error {
-            let _ = self
-                .router
-                .record_result(
-                    &provider.id,
-                    app_type_str,
-                    used_half_open_permit,
-                    false,
-                    Some(retry_err.to_string()),
-                )
-                .await;
+            if rate_limited {
+                self.router
+                    .release_permit_neutral(
+                        &provider.id,
+                        app_type_str,
+                        used_half_open_permit,
+                    )
+                    .await;
+            } else {
+                let _ = self
+                    .router
+                    .record_result(
+                        &provider.id,
+                        app_type_str,
+                        used_half_open_permit,
+                        false,
+                        Some(retry_err.to_string()),
+                    )
+                    .await;
+            }
             {
                 let mut status = self.status.write().await;
                 status.last_error = Some(format!(
@@ -708,6 +757,20 @@ impl RequestForwarder {
                     self.max_attempts
                 );
                 break;
+            }
+
+            // 429 / 配额冷却与熔断器是两个维度。即使单 Provider 模式绕过熔断器，
+            // 也应尊重上游明确要求的 Retry-After，避免形成紧密重试环。
+            if self
+                .router
+                .is_provider_cooled_down(&provider.id, app_type_str)
+                .await
+            {
+                log::debug!(
+                    "[{app_type_str}] Provider {} is temporarily rate-limit cooled down; skipping",
+                    provider.id
+                );
+                continue;
             }
 
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
@@ -1160,17 +1223,34 @@ impl RequestForwarder {
 
                     match category {
                         ErrorCategory::Retryable => {
-                            // 可重试：真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度
-                            let _ = self
-                                .router
-                                .record_result(
-                                    &provider.id,
-                                    app_type_str,
-                                    used_half_open_permit,
-                                    false,
-                                    Some(e.to_string()),
-                                )
-                                .await;
+                            let rate_limited = matches!(
+                                &e,
+                                ProxyError::UpstreamError { status: 429, .. }
+                            );
+                            if rate_limited {
+                                // 429 表示当前配额/速率窗口不可用，不等价于上游服务故障。
+                                // cooldown 已在读取响应头时写入，这里只释放 HalfOpen permit，
+                                // 不累计 circuit breaker / provider_health 的失败计数。
+                                self.router
+                                    .release_permit_neutral(
+                                        &provider.id,
+                                        app_type_str,
+                                        used_half_open_permit,
+                                    )
+                                    .await;
+                            } else {
+                                // 真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度。
+                                let _ = self
+                                    .router
+                                    .record_result(
+                                        &provider.id,
+                                        app_type_str,
+                                        used_half_open_permit,
+                                        false,
+                                        Some(e.to_string()),
+                                    )
+                                    .await;
+                            }
 
                             {
                                 let mut status = self.status.write().await;
@@ -1235,11 +1315,11 @@ impl RequestForwarder {
         }
 
         if attempted_providers == 0 {
-            // providers 列表非空，但全部被熔断器拒绝（典型：HalfOpen 探测名额被占用）
+            // providers 列表非空，但全部被熔断器或限流冷却拒绝。
             {
                 let mut status = self.status.write().await;
                 status.failed_requests += 1;
-                status.last_error = Some("所有供应商暂时不可用（熔断器限制）".to_string());
+                status.last_error = Some("所有供应商暂时不可用（熔断器/限流冷却）".to_string());
                 if status.total_requests > 0 {
                     status.success_rate =
                         (status.success_requests as f32 / status.total_requests as f32) * 100.0;
@@ -2397,6 +2477,18 @@ impl RequestForwarder {
             Ok((response, resolved_claude_api_format, outbound_model))
         } else {
             let status_code = status.as_u16();
+            if status_code == 429 {
+                let cooldown = retry_after_duration(response.headers());
+                self.router
+                    .cooldown_provider(&provider.id, app_type.as_str(), cooldown)
+                    .await;
+                log::warn!(
+                    "[{}] Provider {} returned HTTP 429; cooling it down for {}s",
+                    app_type.as_str(),
+                    provider.id,
+                    cooldown.as_secs()
+                );
+            }
             // 错误响应同样可能被上游压缩（content-encoding）。reqwest 未启用任何
             // 自动解压 feature，这里拿到的是原始字节；不解压的话，压缩过的错误体会
             // 在 from_utf8 处变成非 UTF-8 而被丢弃，隐藏掉上游的限流/鉴权等详情。
@@ -3825,6 +3917,23 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::time::Duration;
+
+    #[test]
+    fn retry_after_seconds_are_honored_and_bounded() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("90"));
+        assert_eq!(retry_after_duration(&headers), Duration::from_secs(90));
+
+        headers.insert("retry-after", HeaderValue::from_static("999999"));
+        assert_eq!(retry_after_duration(&headers), MAX_RATE_LIMIT_COOLDOWN);
+    }
+
+    #[test]
+    fn malformed_retry_after_uses_short_default() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("not-a-date"));
+        assert_eq!(retry_after_duration(&headers), DEFAULT_RATE_LIMIT_COOLDOWN);
+    }
 
     fn test_provider_with_type(provider_type: Option<&str>) -> Provider {
         test_provider_with_id("provider-1", provider_type)
