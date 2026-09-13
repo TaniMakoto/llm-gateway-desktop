@@ -2018,6 +2018,17 @@ function ModelTestModal({
   const scrollRef = useRef<HTMLDivElement>(null);
   const initialLoad = useRef(false);
 
+  // 关闭弹窗时可能还有一帧增量在排队，取消掉，避免回调在卸载后才触发。
+  useEffect(
+    () => () => {
+      if (streamFrameRef.current !== null) {
+        cancelAnimationFrame(streamFrameRef.current);
+        streamFrameRef.current = null;
+      }
+    },
+    [],
+  );
+
   useEffect(() => {
     if (!initialLoad.current) {
       initialLoad.current = true;
