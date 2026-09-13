@@ -1,9 +1,9 @@
 //! 会话亲和（Session Affinity）
 //!
 //! 把一段对话绑定到固定的上游 provider，让同一会话的后续请求继续落到同一家：
-//! prompt / KV cache 命中率显著提升，不同上游对同一段历史的处理差异也不会再造成行为抖动。
+//! prompt / KV cache 命中率显著提升，不同上游对同一段历史处理方式的差异也不会再造成行为抖动。
 //!
-//! 语义移植自 CPA 的 `SessionAffinitySelector`（`sdk/cliproxy/auth/selector.go`），
+//! 语义移植自 CPA 的会话亲和选择器（`sdk/cliproxy/auth/selector.go`），
 //! 但只保留我们需要的部分——我们的模型是「一行 provider = 一个凭证」，没有凭证池层级，
 //! 所以没有 auth / model 两级调度，只做「会话 → provider」一层映射。
 //!
@@ -11,8 +11,11 @@
 //!
 //! - **绑定优先于配置顺序**：命中绑定时先试被绑定的 provider；它不可用则回退重选并重新绑定。
 //!   这不计入「故障转移」统计——亲和是偏好层，不是故障转移。
-//! - **`get` 不续期**：只有 [`SessionAffinityStore::touch`] / `get_and_refresh` 才刷新 TTL。
-//!   否则打开一个陈旧标签页就能让早已过期的绑定永远活下去。
+//! - **`get` 不续期**：查询本身延长绑定寿命的话，一个反复打开陈旧标签页的客户端
+//!   就能让早已不该存在的绑定一直活下去。绑定寿命只由成功请求延长。
+//! - **成功时用 `bind` 而不是「仅续期」**：故障转移后会话必须能改绑到新的健康上游，
+//!   「仅当仍指向同一家才续期」的操作在这里会变成空操作，会话再也绑不回去。
+//!   这与 CPA `Touch`（「刷新已有序列，或在它是新扩展时绑定」）在单层模型下的行为一致。
 //! - **`compare_and_delete`**：失败时仅当当前映射仍指向那个 provider 才解除，
 //!   避免删掉另一个请求刚重新建立的绑定。
 //! - **容量有界**：写入时先清过期项，仍然满则淘汰最久未访问的一条。
@@ -38,7 +41,7 @@ struct Binding {
     provider_id: String,
     /// 过期时刻
     expires_at: Instant,
-    /// 最近一次续期 / 访问（仅用于容量淘汰的取舍）
+    /// 最近一次绑定 / 续期（仅用于容量淘汰的取舍）
     last_access: Instant,
 }
 
@@ -56,15 +59,12 @@ impl Binding {
 /// 会话 → provider 绑定表
 ///
 /// 见模块文档。[`SessionAffinityStore::get`] 只读不续期，
-/// 续期要靠 [`SessionAffinityStore::touch`]（成功时调用）或
-/// [`SessionAffinityStore::get_and_refresh`]。
+/// 寿命由 [`SessionAffinityStore::bind`]（成功转发时调用）延长。
 #[derive(Debug)]
 pub struct SessionAffinityStore {
     bindings: HashMap<String, Binding>,
     ttl: Duration,
     capacity: usize,
-    hits: u64,
-    misses: u64,
 }
 
 impl Default for SessionAffinityStore {
@@ -80,8 +80,6 @@ impl SessionAffinityStore {
             bindings: HashMap::new(),
             ttl,
             capacity: capacity.max(1),
-            hits: 0,
-            misses: 0,
         }
     }
 
@@ -92,22 +90,11 @@ impl SessionAffinityStore {
         self.get_at(session_id, Instant::now())
     }
 
-    /// 查询绑定并续期（命中后延长 TTL）
-    pub fn get_and_refresh(&mut self, session_id: &str) -> Option<String> {
-        self.get_and_refresh_at(session_id, Instant::now())
-    }
-
-    /// 建立 / 覆盖绑定
+    /// 建立 / 覆盖绑定，并刷新 TTL
+    ///
+    /// 成功转发后调用。同时承担「首次建立」「故障转移后改绑」「续期」三种职责。
     pub fn bind(&mut self, session_id: &str, provider_id: &str) {
         self.bind_at(session_id, provider_id, Instant::now());
-    }
-
-    /// 成功转发后调用：仅当映射仍指向该 provider 时续期
-    ///
-    /// 返回是否续期成功。`false` 说明这条绑定已经被别的请求改写或已过期，
-    /// 此时不应该把这次成功当成「亲和命中」记账。
-    pub fn touch(&mut self, session_id: &str, provider_id: &str) -> bool {
-        self.touch_at(session_id, provider_id, Instant::now())
     }
 
     /// 失败时调用：仅当映射仍指向该 provider 才解除绑定
@@ -128,39 +115,18 @@ impl SessionAffinityStore {
         matched
     }
 
-    /// 显式解除绑定（忽略当前指向哪一家）
-    pub fn remove(&mut self, session_id: &str) -> Option<String> {
-        self.bindings.remove(session_id).map(|b| b.provider_id)
-    }
-
-    /// 清空
-    pub fn clear(&mut self) {
-        self.bindings.clear();
-    }
-
-    /// 当前绑定条数（含尚未被清理的过期项）
+    /// 绑定条数（含尚未被清理的过期项）
+    ///
+    /// 只给测试用：生产代码从不读它，放出来会让 release 构建多一个永远为 0 的调用点。
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.bindings.len()
     }
 
-    /// 是否为空
+    /// 是否为空（与 [`Self::len`] 一样，仅测试内省用）
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
-    }
-
-    /// 命中次数（`get` / `get_and_refresh` 命中即计）
-    pub fn hits(&self) -> u64 {
-        self.hits
-    }
-
-    /// 未命中次数
-    pub fn misses(&self) -> u64 {
-        self.misses
-    }
-
-    /// 清掉所有已过期绑定，返回清理条数
-    pub fn sweep_expired(&mut self) -> usize {
-        self.sweep_expired_at(Instant::now())
     }
 
     // ------------------------------------------------------------------
@@ -179,54 +145,9 @@ impl SessionAffinityStore {
             self.bindings.remove(session_id);
         }
 
-        let found = self
-            .bindings
+        self.bindings
             .get(session_id)
-            .map(|binding| binding.provider_id.clone());
-
-        match found {
-            Some(provider_id) => {
-                self.hits += 1;
-                Some(provider_id)
-            }
-            None => {
-                self.misses += 1;
-                None
-            }
-        }
-    }
-
-    fn get_and_refresh_at(&mut self, session_id: &str, now: Instant) -> Option<String> {
-        let ttl = self.ttl;
-
-        let expired = self
-            .bindings
-            .get(session_id)
-            .map(|binding| binding.is_expired(now))
-            .unwrap_or(false);
-
-        if expired {
-            self.bindings.remove(session_id);
-        }
-
-        let found = match self.bindings.get_mut(session_id) {
-            Some(binding) => {
-                binding.refresh(now, ttl);
-                Some(binding.provider_id.clone())
-            }
-            None => None,
-        };
-
-        match found {
-            Some(provider_id) => {
-                self.hits += 1;
-                Some(provider_id)
-            }
-            None => {
-                self.misses += 1;
-                None
-            }
-        }
+            .map(|binding| binding.provider_id.clone())
     }
 
     fn bind_at(&mut self, session_id: &str, provider_id: &str, now: Instant) {
@@ -251,18 +172,6 @@ impl SessionAffinityStore {
                 binding.refresh(now, ttl);
                 binding
             });
-    }
-
-    fn touch_at(&mut self, session_id: &str, provider_id: &str, now: Instant) -> bool {
-        let ttl = self.ttl;
-
-        match self.bindings.get_mut(session_id) {
-            Some(binding) if binding.provider_id == provider_id && !binding.is_expired(now) => {
-                binding.refresh(now, ttl);
-                true
-            }
-            _ => false,
-        }
     }
 
     fn sweep_expired_at(&mut self, now: Instant) -> usize {
@@ -314,8 +223,7 @@ mod tests {
         let mut store = store();
 
         assert_eq!(store.get("nope"), None);
-        assert_eq!(store.hits(), 0);
-        assert_eq!(store.misses(), 1);
+        assert!(store.is_empty());
     }
 
     #[test]
@@ -330,17 +238,18 @@ mod tests {
             .is_some());
         // 原本的到期时刻之后：必须已经过期
         assert_eq!(store.get_at("s1", now + TTL + Duration::from_secs(1)), None);
+        // 过期项在查询时被就地丢弃
         assert!(store.is_empty());
     }
 
     #[test]
-    fn test_get_and_refresh_extends_ttl() {
+    fn test_bind_refreshes_ttl() {
         let mut store = store();
         let now = Instant::now();
 
         store.bind_at("s1", "provider-a", now);
         let later = now + TTL - Duration::from_secs(1);
-        assert!(store.get_and_refresh_at("s1", later).is_some());
+        store.bind_at("s1", "provider-a", later);
 
         // 从续期时刻起重新计时，所以原到期时刻之后仍然有效
         assert!(store
@@ -351,40 +260,6 @@ mod tests {
             store.get_at("s1", later + TTL + Duration::from_secs(1)),
             None
         );
-    }
-
-    #[test]
-    fn test_touch_only_refreshes_matching_provider() {
-        let mut store = store();
-        let now = Instant::now();
-
-        store.bind_at("s1", "provider-a", now);
-
-        assert!(!store.touch_at("s1", "provider-b", now));
-        // 不匹配的 touch 不该续期
-        assert_eq!(store.get_at("s1", now + TTL + Duration::from_secs(1)), None);
-    }
-
-    #[test]
-    fn test_touch_refreshes_ttl() {
-        let mut store = store();
-        let now = Instant::now();
-
-        store.bind_at("s1", "provider-a", now);
-        let later = now + TTL - Duration::from_secs(1);
-        assert!(store.touch_at("s1", "provider-a", later));
-        assert!(store
-            .get_at("s1", now + TTL + Duration::from_secs(1))
-            .is_some());
-    }
-
-    #[test]
-    fn test_touch_ignores_expired_binding() {
-        let mut store = store();
-        let now = Instant::now();
-
-        store.bind_at("s1", "provider-a", now);
-        assert!(!store.touch_at("s1", "provider-a", now + TTL + Duration::from_secs(1)));
     }
 
     #[test]
@@ -426,11 +301,9 @@ mod tests {
 
         store.bind_at("s1", "provider-a", now);
         store.bind_at("s2", "provider-b", now + Duration::from_secs(1));
-        // 续期 s1 使其成为最近访问的一条 —— 注意只有 refresh 会更新 last_access，
-        // 普通的 `get` 不会，所以这里必须用 get_and_refresh_at 来表达「s1 更活跃」
-        assert!(store
-            .get_and_refresh_at("s1", now + Duration::from_secs(2))
-            .is_some());
+        // 重新绑定 s1 使其成为最近访问的一条 —— 只有 bind 会更新 last_access，
+        // 普通的 `get` 不会，所以这里用 bind_at 来表达「s1 更活跃」
+        store.bind_at("s1", "provider-a", now + Duration::from_secs(2));
 
         store.bind_at("s3", "provider-c", now + Duration::from_secs(3));
 
@@ -473,6 +346,7 @@ mod tests {
         store.bind("s1", "provider-a");
         store.bind("s1", "provider-b");
 
+        // 容量为 1：若改绑先去「腾位置」，被淘汰的会是 s1 自己，改绑就白做了
         assert_eq!(store.len(), 1);
         assert_eq!(store.get("s1").as_deref(), Some("provider-b"));
     }
@@ -484,48 +358,5 @@ mod tests {
         store.bind("s1", "provider-a");
 
         assert_eq!(store.get("s1").as_deref(), Some("provider-a"));
-    }
-
-    #[test]
-    fn test_sweep_expired_drops_old_entries() {
-        let mut store = store();
-        let now = Instant::now();
-
-        store.bind_at("s1", "provider-a", now);
-        store.bind_at("s2", "provider-b", now + TTL);
-
-        assert_eq!(
-            store.sweep_expired_at(now + TTL + Duration::from_secs(1)),
-            1
-        );
-        assert_eq!(store.len(), 1);
-        assert_eq!(
-            store
-                .get_at("s2", now + TTL + Duration::from_secs(1))
-                .as_deref(),
-            Some("provider-b")
-        );
-    }
-
-    #[test]
-    fn test_remove_returns_previous_provider() {
-        let mut store = store();
-
-        store.bind("s1", "provider-a");
-
-        assert_eq!(store.remove("s1").as_deref(), Some("provider-a"));
-        assert_eq!(store.remove("s1"), None);
-    }
-
-    #[test]
-    fn test_hits_and_misses_are_counted() {
-        let mut store = store();
-
-        store.bind("s1", "provider-a");
-        let _ = store.get("s1");
-        let _ = store.get("missing");
-
-        assert_eq!(store.hits(), 1);
-        assert_eq!(store.misses(), 1);
     }
 }

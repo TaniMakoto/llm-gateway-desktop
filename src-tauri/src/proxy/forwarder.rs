@@ -198,7 +198,7 @@ pub struct RequestForwarder {
     session_client_provided: bool,
     /// 会话亲和的键；`None` 表示这个会话没有稳定标识，不做任何绑定
     ///
-    /// 见 [`RequestForwarder::order_by_session_affinity`]。
+    /// 见 [`RequestForwarder::order_providers`]。
     session_affinity_key: Option<String>,
     /// 共享的会话 → provider 绑定表
     session_affinity: Arc<RwLock<SessionAffinityStore>>,
@@ -253,8 +253,8 @@ impl RequestForwarder {
     async fn session_affinity_preference(&self, providers: &[Provider]) -> Option<String> {
         let key = self.session_affinity_key.clone()?;
 
-        // 用 `get` 而非 `get_and_refresh`：查询本身不续期。
-        // 绑定寿命只由真正成功的请求（`bind`）延长，
+        // `SessionAffinityStore::get` 只读不续期：查询本身不延长绑定寿命。
+        // 寿命只由真正成功的请求（`bind`）延长，
         // 否则一个陈旧客户端反复发起失败请求也能让绑定一直活着。
         let preferred = {
             let mut store = self.session_affinity.write().await;
