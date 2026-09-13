@@ -7,8 +7,7 @@
 //! 支持从客户端请求中提取 Session ID，用于关联同一对话的多个请求：
 //! - Claude: 从 `metadata.user_id` (格式: `user_xxx_session_yyy`) 或 `metadata.session_id` 提取
 //! - Codex: 从 headers 中的 `session_id` / `x-session-id` 或 `metadata.session_id` 提取
-//! - 内容哈希: 客户端未提供任何标识时，用「系统提示 + 首条用户消息 + 首条助手消息」
-//!   派生稳定键（见 [`SessionIdResult::is_stable`]）
+//! - 内容哈希: 客户端未提供任何标识时，用「系统提示 + 首条用户消息」派生稳定键
 //! - 其他: 生成新的 UUID（一次性，不可用于路由粘性）
 
 use axum::http::HeaderMap;
@@ -200,7 +199,7 @@ pub enum SessionIdSource {
     MetadataSessionId,
     /// 从 headers 提取 (Codex)
     Header,
-    /// 由请求内容派生（系统提示 + 首条用户消息 + 首条助手消息）
+    /// 由请求内容派生（系统提示 + 首条用户消息）
     ContentHash,
     /// 新生成
     Generated,
@@ -251,9 +250,8 @@ impl SessionIdResult {
 /// ## 内容哈希兜底
 ///
 /// 客户端一个标识都不发时（例如直接 curl，或未携带会话头的第三方客户端），
-/// 用「系统提示 + 首条用户消息 + 首条助手消息」派生一个稳定键
-/// （[`compute_content_session_hash`]）。这样同一段对话的后续轮次会落到同一个键上，
-/// 而不是每轮换一个随机 UUID —— 路由粘性与前缀缓存都依赖这一点。
+/// 用「系统提示 + 首条用户消息」派生稳定键。只取对话开头不会随历史增长变化的
+/// 锚点，确保首轮与后续轮次使用同一个 affinity key。
 ///
 /// 内容里连首条用户消息都找不到时（空 body / 只有 system），退回生成随机 UUID，
 /// 其结果 [`SessionIdResult::is_stable`] 为 `false`，调用方据此跳过粘性路由。
@@ -416,31 +414,20 @@ fn extract_from_content(body: &serde_json::Value) -> Option<SessionIdResult> {
     })
 }
 
-/// 由「系统提示 + 首条用户消息 + 首条助手消息」派生稳定会话键
+/// 由「系统提示 + 首条用户消息」派生稳定会话键。
 ///
-/// 客户端不提供任何会话标识时的兜底。只取对话的**开头**三要素，因此：
-/// - 同一段对话的后续轮次（历史在增长）会得到同一个键
-/// - 不同对话即使前几轮相似，只要首条用户消息不同就会分开
-///
-/// 返回 `content_` 前缀 + SHA-256 前 32 位十六进制，便于在日志里一眼认出这是派生键。
+/// 返回 `content_` 前缀 + SHA-256 前 32 位十六进制。
 /// 找不到首条用户消息时返回 `None` —— 没有锚点就不是可识别的对话，调用方应退回随机 UUID。
 pub(super) fn compute_content_session_hash(body: &serde_json::Value) -> Option<String> {
     // 首条用户消息是锚点：没有它就无法把「同一段对话」区分出来
     let user_text = first_role_text(body, "user")?;
     let system_text = extract_system_text(body).unwrap_or_default();
-    let assistant_text = first_role_text(body, "assistant").unwrap_or_default();
-
     let mut hasher = Sha256::new();
     hasher.update(system_text.as_bytes());
-    // 0x1f = ASCII Unit Separator，避免「a|b」与「a」「|b」拼接歧义
     hasher.update(b"\x1f");
     hasher.update(user_text.as_bytes());
-    hasher.update(b"\x1f");
-    hasher.update(assistant_text.as_bytes());
-
     let digest = hasher.finalize();
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-
     Some(format!("content_{}", &hex[..32]))
 }
 
@@ -830,7 +817,7 @@ mod tests {
             "messages": [{"role": "user", "content": "Explain Rust ownership."}]
         });
 
-        // 后续轮次：历史变长，但开头三要素没变
+        // 后续轮次：历史增长，但稳定锚点不变。
         let later_turn = json!({
             "model": "claude-3-5-sonnet",
             "system": "You are a helpful assistant.",
