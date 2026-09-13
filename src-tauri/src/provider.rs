@@ -535,6 +535,15 @@ pub struct ProviderMeta {
     /// 用于多账号支持，关联到特定的 GitHub 账号
     #[serde(rename = "githubAccountId", skip_serializing_if = "Option::is_none")]
     pub github_account_id: Option<String>,
+    /// 请求体录制（统一网关诊断功能）：None=关闭；Some(list) 开启，
+    /// list 为空表示录制该 (供应商, 协议) 下所有模型，非空则只录制
+    /// 出站模型名命中的条目。由统一网关的供应商/模型级开关物化而来。
+    #[serde(
+        default,
+        rename = "bodyRecordingModels",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub body_recording_models: Option<Vec<String>>,
 }
 
 /// 解析 Provider 级自定义 User-Agent 字符串（单一真理来源）。

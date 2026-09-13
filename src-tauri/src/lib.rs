@@ -476,6 +476,7 @@ pub fn run() {
             gateway::fetch_gateway_provider_models,
             gateway::generate_gateway_api_key,
             gateway::test_gateway_model,
+            gateway::open_gateway_recording_folder,
             commands::get_startup_preferences,
             commands::get_auto_launch_status,
             commands::set_auto_launch,

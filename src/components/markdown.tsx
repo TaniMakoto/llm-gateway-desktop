@@ -1,0 +1,78 @@
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeHighlight from "rehype-highlight";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
+
+/**
+ * 将 LaTeX 风格的定界符规范化为 remark-math 认识的 `$` / `$$`。
+ *
+ * 上游模型常用 `\[ … \]`（块级）和 `\( … \)`（行内），但 remark-math 只识别
+ * `$`。若不转换，CommonMark 会把定界符里的反斜杠当转义符吃掉，只剩裸 `[` `(`，
+ * 而 `\sum`、`\frac` 等命令原样漏出成纯文本——这正是渲染错乱的根因。
+ *
+ * 两点必须保护：
+ * - `\\`（aligned 环境里的换行）不能被误当作定界符拆开；用单次交替匹配把 `\\`
+ *   先吃掉即可，避免在第二个反斜杠上错误命中 `\(` / `\)`。
+ * - 代码块 / 行内代码里字面出现的 `\[`、`\(` 等不应被改写（否则会破坏“如何书写
+ *   LaTeX”这类回复）；先把它们占位抠出，转换后再还原。
+ */
+function normalizeMathDelimiters(src: string): string {
+  const protectedSpans: string[] = [];
+  const stash = (m: string): string => {
+    protectedSpans.push(m);
+    return ` MATHSKIP${protectedSpans.length - 1} `;
+  };
+
+  // 抠出围栏代码块（``` / ~~~）与行内代码（`…`），避免其中的定界符被改写。
+  const withoutCode = src.replace(
+    /```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`/g,
+    stash,
+  );
+
+  // 单次交替匹配：`\\` 优先命中并原样保留，其余定界符转成 `$` / `$$`。
+  const converted = withoutCode.replace(/\\\\|\\\[|\\\]|\\\(|\\\)/g, (m) => {
+    switch (m) {
+      case "\\[":
+      case "\\]":
+        return "$$";
+      case "\\(":
+      case "\\)":
+        return "$";
+      default:
+        return m; // "\\" 换行原样保留
+    }
+  });
+
+  // 还原被保护的代码片段。
+  return converted.replace(
+    / MATHSKIP(\d+) /g,
+    (_, i: string) => protectedSpans[Number(i)],
+  );
+}
+
+/**
+ * 将模型回复的 Markdown 源文本渲染为富文本。
+ *
+ * - remark-gfm：表格、删除线、任务列表、自动链接。
+ * - remark-math + rehype-katex：数学公式（KaTeX），配合上面的定界符规范化，
+ *   支持上游常见的 `\[ … \]` / `\( … \)` 写法。
+ * - rehype-highlight：代码块语法高亮（hljs 仅负责给 token 加 class，配色由
+ *   `.markdown-body` 下的样式表按主题变量统一提供，见 src/index.css）。
+ *
+ * react-markdown 默认对原始 HTML 转义，不使用 dangerouslySetInnerHTML，
+ * 因此可安全渲染来自上游模型的文本。
+ */
+export function Markdown({ content }: { content: string }) {
+  return (
+    <div className="markdown-body">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex, rehypeHighlight]}
+      >
+        {normalizeMathDelimiters(content)}
+      </ReactMarkdown>
+    </div>
+  );
+}
