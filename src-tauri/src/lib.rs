@@ -474,6 +474,7 @@ pub fn run() {
             gateway::start_gateway,
             gateway::stop_gateway,
             gateway::fetch_gateway_provider_models,
+            gateway::resolve_gateway_model_capabilities,
             gateway::generate_gateway_api_key,
             gateway::test_gateway_model,
             gateway::open_gateway_recording_folder,

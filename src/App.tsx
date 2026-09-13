@@ -67,6 +67,13 @@ interface ModelMetadata {
   reasoningLevels?: string[];
 }
 
+interface ModelCapabilityResolution {
+  canonicalModel: string;
+  metadata: ModelMetadata;
+  defaultReasoningLevel?: string | null;
+  source: "registry" | "unknown" | string;
+}
+
 interface GatewayProvider {
   id: string;
   name: string;
@@ -102,6 +109,7 @@ interface GatewayConfig {
   autoStart: boolean;
   enableLogging: boolean;
   routingPolicies: Record<string, RoutingPolicy>;
+  modelRegistryOverrides: Record<string, ModelMetadata>;
   providers: GatewayProvider[];
 }
 
@@ -224,6 +232,7 @@ const DEFAULT_CONFIG: GatewayConfig = {
   autoStart: false,
   enableLogging: true,
   routingPolicies: {},
+  modelRegistryOverrides: {},
   providers: [],
 };
 
@@ -236,6 +245,60 @@ const formatLabels: Record<ApiFormat, string> = {
 /** 模型测试页"最大输出 token"输入框的上限，需与后端 gateway.rs 的
  *  TEST_MAX_OUTPUT_TOKENS_MAX 保持一致。 */
 const MODEL_TEST_MAX_OUTPUT_TOKENS = 131072;
+const COMMON_REASONING_LEVELS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+const COMMON_MODALITIES = ["text", "image", "audio", "video", "pdf"];
+
+function hasMetadataValues(metadata?: ModelMetadata): boolean {
+  return Boolean(
+    metadata?.contextLength ||
+      metadata?.maxOutputTokens ||
+      (metadata?.inputModalities?.length ?? 0) > 0 ||
+      (metadata?.reasoningLevels?.length ?? 0) > 0,
+  );
+}
+
+function firstNonEmptyList(...values: Array<string[] | undefined>): string[] {
+  return values.find((value) => (value?.length ?? 0) > 0) ?? [];
+}
+
+function conservativeListCapability(
+  routeOverride: string[] | undefined,
+  provider: string[] | undefined,
+  registry: string[] | undefined,
+): string[] {
+  if ((routeOverride?.length ?? 0) > 0) return routeOverride ?? [];
+  const base = registry ?? [];
+  if ((provider?.length ?? 0) === 0) return base;
+  if (base.length === 0) return provider ?? [];
+  return base.filter((value) => provider?.includes(value));
+}
+
+function conservativeLimit(
+  override: number | null | undefined,
+  provider: number | null | undefined,
+  registry: number | null | undefined,
+): number | null {
+  if (override != null) return override;
+  const known = [provider, registry].filter(
+    (value): value is number => typeof value === "number" && value > 0,
+  );
+  return known.length > 0 ? Math.min(...known) : null;
+}
+
+function formatTokenLimit(value?: number | null): string {
+  if (!value) return "未知";
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2).replace(/\.00$/, "")}M`;
+  if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
+  return String(value);
+}
 
 function newId(prefix: string): string {
   const value =
@@ -651,6 +714,22 @@ function App() {
     }));
   };
 
+  const patchModelRegistryOverride = (
+    canonicalModel: string,
+    metadata: ModelMetadata | null,
+  ) => {
+    if (!canonicalModel) return;
+    setConfig((current) => {
+      const next = { ...(current.modelRegistryOverrides ?? {}) };
+      if (!metadata || !hasMetadataValues(metadata)) {
+        delete next[canonicalModel];
+      } else {
+        next[canonicalModel] = metadata;
+      }
+      return { ...current, modelRegistryOverrides: next };
+    });
+  };
+
   const moveProvider = (index: number, direction: -1 | 1) => {
     setConfig((current) => {
       const next = structuredClone(current);
@@ -1018,6 +1097,8 @@ function App() {
                     <ProviderRoutesCard
                       key={provider.id}
                       provider={provider}
+                      modelRegistryOverrides={config.modelRegistryOverrides ?? {}}
+                      onPatchModelRegistryOverride={patchModelRegistryOverride}
                       runtime={providerRuntime.filter(
                         (entry) => entry.sourceProviderId === provider.id,
                       )}
@@ -1408,6 +1489,8 @@ function App() {
 
 function ProviderRoutesCard({
   provider,
+  modelRegistryOverrides,
+  onPatchModelRegistryOverride,
   runtime,
   providerIndex,
   canMoveUp,
@@ -1423,6 +1506,11 @@ function ProviderRoutesCard({
   onTestModel,
 }: {
   provider: GatewayProvider;
+  modelRegistryOverrides: Record<string, ModelMetadata>;
+  onPatchModelRegistryOverride: (
+    canonicalModel: string,
+    metadata: ModelMetadata | null,
+  ) => void;
   runtime: ProviderRuntimeStatus[];
   providerIndex: number;
   canMoveUp: boolean;
@@ -1528,6 +1616,8 @@ function ProviderRoutesCard({
                 key={index}
                 model={model}
                 cachedModels={provider.cachedModels ?? []}
+                modelRegistryOverrides={modelRegistryOverrides}
+                onPatchModelRegistryOverride={onPatchModelRegistryOverride}
                 onPatch={(patch) => onPatchModel(index, patch)}
                 onRemove={() => onRemoveModel(index)}
                 onTest={() => onTestModel(index)}
@@ -1548,7 +1638,6 @@ function ProviderRoutesCard({
                   onAddModel({
                     upstreamModel: cached.id,
                     alias: cached.id,
-                    metadata: cached.metadata,
                   })
                 }
                 title={cached.displayName || cached.id}
@@ -1566,17 +1655,135 @@ function ProviderRoutesCard({
 function ModelRow({
   model,
   cachedModels,
+  modelRegistryOverrides,
+  onPatchModelRegistryOverride,
   onPatch,
   onRemove,
   onTest,
 }: {
   model: ProviderModel;
   cachedModels: CachedModel[];
+  modelRegistryOverrides: Record<string, ModelMetadata>;
+  onPatchModelRegistryOverride: (
+    canonicalModel: string,
+    metadata: ModelMetadata | null,
+  ) => void;
   onPatch: (patch: Partial<ProviderModel>) => void;
   onRemove: () => void;
   onTest: () => void;
 }) {
   const listId = useMemo(() => `cached-models-${newId("dl")}`, []);
+  const [registryCapability, setRegistryCapability] =
+    useState<ModelCapabilityResolution | null>(null);
+  const [showMetadataOverride, setShowMetadataOverride] = useState(false);
+  const cachedMetadata = useMemo(
+    () => cachedModels.find((item) => item.id === model.upstreamModel)?.metadata,
+    [cachedModels, model.upstreamModel],
+  );
+
+  useEffect(() => {
+    const modelId = model.upstreamModel.trim();
+    if (!modelId) {
+      setRegistryCapability(null);
+      return;
+    }
+    let cancelled = false;
+    void invoke<ModelCapabilityResolution>("resolve_gateway_model_capabilities", {
+      request: { modelId, apiFormat: model.apiFormat },
+    })
+      .then((result) => {
+        if (!cancelled) setRegistryCapability(result);
+      })
+      .catch(() => {
+        if (!cancelled) setRegistryCapability(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [model.upstreamModel, model.apiFormat]);
+
+  const canonicalModel = registryCapability?.canonicalModel ?? "";
+  const globalOverride = canonicalModel
+    ? modelRegistryOverrides[canonicalModel]
+    : undefined;
+  const globalAutoMetadata: ModelMetadata = {
+    contextLength:
+      registryCapability?.metadata.contextLength ?? cachedMetadata?.contextLength ?? null,
+    maxOutputTokens:
+      registryCapability?.metadata.maxOutputTokens ?? cachedMetadata?.maxOutputTokens ?? null,
+    inputModalities: firstNonEmptyList(
+      registryCapability?.metadata.inputModalities,
+      cachedMetadata?.inputModalities,
+    ),
+    reasoningLevels: firstNonEmptyList(
+      registryCapability?.metadata.reasoningLevels,
+      cachedMetadata?.reasoningLevels,
+    ),
+  };
+  const registryOrGlobalMetadata: ModelMetadata = {
+    contextLength: globalOverride?.contextLength ?? globalAutoMetadata.contextLength,
+    maxOutputTokens:
+      globalOverride?.maxOutputTokens ?? globalAutoMetadata.maxOutputTokens,
+    inputModalities: firstNonEmptyList(
+      globalOverride?.inputModalities,
+      globalAutoMetadata.inputModalities,
+    ),
+    reasoningLevels: firstNonEmptyList(
+      globalOverride?.reasoningLevels,
+      globalAutoMetadata.reasoningLevels,
+    ),
+  };
+
+  const effectiveMetadata: ModelMetadata = {
+    contextLength: conservativeLimit(
+      model.metadata?.contextLength,
+      cachedMetadata?.contextLength,
+      registryOrGlobalMetadata.contextLength,
+    ),
+    maxOutputTokens: conservativeLimit(
+      model.metadata?.maxOutputTokens,
+      cachedMetadata?.maxOutputTokens,
+      registryOrGlobalMetadata.maxOutputTokens,
+    ),
+    inputModalities: conservativeListCapability(
+      model.metadata?.inputModalities,
+      cachedMetadata?.inputModalities,
+      registryOrGlobalMetadata.inputModalities,
+    ),
+    reasoningLevels: conservativeListCapability(
+      model.metadata?.reasoningLevels,
+      cachedMetadata?.reasoningLevels,
+      registryOrGlobalMetadata.reasoningLevels,
+    ),
+  };
+  const legacyRouteOverrideActive = hasMetadataValues(model.metadata);
+  const globalOverrideActive = hasMetadataValues(globalOverride);
+  const capabilityKnown = hasMetadataValues(effectiveMetadata);
+  const capabilitySource = legacyRouteOverrideActive
+    ? "旧路由覆盖"
+    : globalOverrideActive
+      ? "全局覆盖"
+    : hasMetadataValues(cachedMetadata)
+      ? "自动（上游 / Registry）"
+      : registryCapability?.source === "registry"
+        ? "Registry"
+        : "未知";
+  const reasoningChoices = Array.from(
+    new Set([
+      ...COMMON_REASONING_LEVELS,
+      ...(effectiveMetadata.reasoningLevels ?? []),
+      ...(globalOverride?.reasoningLevels ?? []),
+    ]),
+  );
+
+  const patchGlobalMetadata = (patch: Partial<ModelMetadata>) => {
+    if (!canonicalModel) return;
+    onPatchModelRegistryOverride(canonicalModel, {
+      ...globalOverride,
+      ...patch,
+    });
+  };
+
   return (
     <div className="flex flex-wrap items-center gap-2">
       <input
@@ -1592,10 +1799,9 @@ function ModelRow({
           value={model.upstreamModel}
           onChange={(event) => {
             const upstreamModel = event.target.value;
-            const cached = cachedModels.find((item) => item.id === upstreamModel);
             onPatch({
               upstreamModel,
-              ...(cached?.metadata ? { metadata: cached.metadata } : {}),
+              metadata: {},
             });
           }}
           placeholder="上游真实模型名"
@@ -1661,76 +1867,157 @@ function ModelRow({
           <Trash2 className="h-4 w-4" />
         </button>
       </div>
-      <div className="basis-full rounded-md border bg-muted/30 p-2">
-        <div className="mb-2 text-[11px] font-medium text-muted-foreground">
-          模型 Metadata（提供给本地 API 客户端）
+      <div className="basis-full rounded-md border bg-muted/30 p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="text-[11px] font-medium text-muted-foreground">模型能力</div>
+          <span className="tag text-[10px]">{capabilitySource}</span>
+          {registryCapability?.canonicalModel && (
+            <span className="text-[10px] text-muted-foreground">
+              canonical: {registryCapability.canonicalModel}
+            </span>
+          )}
+          <button
+            className="ml-auto text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+            onClick={() => setShowMetadataOverride((value) => !value)}
+          >
+            {showMetadataOverride ? "收起高级覆盖" : "高级覆盖"}
+          </button>
         </div>
-        <div className="grid gap-2 md:grid-cols-4">
-          <input
-            className="input font-mono"
-            type="number"
-            min={1}
-            value={model.metadata?.contextLength ?? ""}
-            onChange={(event) => {
-              const value = event.target.value.trim();
-              onPatch({
-                metadata: {
-                  ...model.metadata,
-                  contextLength: value ? Number(value) : null,
-                },
-              });
-            }}
-            placeholder="context length，如 1000000"
-          />
-          <input
-            className="input font-mono"
-            type="number"
-            min={1}
-            value={model.metadata?.maxOutputTokens ?? ""}
-            onChange={(event) => {
-              const value = event.target.value.trim();
-              onPatch({
-                metadata: {
-                  ...model.metadata,
-                  maxOutputTokens: value ? Number(value) : null,
-                },
-              });
-            }}
-            placeholder="max output，如 128000"
-          />
-          <input
-            className="input font-mono"
-            value={(model.metadata?.inputModalities ?? []).join(", ")}
-            onChange={(event) =>
-              onPatch({
-                metadata: {
-                  ...model.metadata,
-                  inputModalities: event.target.value
-                    .split(",")
-                    .map((value) => value.trim())
-                    .filter(Boolean),
-                },
-              })
-            }
-            placeholder="input: text, image"
-          />
-          <input
-            className="input font-mono"
-            value={(model.metadata?.reasoningLevels ?? []).join(", ")}
-            onChange={(event) =>
-              onPatch({
-                metadata: {
-                  ...model.metadata,
-                  reasoningLevels: event.target.value
-                    .split(",")
-                    .map((value) => value.trim())
-                    .filter(Boolean),
-                },
-              })
-            }
-            placeholder="reasoning: low, medium, high"
-          />
-        </div>
+
+        {capabilityKnown ? (
+          <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+            <span className="tag">Context {formatTokenLimit(effectiveMetadata.contextLength)}</span>
+            <span className="tag">Max output {formatTokenLimit(effectiveMetadata.maxOutputTokens)}</span>
+            {(effectiveMetadata.inputModalities ?? []).map((value) => (
+              <span key={`modality-${value}`} className="tag">{value}</span>
+            ))}
+            {(effectiveMetadata.reasoningLevels ?? []).length > 0 && (
+              <span className="flex flex-wrap items-center gap-1">
+                <span className="text-muted-foreground">Reasoning:</span>
+                {(effectiveMetadata.reasoningLevels ?? []).map((value) => (
+                  <span key={`reasoning-${value}`} className="tag">{value}</span>
+                ))}
+              </span>
+            )}
+            {registryCapability?.defaultReasoningLevel &&
+              (effectiveMetadata.reasoningLevels ?? []).includes(
+                registryCapability.defaultReasoningLevel,
+              ) && (
+              <span className="tag">默认 reasoning: {registryCapability.defaultReasoningLevel}</span>
+              )}
+          </div>
+        ) : (
+          <div className="mt-2 text-[11px] text-muted-foreground">
+            Registry 与上游模型列表都没有提供能力信息。可以保持未知，只有确实需要时再使用高级覆盖。
+          </div>
+        )}
+
+        {showMetadataOverride && (
+          <div className="mt-3 space-y-3 rounded-md border bg-background p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-[11px] text-muted-foreground">
+                全局覆盖 canonical 模型 {canonicalModel || "（尚未识别）"}；所有 Provider 共用。正常情况下保持自动即可。
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {globalOverrideActive && canonicalModel && (
+                  <button
+                    className="secondary-button"
+                    onClick={() => onPatchModelRegistryOverride(canonicalModel, null)}
+                  >
+                    清除全局覆盖
+                  </button>
+                )}
+                {legacyRouteOverrideActive && (
+                  <button
+                    className="secondary-button"
+                    onClick={() => onPatch({ metadata: {} })}
+                    title="旧版配置可能在每条路由保存 metadata；清除后改用全局 Registry"
+                  >
+                    清除旧路由覆盖
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="grid gap-2 md:grid-cols-2">
+              <input
+                className="input font-mono"
+                type="number"
+                min={1}
+                value={globalOverride?.contextLength ?? ""}
+                onChange={(event) => {
+                  const value = event.target.value.trim();
+                  patchGlobalMetadata({ contextLength: value ? Number(value) : null });
+                }}
+                placeholder={`Context；Registry ${formatTokenLimit(globalAutoMetadata.contextLength)}`}
+              />
+              <input
+                className="input font-mono"
+                type="number"
+                min={1}
+                value={globalOverride?.maxOutputTokens ?? ""}
+                onChange={(event) => {
+                  const value = event.target.value.trim();
+                  patchGlobalMetadata({ maxOutputTokens: value ? Number(value) : null });
+                }}
+                placeholder={`Max output；Registry ${formatTokenLimit(globalAutoMetadata.maxOutputTokens)}`}
+              />
+            </div>
+
+            <div>
+              <div className="mb-1 text-[11px] text-muted-foreground">输入模态</div>
+              <div className="flex flex-wrap gap-1">
+                {COMMON_MODALITIES.map((value) => {
+                  const current = globalOverride?.inputModalities?.length
+                    ? globalOverride.inputModalities
+                    : globalAutoMetadata.inputModalities ?? [];
+                  const active = current.includes(value);
+                  return (
+                    <button
+                      key={value}
+                      className={cn("tag", active && "bg-primary text-primary-foreground")}
+                      onClick={() => {
+                        const next = active
+                          ? current.filter((item) => item !== value)
+                          : [...current, value];
+                        patchGlobalMetadata({ inputModalities: next });
+                      }}
+                    >
+                      {value}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div>
+              <div className="mb-1 text-[11px] text-muted-foreground">
+                Reasoning 档位（无需手写）
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {reasoningChoices.map((value) => {
+                  const current = globalOverride?.reasoningLevels?.length
+                    ? globalOverride.reasoningLevels
+                    : globalAutoMetadata.reasoningLevels ?? [];
+                  const active = current.includes(value);
+                  return (
+                    <button
+                      key={value}
+                      className={cn("tag", active && "bg-primary text-primary-foreground")}
+                      onClick={() => {
+                        const next = active
+                          ? current.filter((item) => item !== value)
+                          : [...current, value];
+                        patchGlobalMetadata({ reasoningLevels: next });
+                      }}
+                    >
+                      {value}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

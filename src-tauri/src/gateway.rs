@@ -36,6 +36,36 @@ pub enum GatewayApiFormat {
     Anthropic,
 }
 
+#[tauri::command]
+pub fn resolve_gateway_model_capabilities(
+    request: ResolveGatewayModelCapabilitiesRequest,
+) -> GatewayModelCapabilityResolution {
+    let canonical_model = crate::model_capabilities::canonical_model_key(&request.model_id);
+    let format = request.api_format.unwrap_or(GatewayApiFormat::OpenaiChat);
+    match crate::model_capabilities::registry_model_capabilities(
+        &request.model_id,
+        Some(format.as_wire_name()),
+    ) {
+        Some(capabilities) => GatewayModelCapabilityResolution {
+            canonical_model,
+            metadata: GatewayModelMetadata {
+                context_length: capabilities.context_length,
+                max_output_tokens: capabilities.max_output_tokens,
+                input_modalities: capabilities.input_modalities,
+                reasoning_levels: capabilities.reasoning_levels,
+            },
+            default_reasoning_level: capabilities.default_reasoning_level,
+            source: "registry".to_string(),
+        },
+        None => GatewayModelCapabilityResolution {
+            canonical_model,
+            metadata: GatewayModelMetadata::default(),
+            default_reasoning_level: None,
+            source: "unknown".to_string(),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayRoutingPolicy {
@@ -60,6 +90,28 @@ impl GatewayApiFormat {
             Self::Anthropic => "anthropic",
         }
     }
+}
+
+fn effective_provider_model_metadata(
+    provider: &GatewayProvider,
+    model: &GatewayProviderModel,
+    registry_overrides: &HashMap<String, GatewayModelMetadata>,
+) -> GatewayModelMetadata {
+    let mut metadata = GatewayModelMetadata::default();
+    metadata.apply_registry_fallback(&model.upstream_model, model.api_format);
+    let canonical = crate::model_capabilities::canonical_model_key(&model.upstream_model);
+    if let Some(global_override) = registry_overrides.get(&canonical) {
+        metadata.apply_explicit_override(global_override);
+    }
+    if let Some(cached) = provider
+        .cached_models
+        .iter()
+        .find(|cached| cached.id == model.upstream_model)
+    {
+        metadata.constrain_with_provider_metadata(&cached.metadata);
+    }
+    metadata.apply_explicit_override(&model.metadata);
+    metadata
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,8 +152,11 @@ impl GatewayModelMetadata {
         merge_known_intersection(&mut self.reasoning_levels, &other.reasoning_levels);
     }
 
-    fn apply_registry_fallback(&mut self, model_id: &str) {
-        let Some(fallback) = crate::model_capabilities::registry_model_capabilities(model_id) else {
+    fn apply_registry_fallback(&mut self, model_id: &str, api_format: GatewayApiFormat) {
+        let Some(fallback) = crate::model_capabilities::registry_model_capabilities(
+            model_id,
+            Some(api_format.as_wire_name()),
+        ) else {
             return;
         };
         if self.context_length.is_none() {
@@ -115,6 +170,59 @@ impl GatewayModelMetadata {
         }
         if self.reasoning_levels.is_empty() {
             self.reasoning_levels = fallback.reasoning_levels;
+        }
+    }
+
+    /// Provider `/models` metadata constrains the canonical model capability.
+    /// Missing provider fields mean "not reported" and therefore do not erase
+    /// registry knowledge; explicit provider limits are treated conservatively.
+    fn constrain_with_provider_metadata(&mut self, provider: &Self) {
+        if let Some(value) = provider.context_length {
+            self.context_length = Some(
+                self.context_length
+                    .map(|current| current.min(value))
+                    .unwrap_or(value),
+            );
+        }
+        if let Some(value) = provider.max_output_tokens {
+            self.max_output_tokens = Some(
+                self.max_output_tokens
+                    .map(|current| current.min(value))
+                    .unwrap_or(value),
+            );
+        }
+        if !provider.input_modalities.is_empty() {
+            if self.input_modalities.is_empty() {
+                self.input_modalities = provider.input_modalities.clone();
+            } else {
+                self.input_modalities
+                    .retain(|value| provider.input_modalities.contains(value));
+            }
+        }
+        if !provider.reasoning_levels.is_empty() {
+            if self.reasoning_levels.is_empty() {
+                self.reasoning_levels = provider.reasoning_levels.clone();
+            } else {
+                self.reasoning_levels
+                    .retain(|value| provider.reasoning_levels.contains(value));
+            }
+        }
+    }
+
+    /// Legacy/per-route metadata is retained only as an explicit advanced
+    /// override. Empty fields continue to inherit automatic capability data.
+    fn apply_explicit_override(&mut self, override_metadata: &Self) {
+        if override_metadata.context_length.is_some() {
+            self.context_length = override_metadata.context_length;
+        }
+        if override_metadata.max_output_tokens.is_some() {
+            self.max_output_tokens = override_metadata.max_output_tokens;
+        }
+        if !override_metadata.input_modalities.is_empty() {
+            self.input_modalities = override_metadata.input_modalities.clone();
+        }
+        if !override_metadata.reasoning_levels.is_empty() {
+            self.reasoning_levels = override_metadata.reasoning_levels.clone();
         }
     }
 }
@@ -211,6 +319,10 @@ pub struct GatewayConfig {
     pub enable_logging: bool,
     #[serde(default)]
     pub routing_policies: HashMap<String, GatewayRoutingPolicy>,
+    /// Canonical model-level manual corrections. These apply across all
+    /// providers/routes that resolve to the same canonical model id.
+    #[serde(default)]
+    pub model_registry_overrides: HashMap<String, GatewayModelMetadata>,
     #[serde(default)]
     pub providers: Vec<GatewayProvider>,
 }
@@ -225,6 +337,7 @@ impl Default for GatewayConfig {
             auto_start: false,
             enable_logging: true,
             routing_policies: HashMap::new(),
+            model_registry_overrides: HashMap::new(),
             providers: Vec::new(),
         }
     }
@@ -257,6 +370,23 @@ pub struct GatewayProviderRuntimeStatus {
 pub struct GatewayModelFetchResult {
     pub models: Vec<GatewayCachedModel>,
     pub fetched_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveGatewayModelCapabilitiesRequest {
+    pub model_id: String,
+    #[serde(default)]
+    pub api_format: Option<GatewayApiFormat>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelCapabilityResolution {
+    pub canonical_model: String,
+    pub metadata: GatewayModelMetadata,
+    pub default_reasoning_level: Option<String>,
+    pub source: String,
 }
 
 fn default_true() -> bool {
@@ -464,6 +594,7 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
         auto_start: legacy.auto_start,
         enable_logging: legacy.enable_logging,
         routing_policies: HashMap::new(),
+        model_registry_overrides: HashMap::new(),
         providers,
     })
 }
@@ -477,6 +608,18 @@ fn normalize_config(mut config: GatewayConfig) -> GatewayConfig {
         .filter_map(|(alias, policy)| {
             let alias = alias.trim().to_string();
             (!alias.is_empty()).then_some((alias, policy))
+        })
+        .collect();
+    config.model_registry_overrides = config
+        .model_registry_overrides
+        .into_iter()
+        .filter_map(|(model_id, mut metadata)| {
+            let canonical = crate::model_capabilities::canonical_model_key(&model_id);
+            if canonical.is_empty() {
+                return None;
+            }
+            normalize_model_metadata(&mut metadata);
+            Some((canonical, metadata))
         })
         .collect();
     for provider in &mut config.providers {
@@ -508,27 +651,29 @@ fn normalize_config(mut config: GatewayConfig) -> GatewayConfig {
         for model in &mut provider.models {
             model.alias = model.alias.trim().to_string();
             model.upstream_model = model.upstream_model.trim().to_string();
-            model.metadata.input_modalities = model
-                .metadata
-                .input_modalities
-                .drain(..)
-                .map(|value| value.trim().to_ascii_lowercase())
-                .filter(|value| !value.is_empty())
-                .collect();
-            model.metadata.input_modalities.sort();
-            model.metadata.input_modalities.dedup();
-            model.metadata.reasoning_levels = model
-                .metadata
-                .reasoning_levels
-                .drain(..)
-                .map(|value| value.trim().to_ascii_lowercase())
-                .filter(|value| !value.is_empty())
-                .collect();
-            model.metadata.reasoning_levels.sort();
-            model.metadata.reasoning_levels.dedup();
+            normalize_model_metadata(&mut model.metadata);
         }
     }
     config
+}
+
+fn normalize_model_metadata(metadata: &mut GatewayModelMetadata) {
+    metadata.input_modalities = metadata
+        .input_modalities
+        .drain(..)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    metadata.input_modalities.sort();
+    metadata.input_modalities.dedup();
+    metadata.reasoning_levels = metadata
+        .reasoning_levels
+        .drain(..)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    metadata.reasoning_levels.sort();
+    metadata.reasoning_levels.dedup();
 }
 
 pub fn routing_policy_for_alias(config: &GatewayConfig, alias: &str) -> GatewayRoutingPolicy {
@@ -1013,8 +1158,11 @@ pub fn openai_models_response(db: &Database) -> Result<Value, AppError> {
             if !model.enabled {
                 continue;
             }
-            let mut effective_metadata = model.metadata.clone();
-            effective_metadata.apply_registry_fallback(&model.upstream_model);
+            let effective_metadata = effective_provider_model_metadata(
+                provider,
+                model,
+                &config.model_registry_overrides,
+            );
             aliases
                 .entry(model.alias.clone())
                 .and_modify(|metadata| metadata.merge_failover_capabilities(&effective_metadata))
@@ -1202,21 +1350,16 @@ pub async fn fetch_gateway_provider_models(
     )
     .await?
     .into_iter()
-    .map(|model| {
-        let id = model.id;
-        let mut metadata = GatewayModelMetadata {
+    .map(|model| GatewayCachedModel {
+        id: model.id,
+        owned_by: model.owned_by,
+        display_name: model.display_name,
+        metadata: GatewayModelMetadata {
             context_length: model.context_length,
             max_output_tokens: model.max_output_tokens,
             input_modalities: model.input_modalities,
             reasoning_levels: model.reasoning_levels,
-        };
-        metadata.apply_registry_fallback(&id);
-        GatewayCachedModel {
-            id,
-            owned_by: model.owned_by,
-            display_name: model.display_name,
-            metadata,
-        }
+        },
     })
     .collect();
 
@@ -2655,12 +2798,95 @@ mod tests {
             reasoning_levels: vec!["high".to_string()],
         };
 
-        metadata.apply_registry_fallback("gpt-5.5");
+        metadata.apply_registry_fallback("gpt-5.5", GatewayApiFormat::OpenaiResponses);
 
         assert_eq!(metadata.context_length, Some(123_456));
         assert_eq!(metadata.max_output_tokens, Some(7_777));
         assert_eq!(metadata.input_modalities, vec!["text", "image"]);
         assert_eq!(metadata.reasoning_levels, vec!["high"]);
+    }
+
+    #[test]
+    fn effective_metadata_uses_registry_then_provider_constraints_then_explicit_override() {
+        let mut provider = provider_with_format("p", GatewayApiFormat::OpenaiResponses);
+        provider.cached_models = vec![GatewayCachedModel {
+            id: "gpt-5.6-sol".to_string(),
+            owned_by: None,
+            display_name: None,
+            metadata: GatewayModelMetadata {
+                context_length: Some(200_000),
+                max_output_tokens: None,
+                input_modalities: vec!["text".to_string()],
+                reasoning_levels: vec!["high".to_string(), "max".to_string()],
+            },
+        }];
+        provider.models[0].upstream_model = "gpt-5.6-sol".to_string();
+        provider.models[0].api_format = GatewayApiFormat::OpenaiResponses;
+
+        let effective = effective_provider_model_metadata(
+            &provider,
+            &provider.models[0],
+            &HashMap::new(),
+        );
+        assert_eq!(effective.context_length, Some(200_000));
+        assert_eq!(effective.max_output_tokens, Some(128_000));
+        assert_eq!(effective.input_modalities, vec!["text"]);
+        assert_eq!(effective.reasoning_levels, vec!["high", "max"]);
+
+        provider.models[0].metadata = GatewayModelMetadata {
+            context_length: Some(999_999),
+            max_output_tokens: None,
+            input_modalities: Vec::new(),
+            reasoning_levels: vec!["medium".to_string()],
+        };
+        let overridden = effective_provider_model_metadata(
+            &provider,
+            &provider.models[0],
+            &HashMap::new(),
+        );
+        assert_eq!(overridden.context_length, Some(999_999));
+        assert_eq!(overridden.max_output_tokens, Some(128_000));
+        assert_eq!(overridden.input_modalities, vec!["text"]);
+        assert_eq!(overridden.reasoning_levels, vec!["medium"]);
+    }
+
+    #[test]
+    fn global_registry_override_applies_across_provider_routes() {
+        let mut provider = provider_with_format("p", GatewayApiFormat::OpenaiResponses);
+        provider.models[0].upstream_model = "openai/gpt-5.6-sol-high".to_string();
+        provider.models[0].api_format = GatewayApiFormat::OpenaiResponses;
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "gpt-5.6-sol".to_string(),
+            GatewayModelMetadata {
+                context_length: Some(500_000),
+                max_output_tokens: None,
+                input_modalities: Vec::new(),
+                reasoning_levels: vec!["high".to_string(), "max".to_string()],
+            },
+        );
+
+        let effective =
+            effective_provider_model_metadata(&provider, &provider.models[0], &overrides);
+        assert_eq!(effective.context_length, Some(500_000));
+        assert_eq!(effective.max_output_tokens, Some(128_000));
+        assert_eq!(effective.reasoning_levels, vec!["high", "max"]);
+    }
+
+    #[test]
+    fn capability_resolver_returns_canonical_model_and_default_reasoning() {
+        let resolved = resolve_gateway_model_capabilities(
+            ResolveGatewayModelCapabilitiesRequest {
+                model_id: "openai/gpt-5.6-sol-high".to_string(),
+                api_format: Some(GatewayApiFormat::OpenaiResponses),
+            },
+        );
+
+        assert_eq!(resolved.canonical_model, "gpt-5.6-sol");
+        assert_eq!(resolved.source, "registry");
+        assert_eq!(resolved.metadata.context_length, Some(1_050_000));
+        assert_eq!(resolved.default_reasoning_level.as_deref(), Some("medium"));
     }
 
     fn provider_with_format(id: &str, format: GatewayApiFormat) -> GatewayProvider {
