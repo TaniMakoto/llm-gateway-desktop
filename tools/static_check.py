@@ -213,6 +213,7 @@ def main() -> None:
         "src-tauri/tauri.conf.json",
         "src-tauri/tauri.windows.conf.json",
         "src-tauri/capabilities/default.json",
+        "src-tauri/src/resources/model_capabilities.json",
     ]:
         json.loads((ROOT / rel).read_text(encoding="utf-8"))
         print(f"PASS  parse {rel}")

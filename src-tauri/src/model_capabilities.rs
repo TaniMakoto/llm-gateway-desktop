@@ -1,4 +1,39 @@
+use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistryFile {
+    #[serde(default)]
+    models: Vec<RegistryEntry>,
+    #[serde(default)]
+    text_only_models: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistryEntry {
+    ids: Vec<String>,
+    context_length: Option<u64>,
+    max_output_tokens: Option<u64>,
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
+    reasoning_levels: Vec<String>,
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    protocol_reasoning_levels: HashMap<String, Vec<String>>,
+}
+
+fn registry_file() -> &'static RegistryFile {
+    static REGISTRY: OnceLock<RegistryFile> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        serde_json::from_str(include_str!("resources/model_capabilities.json"))
+            .expect("bundled model_capabilities.json must be valid")
+    })
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RegistryModelCapabilities {
@@ -20,121 +55,21 @@ pub(crate) fn registry_model_capabilities(
     let tail = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
     let base_tail = strip_known_reasoning_suffix(tail);
 
-    if matches!(
-        base_tail,
-        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
-    ) {
+    if let Some(entry) = registry_file()
+        .models
+        .iter()
+        .find(|entry| entry.ids.iter().any(|id| id == base_tail))
+    {
+        let reasoning_levels = api_format
+            .and_then(|format| entry.protocol_reasoning_levels.get(format))
+            .cloned()
+            .unwrap_or_else(|| entry.reasoning_levels.clone());
         return Some(RegistryModelCapabilities {
-            context_length: Some(1_050_000),
-            max_output_tokens: Some(128_000),
-            input_modalities: vec!["text".to_string(), "image".to_string()],
-            reasoning_levels: vec![
-                "none".to_string(),
-                "low".to_string(),
-                "medium".to_string(),
-                "high".to_string(),
-                "xhigh".to_string(),
-                "max".to_string(),
-            ],
-            default_reasoning_level: Some("medium".to_string()),
-        });
-    }
-
-    if base_tail == "gpt-6-astra" {
-        return Some(RegistryModelCapabilities {
-            context_length: Some(1_050_000),
-            max_output_tokens: Some(128_000),
-            input_modalities: vec!["text".to_string(), "image".to_string()],
-            reasoning_levels: vec![
-                "low".to_string(),
-                "medium".to_string(),
-                "high".to_string(),
-                "xhigh".to_string(),
-                "max".to_string(),
-            ],
-            default_reasoning_level: None,
-        });
-    }
-
-    if matches!(base_tail, "gemini-3.7-flash" | "gemini-3.8-flash") {
-        return Some(RegistryModelCapabilities {
-            context_length: Some(1_000_000),
-            max_output_tokens: Some(65_536),
-            input_modalities: vec![
-                "text".to_string(),
-                "image".to_string(),
-                "video".to_string(),
-                "audio".to_string(),
-                "pdf".to_string(),
-            ],
-            reasoning_levels: vec![
-                "low".to_string(),
-                "medium".to_string(),
-                "high".to_string(),
-            ],
-            default_reasoning_level: Some("medium".to_string()),
-        });
-    }
-
-    if matches!(base_tail, "claude-opus-4-8" | "claude-opus-5") {
-        return Some(RegistryModelCapabilities {
-            context_length: Some(1_000_000),
-            max_output_tokens: Some(128_000),
-            input_modalities: vec![
-                "text".to_string(),
-                "image".to_string(),
-                "pdf".to_string(),
-            ],
-            reasoning_levels: vec![
-                "low".to_string(),
-                "medium".to_string(),
-                "high".to_string(),
-                "xhigh".to_string(),
-                "max".to_string(),
-            ],
-            default_reasoning_level: Some("high".to_string()),
-        });
-    }
-
-    if matches!(
-        base_tail,
-        "deepseek-v4-flash" | "deepseek-v4-pro" | "deepseek-v4-flash-vision-exp"
-    ) {
-        let reasoning_levels = if api_format == Some("openai_responses") {
-            vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-        } else {
-            vec!["low", "high", "max"]
-        };
-        let mut input_modalities = vec!["text".to_string()];
-        if base_tail == "deepseek-v4-flash-vision-exp" {
-            input_modalities.push("image".to_string());
-        }
-        return Some(RegistryModelCapabilities {
-            context_length: Some(1_048_576),
-            max_output_tokens: Some(384_000),
-            input_modalities,
-            reasoning_levels: reasoning_levels
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            default_reasoning_level: Some("high".to_string()),
-        });
-    }
-
-    // Mirrors src/resources/gpt5_5_template.json, the project's bundled Codex
-    // catalog source for GPT-5.5.
-    if base_tail == "gpt-5.5" {
-        return Some(RegistryModelCapabilities {
-            context_length: Some(272_000),
-            max_output_tokens: None,
-            input_modalities: vec!["text".to_string(), "image".to_string()],
-            reasoning_levels: vec![
-                "low".to_string(),
-                "medium".to_string(),
-                "high".to_string(),
-                "xhigh".to_string(),
-            ],
-            default_reasoning_level: None,
+            context_length: entry.context_length,
+            max_output_tokens: entry.max_output_tokens,
+            input_modalities: entry.input_modalities.clone(),
+            reasoning_levels,
+            default_reasoning_level: entry.default_reasoning_level.clone(),
         });
     }
 
@@ -241,40 +176,10 @@ pub(crate) fn image_input_capability_from_modalities(
 pub(crate) fn is_confirmed_text_only_model(model: &str) -> bool {
     let normalized = normalize_model_id(model);
     let tail = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-
-    const CONFIRMED_TAILS: &[&str] = &[
-        "ark-code-latest",
-        "deepseek-chat",
-        "deepseek-reasoner",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-        "glm-5.1",
-        // Exact rather than prefix matching: GLM visual models use a `v`
-        // suffix (for example glm-5.2v), which must remain image-capable.
-        "glm-5.2",
-        "kat-coder",
-        "kat-coder-pro",
-        "kat-coder-pro v1",
-        "kat-coder-pro v2",
-        "kat-coder-pro-v1",
-        "kat-coder-pro-v2",
-        "ling-2.5-1t",
-        "longcat-2.0",
-        "longcat-flash-chat",
-        "minimax-m2.7",
-        "minimax-m2.7-highspeed",
-        "mimo-v2.5-pro",
-        "qwen3-coder-480b",
-        "qwen3-coder-480b-a35b-instruct",
-        "qwen3-coder-flash",
-        "qwen3-coder-next",
-        "qwen3-coder-plus",
-        "step-3.5-flash",
-        "step-3.5-flash-2603",
-        "us.deepseek.r1-v1",
-    ];
-
-    CONFIRMED_TAILS.contains(&tail)
+    registry_file()
+        .text_only_models
+        .iter()
+        .any(|candidate| candidate == tail)
 }
 
 fn declared_model_image_support(settings: &Value, model: &str) -> Option<bool> {
