@@ -29,6 +29,9 @@ pub enum ProxyError {
     #[error("无可用的Provider")]
     NoAvailableProvider,
 
+    #[error("网关过载: {0}")]
+    GatewayOverloaded(String),
+
     #[error("所有供应商已熔断，无可用渠道")]
     AllProvidersCircuitOpen,
 
@@ -126,6 +129,9 @@ impl IntoResponse for ProxyError {
                     }
                     ProxyError::ForwardFailed(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
                     ProxyError::NoAvailableProvider => {
+                        (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
+                    }
+                    ProxyError::GatewayOverloaded(_) => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
                     }
                     ProxyError::AllProvidersCircuitOpen => {

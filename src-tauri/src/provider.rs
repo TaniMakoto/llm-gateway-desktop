@@ -44,6 +44,34 @@ pub struct Provider {
 }
 
 impl Provider {
+    pub fn gateway_source_provider_id(&self) -> &str {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.gateway_source_provider_id.as_deref())
+            .unwrap_or(&self.id)
+    }
+
+    pub fn gateway_max_concurrent_requests(&self) -> u32 {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.gateway_max_concurrent_requests)
+            .unwrap_or(0)
+    }
+
+    pub fn gateway_queue_limit(&self) -> u32 {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.gateway_queue_limit)
+            .unwrap_or(0)
+    }
+
+    pub fn gateway_queue_timeout_ms(&self) -> u64 {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.gateway_queue_timeout_ms)
+            .unwrap_or(0)
+    }
+
     /// 从现有ID创建供应商
     pub fn with_id(
         id: String,
@@ -388,6 +416,28 @@ impl LocalProxyRequestOverrides {
 /// 供应商元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
+    /// Unified gateway source provider id shared by protocol-materialized providers.
+    #[serde(
+        rename = "gatewaySourceProviderId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gateway_source_provider_id: Option<String>,
+    /// Provider-level concurrency cap for the local gateway. 0/None = unlimited.
+    #[serde(
+        rename = "gatewayMaxConcurrentRequests",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gateway_max_concurrent_requests: Option<u32>,
+    #[serde(
+        rename = "gatewayQueueLimit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gateway_queue_limit: Option<u32>,
+    #[serde(
+        rename = "gatewayQueueTimeoutMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gateway_queue_timeout_ms: Option<u64>,
     /// 自定义端点列表（按 URL 去重存储）
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_endpoints: HashMap<String, crate::settings::CustomEndpoint>,

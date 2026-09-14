@@ -1608,6 +1608,7 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::ForwardFailed(_) => "llm_gateway_forward_failed",
         ProxyError::Timeout(_) | ProxyError::StreamIdleTimeout(_) => "llm_gateway_timeout",
         ProxyError::NoAvailableProvider => "llm_gateway_no_available_provider",
+        ProxyError::GatewayOverloaded(_) => "llm_gateway_overloaded",
         ProxyError::AllProvidersCircuitOpen => "llm_gateway_all_providers_circuit_open",
         ProxyError::NoProvidersConfigured => "llm_gateway_no_providers_configured",
         ProxyError::MaxRetriesExceeded => "llm_gateway_max_retries_exceeded",

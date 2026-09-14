@@ -151,19 +151,22 @@ impl RequestContext {
         )
         .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
         {
-            Some((providers, routing_policy)) if !providers.is_empty() => {
+            Some((providers, routing_policy, routing_weights)) if !providers.is_empty() => {
                 let affinity_is_valid = existing_affinity_provider
                     .as_deref()
                     .is_some_and(|bound| providers.iter().any(|provider| provider.id == bound));
                 if affinity_is_valid {
                     providers
                 } else {
+                    let active_provider_counts = state.active_provider_counts.read().await.clone();
                     state
                         .provider_router
                         .apply_gateway_routing_policy(
                             app_type_str,
                             &request_model,
                             routing_policy,
+                            &routing_weights,
+                            &active_provider_counts,
                             providers,
                         )
                         .await

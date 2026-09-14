@@ -419,4 +419,10 @@ impl ProxyServer {
             .provider_cooldown_remaining_seconds(provider_id, app_type)
             .await
     }
+
+    pub fn get_provider_capacity_snapshot(&self, source_provider_id: &str) -> (u32, u32, u32) {
+        self.state
+            .provider_router
+            .provider_capacity_snapshot(source_provider_id)
+    }
 }

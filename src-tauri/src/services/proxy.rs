@@ -2329,6 +2329,17 @@ impl ProxyService {
         }
     }
 
+    pub async fn get_provider_capacity_snapshot(
+        &self,
+        source_provider_id: &str,
+    ) -> (u32, u32, u32) {
+        let server = self.server.read().await;
+        match server.as_ref() {
+            Some(server) => server.get_provider_capacity_snapshot(source_provider_id),
+            None => (0, 0, 0),
+        }
+    }
+
     pub async fn get_provider_cooldown_remaining_seconds(
         &self,
         provider_id: &str,

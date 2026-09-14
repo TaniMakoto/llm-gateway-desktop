@@ -10,9 +10,59 @@ use crate::provider::Provider;
 use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
+
+#[derive(Debug)]
+struct ProviderCapacityState {
+    limit: u32,
+    in_use: u32,
+    waiters: u32,
+    notify: Arc<Notify>,
+}
+
+struct ProviderQueueWaiterGuard {
+    source_provider_id: String,
+    states: Arc<Mutex<HashMap<String, ProviderCapacityState>>>,
+}
+
+impl Drop for ProviderQueueWaiterGuard {
+    fn drop(&mut self) {
+        let mut states = self.states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(state) = states.get_mut(&self.source_provider_id) {
+            state.waiters = state.waiters.saturating_sub(1);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityAcquireError {
+    Full,
+    QueueFull,
+    Timeout,
+}
+
+#[derive(Debug)]
+pub struct ProviderCapacityPermit {
+    source_provider_id: String,
+    states: Arc<Mutex<HashMap<String, ProviderCapacityState>>>,
+}
+
+impl Drop for ProviderCapacityPermit {
+    fn drop(&mut self) {
+        let notify = {
+            let mut states = self.states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            states.get_mut(&self.source_provider_id).map(|state| {
+                state.in_use = state.in_use.saturating_sub(1);
+                state.notify.clone()
+            })
+        };
+        if let Some(notify) = notify {
+            notify.notify_one();
+        }
+    }
+}
 
 /// 供应商路由器
 pub struct ProviderRouter {
@@ -25,6 +75,10 @@ pub struct ProviderRouter {
     cooldowns: Arc<RwLock<HashMap<String, Instant>>>,
     /// Round-robin cursor keyed by app_type + public model alias.
     route_cursors: Arc<RwLock<HashMap<String, usize>>>,
+    /// Smooth weighted round-robin current scores keyed by app_type + alias.
+    weighted_route_scores: Arc<RwLock<HashMap<String, HashMap<String, i64>>>>,
+    /// Source-provider admission state shared across app types and protocol materializations.
+    capacity_states: Arc<Mutex<HashMap<String, ProviderCapacityState>>>,
 }
 
 impl ProviderRouter {
@@ -35,7 +89,123 @@ impl ProviderRouter {
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
             cooldowns: Arc::new(RwLock::new(HashMap::new())),
             route_cursors: Arc::new(RwLock::new(HashMap::new())),
+            weighted_route_scores: Arc::new(RwLock::new(HashMap::new())),
+            capacity_states: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn capacity_state_for_provider<'a>(
+        states: &'a mut HashMap<String, ProviderCapacityState>,
+        provider: &Provider,
+    ) -> (&'a mut ProviderCapacityState, String) {
+        let source_id = provider.gateway_source_provider_id().to_string();
+        let configured_limit = provider.gateway_max_concurrent_requests();
+        let state = states.entry(source_id.clone()).or_insert_with(|| ProviderCapacityState {
+            limit: configured_limit,
+            in_use: 0,
+            waiters: 0,
+            notify: Arc::new(Notify::new()),
+        });
+        state.limit = configured_limit;
+        (state, source_id)
+    }
+
+    pub fn provider_capacity_available(&self, provider: &Provider) -> bool {
+        let limit = provider.gateway_max_concurrent_requests();
+        if limit == 0 {
+            return true;
+        }
+        let mut states = self.capacity_states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (state, _) = Self::capacity_state_for_provider(&mut states, provider);
+        state.in_use < state.limit
+    }
+
+    pub fn try_acquire_provider_capacity(
+        &self,
+        provider: &Provider,
+    ) -> Result<Option<ProviderCapacityPermit>, CapacityAcquireError> {
+        if provider.gateway_max_concurrent_requests() == 0 {
+            return Ok(None);
+        }
+        let source_id = {
+            let mut states = self.capacity_states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (state, source_id) = Self::capacity_state_for_provider(&mut states, provider);
+            if state.in_use >= state.limit {
+                return Err(CapacityAcquireError::Full);
+            }
+            state.in_use = state.in_use.saturating_add(1);
+            source_id
+        };
+        Ok(Some(ProviderCapacityPermit {
+            source_provider_id: source_id,
+            states: self.capacity_states.clone(),
+        }))
+    }
+
+    pub async fn wait_acquire_provider_capacity(
+        &self,
+        provider: &Provider,
+    ) -> Result<Option<ProviderCapacityPermit>, CapacityAcquireError> {
+        if provider.gateway_max_concurrent_requests() == 0 {
+            return Ok(None);
+        }
+
+        let queue_limit = provider.gateway_queue_limit();
+        let timeout = Duration::from_millis(provider.gateway_queue_timeout_ms());
+        let (source_id, notify) = {
+            let mut states = self.capacity_states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (state, source_id) = Self::capacity_state_for_provider(&mut states, provider);
+            if state.in_use < state.limit {
+                state.in_use = state.in_use.saturating_add(1);
+                return Ok(Some(ProviderCapacityPermit {
+                    source_provider_id: source_id,
+                    states: self.capacity_states.clone(),
+                }));
+            }
+            if queue_limit == 0 || state.waiters >= queue_limit {
+                return Err(CapacityAcquireError::QueueFull);
+            }
+            state.waiters = state.waiters.saturating_add(1);
+            (source_id, state.notify.clone())
+        };
+        // Cancellation-safe queue accounting: if this future is dropped because
+        // the client disconnects or the task is aborted, waiter count is still released.
+        let _waiter_guard = ProviderQueueWaiterGuard {
+            source_provider_id: source_id.clone(),
+            states: self.capacity_states.clone(),
+        };
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if timeout.is_zero() || tokio::time::timeout_at(deadline, notify.notified()).await.is_err() {
+                return Err(CapacityAcquireError::Timeout);
+            }
+
+            let acquired = {
+                let mut states = self.capacity_states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (state, _) = Self::capacity_state_for_provider(&mut states, provider);
+                if state.in_use < state.limit {
+                    state.in_use = state.in_use.saturating_add(1);
+                    true
+                } else {
+                    false
+                }
+            };
+            if acquired {
+                return Ok(Some(ProviderCapacityPermit {
+                    source_provider_id: source_id,
+                    states: self.capacity_states.clone(),
+                }));
+            }
+        }
+    }
+
+    pub fn provider_capacity_snapshot(&self, source_provider_id: &str) -> (u32, u32, u32) {
+        let states = self.capacity_states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        states
+            .get(source_provider_id)
+            .map(|state| (state.limit, state.in_use, state.waiters))
+            .unwrap_or((0, 0, 0))
     }
 
     pub async fn provider_cooldown_remaining_seconds(
@@ -108,21 +278,86 @@ impl ProviderRouter {
         app_type: &str,
         alias: &str,
         policy: GatewayRoutingPolicy,
+        weights: &HashMap<String, u32>,
+        active_provider_counts: &HashMap<(String, String), (usize, String)>,
         mut providers: Vec<Provider>,
     ) -> Vec<Provider> {
-        if policy == GatewayRoutingPolicy::Priority || providers.len() <= 1 {
+        if providers.len() <= 1 || policy == GatewayRoutingPolicy::Priority {
             return providers;
         }
 
-        let key = format!("{app_type}:{}", alias.trim());
-        let start = {
-            let mut cursors = self.route_cursors.write().await;
-            let cursor = cursors.entry(key).or_insert(0);
-            let start = *cursor % providers.len();
-            *cursor = (*cursor + 1) % providers.len();
-            start
-        };
-        providers.rotate_left(start);
+        match policy {
+            GatewayRoutingPolicy::Priority => {}
+            GatewayRoutingPolicy::RoundRobin => {
+                let key = format!("{app_type}:{}", alias.trim());
+                let start = {
+                    let mut cursors = self.route_cursors.write().await;
+                    let cursor = cursors.entry(key).or_insert(0);
+                    let start = *cursor % providers.len();
+                    *cursor = (*cursor + 1) % providers.len();
+                    start
+                };
+                providers.rotate_left(start);
+            }
+            GatewayRoutingPolicy::WeightedRoundRobin => {
+                let key = format!("{app_type}:{}", alias.trim());
+                let selected_id = {
+                    let mut all_scores = self.weighted_route_scores.write().await;
+                    let scores = all_scores.entry(key).or_default();
+                    let active_ids: std::collections::HashSet<&str> =
+                        providers.iter().map(|provider| provider.id.as_str()).collect();
+                    scores.retain(|provider_id, _| active_ids.contains(provider_id.as_str()));
+
+                    let mut total_weight = 0i64;
+                    let mut selected: Option<(String, i64)> = None;
+                    for provider in &providers {
+                        let weight = weights
+                            .get(provider.gateway_source_provider_id())
+                            .copied()
+                            .unwrap_or(1)
+                            .max(1) as i64;
+                        total_weight += weight;
+                        let score = scores.entry(provider.id.clone()).or_insert(0);
+                        *score += weight;
+                        if selected
+                            .as_ref()
+                            .is_none_or(|(_, selected_score)| *score > *selected_score)
+                        {
+                            selected = Some((provider.id.clone(), *score));
+                        }
+                    }
+                    if let Some((provider_id, _)) = selected {
+                        if let Some(score) = scores.get_mut(&provider_id) {
+                            *score -= total_weight;
+                        }
+                        Some(provider_id)
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(selected_id) = selected_id {
+                    if let Some(index) = providers.iter().position(|provider| provider.id == selected_id) {
+                        providers.rotate_left(index);
+                    }
+                }
+            }
+            GatewayRoutingPolicy::LeastOutstanding => {
+                providers.sort_by_key(|provider| {
+                    let source_id = provider.gateway_source_provider_id();
+                    active_provider_counts
+                        .iter()
+                        .filter(|((_, materialized_id), _)| {
+                            materialized_id
+                                .rsplit_once("::")
+                                .map(|(source, _)| source == source_id)
+                                .unwrap_or(materialized_id == source_id)
+                        })
+                        .map(|(_, (count, _))| *count)
+                        .sum::<usize>()
+                });
+            }
+        }
         providers
     }
 
@@ -470,12 +705,16 @@ mod tests {
             Provider::with_id("b".to_string(), "B".to_string(), json!({}), None),
             Provider::with_id("c".to_string(), "C".to_string(), json!({}), None),
         ];
+        let weights = HashMap::new();
+        let active = HashMap::new();
 
         let priority = router
             .apply_gateway_routing_policy(
                 "codex",
                 "best-code",
                 GatewayRoutingPolicy::Priority,
+                &weights,
+                &active,
                 providers.clone(),
             )
             .await;
@@ -486,6 +725,8 @@ mod tests {
                 "codex",
                 "best-code",
                 GatewayRoutingPolicy::RoundRobin,
+                &weights,
+                &active,
                 providers.clone(),
             )
             .await;
@@ -494,6 +735,8 @@ mod tests {
                 "codex",
                 "best-code",
                 GatewayRoutingPolicy::RoundRobin,
+                &weights,
+                &active,
                 providers.clone(),
             )
             .await;
@@ -502,6 +745,8 @@ mod tests {
                 "codex",
                 "best-code",
                 GatewayRoutingPolicy::RoundRobin,
+                &weights,
+                &active,
                 providers,
             )
             .await;
@@ -509,6 +754,161 @@ mod tests {
         assert_eq!(first[0].id, "a");
         assert_eq!(second[0].id, "b");
         assert_eq!(third[0].id, "c");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_weighted_round_robin_uses_smooth_5_3_2_distribution() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let router = ProviderRouter::new(db);
+        let providers = vec![
+            Provider::with_id("a".to_string(), "A".to_string(), json!({}), None),
+            Provider::with_id("b".to_string(), "B".to_string(), json!({}), None),
+            Provider::with_id("c".to_string(), "C".to_string(), json!({}), None),
+        ];
+        let weights = HashMap::from([
+            ("a".to_string(), 5),
+            ("b".to_string(), 3),
+            ("c".to_string(), 2),
+        ]);
+        let active = HashMap::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+
+        for _ in 0..10 {
+            let ordered = router
+                .apply_gateway_routing_policy(
+                    "codex",
+                    "best-code",
+                    GatewayRoutingPolicy::WeightedRoundRobin,
+                    &weights,
+                    &active,
+                    providers.clone(),
+                )
+                .await;
+            *counts.entry(ordered[0].id.clone()).or_insert(0) += 1;
+        }
+
+        assert_eq!(counts.get("a").copied(), Some(5));
+        assert_eq!(counts.get("b").copied(), Some(3));
+        assert_eq!(counts.get("c").copied(), Some(2));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_least_outstanding_prefers_lowest_source_provider_load() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let router = ProviderRouter::new(db);
+        let providers = vec![
+            Provider::with_id("a".to_string(), "A".to_string(), json!({}), None),
+            Provider::with_id("b".to_string(), "B".to_string(), json!({}), None),
+            Provider::with_id("c".to_string(), "C".to_string(), json!({}), None),
+        ];
+        let active = HashMap::from([
+            (("codex".to_string(), "a".to_string()), (3usize, "A".to_string())),
+            (("claude".to_string(), "b".to_string()), (1usize, "B".to_string())),
+            (("codex".to_string(), "c".to_string()), (2usize, "C".to_string())),
+        ]);
+        let ordered = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "best-code",
+                GatewayRoutingPolicy::LeastOutstanding,
+                &HashMap::new(),
+                &active,
+                providers,
+            )
+            .await;
+        assert_eq!(ordered[0].id, "b");
+        assert_eq!(ordered[1].id, "c");
+        assert_eq!(ordered[2].id, "a");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_provider_capacity_waits_and_releases_slot() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let router = Arc::new(ProviderRouter::new(db));
+        let mut provider = Provider::with_id(
+            "p1::responses".to_string(),
+            "P1".to_string(),
+            json!({}),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            gateway_source_provider_id: Some("p1".to_string()),
+            gateway_max_concurrent_requests: Some(1),
+            gateway_queue_limit: Some(1),
+            gateway_queue_timeout_ms: Some(1_000),
+            ..Default::default()
+        });
+
+        let first = router
+            .try_acquire_provider_capacity(&provider)
+            .unwrap()
+            .expect("limited provider should return a permit");
+        assert_eq!(
+            router.try_acquire_provider_capacity(&provider).unwrap_err(),
+            CapacityAcquireError::Full
+        );
+
+        let wait_router = router.clone();
+        let wait_provider = provider.clone();
+        let waiter = tokio::spawn(async move {
+            wait_router.wait_acquire_provider_capacity(&wait_provider).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(router.provider_capacity_snapshot("p1"), (1, 1, 1));
+
+        drop(first);
+        let second = waiter
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("queued request should receive the released slot");
+        assert_eq!(router.provider_capacity_snapshot("p1"), (1, 1, 0));
+        drop(second);
+        assert_eq!(router.provider_capacity_snapshot("p1"), (1, 0, 0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_provider_capacity_cancelled_waiter_does_not_leak_queue_slot() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let router = Arc::new(ProviderRouter::new(db));
+        let mut provider = Provider::with_id(
+            "p1::chat".to_string(),
+            "P1".to_string(),
+            json!({}),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            gateway_source_provider_id: Some("p1".to_string()),
+            gateway_max_concurrent_requests: Some(1),
+            gateway_queue_limit: Some(1),
+            gateway_queue_timeout_ms: Some(5_000),
+            ..Default::default()
+        });
+
+        let first = router
+            .try_acquire_provider_capacity(&provider)
+            .unwrap()
+            .expect("limited provider should return a permit");
+        let wait_router = router.clone();
+        let wait_provider = provider.clone();
+        let waiter = tokio::spawn(async move {
+            wait_router.wait_acquire_provider_capacity(&wait_provider).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(router.provider_capacity_snapshot("p1"), (1, 1, 1));
+
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(router.provider_capacity_snapshot("p1"), (1, 1, 0));
+        drop(first);
     }
 
     #[tokio::test]

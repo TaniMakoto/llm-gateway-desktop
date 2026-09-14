@@ -10,7 +10,7 @@ use super::{
     failover_switch::FailoverSwitchManager,
     json_canonical::{canonicalize_value, short_value_hash},
     log_codes::fwd as log_fwd,
-    provider_router::ProviderRouter,
+    provider_router::{CapacityAcquireError, ProviderCapacityPermit, ProviderRouter},
     providers::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
         AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
@@ -125,6 +125,7 @@ pub(crate) struct ActiveConnectionGuard {
     active_provider_counts:
         Arc<RwLock<std::collections::HashMap<(String, String), (usize, String)>>>,
     active_provider: Option<(String, String)>,
+    capacity_permit: Option<ProviderCapacityPermit>,
 }
 
 impl ActiveConnectionGuard {
@@ -142,6 +143,7 @@ impl ActiveConnectionGuard {
             status,
             active_provider_counts,
             active_provider: None,
+            capacity_permit: None,
         }
     }
 
@@ -154,6 +156,7 @@ impl ActiveConnectionGuard {
         app_type: &str,
         provider_id: &str,
         provider_name: &str,
+        capacity_permit: Option<ProviderCapacityPermit>,
     ) {
         let next = (app_type.to_string(), provider_id.to_string());
         if self.active_provider.as_ref() == Some(&next) {
@@ -179,6 +182,7 @@ impl ActiveConnectionGuard {
         entry.0 = entry.0.saturating_add(1);
         entry.1 = provider_name.to_string();
         self.active_provider = Some(next);
+        self.capacity_permit = capacity_permit;
     }
 }
 
@@ -735,7 +739,65 @@ impl RequestForwarder {
         // `providers` 本身（配置顺序）仍是首选与故障转移链的权威定义；
         // affinity_preferred 同时传给成功路径，避免把亲和命中记成一次故障转移。
         let affinity_preferred = self.session_affinity_preference(&providers).await;
-        let ordered_providers = Self::order_providers(&providers, affinity_preferred.as_deref());
+        let mut ordered_providers = Self::order_providers(&providers, affinity_preferred.as_deref());
+
+        // Backpressure only queues when every non-cooled candidate is currently at capacity.
+        // If any provider can accept immediately, the normal failover loop below will prefer it
+        // instead of making the client wait behind a saturated higher-priority target.
+        let mut queue_candidate = None;
+        let mut has_immediate_capacity = false;
+        for provider in &ordered_providers {
+            if self
+                .router
+                .is_provider_cooled_down(&provider.id, app_type_str)
+                .await
+            {
+                continue;
+            }
+            if self.router.provider_capacity_available(provider) {
+                has_immediate_capacity = true;
+                break;
+            }
+            if queue_candidate.is_none() && provider.gateway_max_concurrent_requests() > 0 {
+                queue_candidate = Some(*provider);
+            }
+        }
+
+        let mut reserved_capacity: Option<(String, Option<ProviderCapacityPermit>)> = None;
+        if !has_immediate_capacity {
+            if let Some(provider) = queue_candidate {
+                match self.router.wait_acquire_provider_capacity(provider).await {
+                    Ok(permit) => {
+                        reserved_capacity = Some((provider.id.clone(), permit));
+                        if let Some(index) = ordered_providers
+                            .iter()
+                            .position(|candidate| candidate.id == provider.id)
+                        {
+                            ordered_providers.rotate_left(index);
+                        }
+                    }
+                    Err(CapacityAcquireError::QueueFull) => {
+                        return Err(ForwardError {
+                            error: ProxyError::GatewayOverloaded(format!(
+                                "Provider {} 的等待队列已满",
+                                provider.name
+                            )),
+                            provider: Some((*provider).clone()),
+                        });
+                    }
+                    Err(CapacityAcquireError::Timeout) => {
+                        return Err(ForwardError {
+                            error: ProxyError::GatewayOverloaded(format!(
+                                "等待 Provider {} 并发名额超时",
+                                provider.name
+                            )),
+                            provider: Some((*provider).clone()),
+                        });
+                    }
+                    Err(CapacityAcquireError::Full) => unreachable!("wait acquisition never returns Full"),
+                }
+            }
+        }
 
         // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
         let bypass_circuit_breaker = providers.len() == 1;
@@ -772,6 +834,27 @@ impl RequestForwarder {
                 );
                 continue;
             }
+
+            let capacity_permit = if reserved_capacity
+                .as_ref()
+                .is_some_and(|(provider_id, _)| provider_id == &provider.id)
+            {
+                reserved_capacity.take().and_then(|(_, permit)| permit)
+            } else {
+                match self.router.try_acquire_provider_capacity(provider) {
+                    Ok(permit) => permit,
+                    Err(CapacityAcquireError::Full) => {
+                        log::debug!(
+                            "[{app_type_str}] Provider {} reached max concurrency; trying next target",
+                            provider.id
+                        );
+                        continue;
+                    }
+                    Err(CapacityAcquireError::QueueFull | CapacityAcquireError::Timeout) => {
+                        unreachable!("non-blocking capacity acquisition only returns Full")
+                    }
+                }
+            };
 
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
             // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
@@ -810,7 +893,12 @@ impl RequestForwarder {
             // 将该客户端请求绑定到实际正在尝试的 Provider。若后续发生故障转移，
             // guard 会把计数迁移到下一家；成功后计数持续到响应流真正结束。
             connection_guard
-                .switch_provider(app_type_str, &provider.id, &provider.name)
+                .switch_provider(
+                    app_type_str,
+                    &provider.id,
+                    &provider.name,
+                    capacity_permit,
+                )
                 .await;
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
@@ -4162,7 +4250,7 @@ mod tests {
         let mut guard = ActiveConnectionGuard::acquire(status.clone(), counts.clone()).await;
 
         guard
-            .switch_provider("codex", "primary", "Primary · openai_responses")
+            .switch_provider("codex", "primary", "Primary · openai_responses", None)
             .await;
         assert_eq!(status.read().await.active_connections, 1);
         assert_eq!(
@@ -4175,7 +4263,7 @@ mod tests {
         );
 
         guard
-            .switch_provider("codex", "backup", "Backup · anthropic")
+            .switch_provider("codex", "backup", "Backup · anthropic", None)
             .await;
         let snapshot = counts.read().await;
         assert!(!snapshot.contains_key(&("codex".to_string(), "primary".to_string())));

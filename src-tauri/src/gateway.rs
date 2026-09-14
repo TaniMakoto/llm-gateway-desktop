@@ -36,6 +36,17 @@ pub enum GatewayApiFormat {
     Anthropic,
 }
 
+pub fn routing_weights_for_alias(
+    config: &GatewayConfig,
+    alias: &str,
+) -> HashMap<String, u32> {
+    config
+        .routing_weights
+        .get(alias.trim())
+        .cloned()
+        .unwrap_or_default()
+}
+
 #[tauri::command]
 pub fn resolve_gateway_model_capabilities(
     request: ResolveGatewayModelCapabilitiesRequest,
@@ -72,6 +83,8 @@ pub enum GatewayRoutingPolicy {
     #[default]
     Priority,
     RoundRobin,
+    WeightedRoundRobin,
+    LeastOutstanding,
 }
 
 impl GatewayApiFormat {
@@ -302,6 +315,15 @@ pub struct GatewayProvider {
     /// 上游最终响应体转储为 JSONL 文件，用于核对中转站实际收到的内容。
     #[serde(default)]
     pub record_bodies: bool,
+    /// Provider 级并发上限；0 表示不限。
+    #[serde(default)]
+    pub max_concurrent_requests: u32,
+    /// 达到并发上限后允许排队的请求数；仅在 max_concurrent_requests > 0 时生效。
+    #[serde(default = "default_queue_limit")]
+    pub queue_limit: u32,
+    /// 排队等待并发名额的最长时间（毫秒）。
+    #[serde(default = "default_queue_timeout_ms")]
+    pub queue_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +341,9 @@ pub struct GatewayConfig {
     pub enable_logging: bool,
     #[serde(default)]
     pub routing_policies: HashMap<String, GatewayRoutingPolicy>,
+    /// alias -> source provider id -> weight。仅 WeightedRoundRobin 使用。
+    #[serde(default)]
+    pub routing_weights: HashMap<String, HashMap<String, u32>>,
     /// Canonical model-level manual corrections. These apply across all
     /// providers/routes that resolve to the same canonical model id.
     #[serde(default)]
@@ -337,6 +362,7 @@ impl Default for GatewayConfig {
             auto_start: false,
             enable_logging: true,
             routing_policies: HashMap::new(),
+            routing_weights: HashMap::new(),
             model_registry_overrides: HashMap::new(),
             providers: Vec::new(),
         }
@@ -363,6 +389,9 @@ pub struct GatewayProviderRuntimeStatus {
     pub cooldown_seconds: Option<u64>,
     pub consecutive_failures: u32,
     pub total_requests: u32,
+    pub max_concurrent_requests: u32,
+    pub active_requests: u32,
+    pub queued_requests: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -399,6 +428,14 @@ fn default_auth_style() -> String {
 
 fn default_auto_mode() -> String {
     "auto".to_string()
+}
+
+fn default_queue_limit() -> u32 {
+    32
+}
+
+fn default_queue_timeout_ms() -> u64 {
+    30_000
 }
 
 pub fn generate_local_key() -> String {
@@ -582,10 +619,12 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
             adaptive_thinking_display: default_auto_mode(),
             notes: p.notes,
             record_bodies: false,
+            max_concurrent_requests: 0,
+            queue_limit: default_queue_limit(),
+            queue_timeout_ms: default_queue_timeout_ms(),
             models: provider_models.remove(&p.id).unwrap_or_default(),
         })
         .collect();
-
     Ok(GatewayConfig {
         listen_address: legacy.listen_address,
         listen_port: legacy.listen_port,
@@ -594,6 +633,7 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
         auto_start: legacy.auto_start,
         enable_logging: legacy.enable_logging,
         routing_policies: HashMap::new(),
+        routing_weights: HashMap::new(),
         model_registry_overrides: HashMap::new(),
         providers,
     })
@@ -608,6 +648,24 @@ fn normalize_config(mut config: GatewayConfig) -> GatewayConfig {
         .filter_map(|(alias, policy)| {
             let alias = alias.trim().to_string();
             (!alias.is_empty()).then_some((alias, policy))
+        })
+        .collect();
+    config.routing_weights = config
+        .routing_weights
+        .into_iter()
+        .filter_map(|(alias, weights)| {
+            let alias = alias.trim().to_string();
+            if alias.is_empty() {
+                return None;
+            }
+            let weights = weights
+                .into_iter()
+                .filter_map(|(provider_id, weight)| {
+                    let provider_id = provider_id.trim().to_string();
+                    (!provider_id.is_empty() && weight > 0).then_some((provider_id, weight))
+                })
+                .collect::<HashMap<_, _>>();
+            Some((alias, weights))
         })
         .collect();
     config.model_registry_overrides = config
@@ -835,6 +893,10 @@ fn provider_meta(
     format: GatewayApiFormat,
 ) -> ProviderMeta {
     let mut meta = ProviderMeta::default();
+    meta.gateway_source_provider_id = Some(provider.id.clone());
+    meta.gateway_max_concurrent_requests = Some(provider.max_concurrent_requests);
+    meta.gateway_queue_limit = Some(provider.queue_limit);
+    meta.gateway_queue_timeout_ms = Some(provider.queue_timeout_ms);
     meta.api_format = Some(format.as_wire_name().to_string());
     meta.reasoning_request_mode = Some(provider.reasoning_request_mode.clone());
     meta.reasoning_history_mode = Some(provider.reasoning_history_mode.clone());
@@ -1008,6 +1070,8 @@ pub(crate) async fn gateway_runtime_statuses_for_router(
             continue;
         }
         let materialized_provider_id = generated_provider_id(&provider.id, format);
+        let (_, active_requests, queued_requests) =
+            router.provider_capacity_snapshot(&provider.id);
         for app_type in ["claude", "codex"] {
             let stats = router
                 .get_circuit_breaker_stats(&materialized_provider_id, app_type)
@@ -1031,6 +1095,9 @@ pub(crate) async fn gateway_runtime_statuses_for_router(
                     .map(|value| value.consecutive_failures)
                     .unwrap_or(0),
                 total_requests: stats.as_ref().map(|value| value.total_requests).unwrap_or(0),
+                max_concurrent_requests: provider.max_concurrent_requests,
+                active_requests,
+                queued_requests,
             });
         }
     }
@@ -1069,13 +1136,14 @@ pub fn resolve_route_providers(
     app_type: &str,
     _downstream_format: Option<&str>,
     alias: &str,
-) -> Result<Option<(Vec<Provider>, GatewayRoutingPolicy)>, AppError> {
+) -> Result<Option<(Vec<Provider>, GatewayRoutingPolicy, HashMap<String, u32>)>, AppError> {
     let config = load_config(db)?;
     let alias = alias.trim();
     if alias.is_empty() {
         return Ok(None);
     }
     let routing_policy = routing_policy_for_alias(&config, alias);
+    let routing_weights = routing_weights_for_alias(&config, alias);
 
     let mut matched_ids: Vec<String> = Vec::new();
     let mut any_alias_defined = false;
@@ -1110,7 +1178,7 @@ pub fn resolve_route_providers(
             result.push(provider);
         }
     }
-    Ok(Some((result, routing_policy)))
+    Ok(Some((result, routing_policy, routing_weights)))
 }
 
 pub fn validate_local_auth(db: &Database, headers: &HeaderMap) -> Result<(), crate::proxy::ProxyError> {
@@ -1234,6 +1302,9 @@ async fn gateway_runtime_statuses_for_service(
             continue;
         }
         let materialized_provider_id = generated_provider_id(&provider.id, format);
+        let (_, active_requests, queued_requests) = proxy_service
+            .get_provider_capacity_snapshot(&provider.id)
+            .await;
         for app_type in ["claude", "codex"] {
             let stats = proxy_service
                 .get_circuit_breaker_stats(&materialized_provider_id, app_type)
@@ -1257,6 +1328,9 @@ async fn gateway_runtime_statuses_for_service(
                     .map(|value| value.consecutive_failures)
                     .unwrap_or(0),
                 total_requests: stats.as_ref().map(|value| value.total_requests).unwrap_or(0),
+                max_concurrent_requests: provider.max_concurrent_requests,
+                active_requests,
+                queued_requests,
             });
         }
     }
@@ -2909,6 +2983,9 @@ mod tests {
             adaptive_thinking_display: default_auto_mode(),
             notes: String::new(),
             record_bodies: false,
+            max_concurrent_requests: 0,
+            queue_limit: default_queue_limit(),
+            queue_timeout_ms: default_queue_timeout_ms(),
             models: vec![GatewayProviderModel {
                 alias: "local".to_string(),
                 upstream_model: "model-a".to_string(),

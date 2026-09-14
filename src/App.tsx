@@ -40,7 +40,11 @@ import { cn } from "@/lib/utils";
 import { Markdown } from "@/components/markdown";
 
 type ApiFormat = "openai_chat" | "openai_responses" | "anthropic";
-type RoutingPolicy = "priority" | "round_robin";
+type RoutingPolicy =
+  | "priority"
+  | "round_robin"
+  | "weighted_round_robin"
+  | "least_outstanding";
 type Tab = "dashboard" | "providers" | "routes" | "settings";
 type ProxyMode = "follow_global" | "bypass" | "custom";
 
@@ -93,6 +97,9 @@ interface GatewayProvider {
   adaptiveThinkingDisplay: "auto" | "summarized" | "omitted";
   notes: string;
   recordBodies?: boolean;
+  maxConcurrentRequests: number;
+  queueLimit: number;
+  queueTimeoutMs: number;
   models: ProviderModel[];
 }
 
@@ -109,6 +116,7 @@ interface GatewayConfig {
   autoStart: boolean;
   enableLogging: boolean;
   routingPolicies: Record<string, RoutingPolicy>;
+  routingWeights: Record<string, Record<string, number>>;
   modelRegistryOverrides: Record<string, ModelMetadata>;
   providers: GatewayProvider[];
 }
@@ -139,6 +147,9 @@ interface ProviderRuntimeStatus {
   cooldownSeconds?: number | null;
   consecutiveFailures: number;
   totalRequests: number;
+  maxConcurrentRequests: number;
+  activeRequests: number;
+  queuedRequests: number;
 }
 
 interface ActiveProvider {
@@ -232,6 +243,7 @@ const DEFAULT_CONFIG: GatewayConfig = {
   autoStart: false,
   enableLogging: true,
   routingPolicies: {},
+  routingWeights: {},
   modelRegistryOverrides: {},
   providers: [],
 };
@@ -596,6 +608,9 @@ function App() {
       adaptiveThinkingDisplay: "auto",
       notes: "",
       recordBodies: false,
+      maxConcurrentRequests: 0,
+      queueLimit: 32,
+      queueTimeoutMs: 30000,
       models: [],
     };
     setEditingProviderId(null);
@@ -619,6 +634,9 @@ function App() {
       reasoningHistoryMode: provider.reasoningHistoryMode ?? "auto",
       adaptiveThinkingDisplay: provider.adaptiveThinkingDisplay ?? "auto",
       recordBodies: provider.recordBodies ?? false,
+      maxConcurrentRequests: provider.maxConcurrentRequests ?? 0,
+      queueLimit: provider.queueLimit ?? 32,
+      queueTimeoutMs: provider.queueTimeoutMs ?? 30000,
       models: provider.models ?? [],
     });
     setHeadersText(
@@ -1059,37 +1077,87 @@ function App() {
                         <div>
                           <div className="text-sm font-semibold">路由策略</div>
                           <div className="mt-0.5 text-xs text-muted-foreground">
-                            Priority 保持供应商顺序；Round Robin 为新会话轮换首选，已有会话仍保持亲和。
+                            策略只决定新会话的首选目标；已有会话仍优先保持 Session Affinity。
                           </div>
                         </div>
                       </div>
                       <div className="grid gap-2 md:grid-cols-2">
-                        {enabledAliases.map((alias) => (
-                          <div
-                            key={alias}
-                            className="flex items-center gap-3 rounded-md border px-3 py-2"
-                          >
-                            <span className="min-w-0 flex-1 truncate font-mono text-xs">
-                              {alias}
-                            </span>
-                            <select
-                              className="input w-40"
-                              value={config.routingPolicies?.[alias] ?? "priority"}
-                              onChange={(event) =>
-                                setConfig({
-                                  ...config,
-                                  routingPolicies: {
-                                    ...(config.routingPolicies ?? {}),
-                                    [alias]: event.target.value as RoutingPolicy,
-                                  },
-                                })
-                              }
-                            >
-                              <option value="priority">Priority</option>
-                              <option value="round_robin">Round Robin</option>
-                            </select>
-                          </div>
-                        ))}
+                        {enabledAliases.map((alias) => {
+                          const policy = config.routingPolicies?.[alias] ?? "priority";
+                          const targets = config.providers.filter(
+                            (provider) =>
+                              provider.enabled &&
+                              provider.models.some(
+                                (model) => model.enabled && model.alias === alias,
+                              ),
+                          );
+                          return (
+                            <div key={alias} className="rounded-md border px-3 py-2">
+                              <div className="flex items-center gap-3">
+                                <span className="min-w-0 flex-1 truncate font-mono text-xs">
+                                  {alias}
+                                </span>
+                                <select
+                                  className="input w-52"
+                                  value={policy}
+                                  onChange={(event) =>
+                                    setConfig({
+                                      ...config,
+                                      routingPolicies: {
+                                        ...(config.routingPolicies ?? {}),
+                                        [alias]: event.target.value as RoutingPolicy,
+                                      },
+                                    })
+                                  }
+                                >
+                                  <option value="priority">Priority</option>
+                                  <option value="round_robin">Round Robin</option>
+                                  <option value="weighted_round_robin">Weighted Round Robin</option>
+                                  <option value="least_outstanding">Least Outstanding</option>
+                                </select>
+                              </div>
+                              {policy === "weighted_round_robin" && (
+                                <div className="mt-2 grid gap-2 border-t pt-2 sm:grid-cols-2">
+                                  {targets.map((provider) => (
+                                    <label
+                                      key={provider.id}
+                                      className="flex items-center gap-2 text-[11px] text-muted-foreground"
+                                    >
+                                      <span className="min-w-0 flex-1 truncate">
+                                        {provider.name || provider.id}
+                                      </span>
+                                      <input
+                                        className="input w-20 font-mono"
+                                        type="number"
+                                        min={1}
+                                        max={1000}
+                                        value={
+                                          config.routingWeights?.[alias]?.[provider.id] ?? 1
+                                        }
+                                        onChange={(event) => {
+                                          const value = Math.max(
+                                            1,
+                                            Math.min(1000, Number(event.target.value) || 1),
+                                          );
+                                          setConfig({
+                                            ...config,
+                                            routingWeights: {
+                                              ...(config.routingWeights ?? {}),
+                                              [alias]: {
+                                                ...(config.routingWeights?.[alias] ?? {}),
+                                                [provider.id]: value,
+                                              },
+                                            },
+                                          });
+                                        }}
+                                      />
+                                    </label>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   )}
@@ -1528,6 +1596,8 @@ function ProviderRoutesCard({
   const abnormalRuntime = runtime.filter(
     (entry) => entry.cooldownSeconds || entry.circuitState !== "closed",
   );
+  const capacityRuntime = runtime.find((entry) => entry.maxConcurrentRequests > 0);
+  const hasQueuedRequests = (capacityRuntime?.queuedRequests ?? 0) > 0;
   return (
     <div className="panel overflow-hidden">
       <div className="flex items-center gap-3 border-b p-4">
@@ -1556,7 +1626,7 @@ function ProviderRoutesCard({
             <span className="text-[11px] text-muted-foreground">
               #{providerIndex + 1}
             </span>
-            {abnormalRuntime.length === 0 && runtime.length > 0 ? (
+            {abnormalRuntime.length === 0 && runtime.length > 0 && !hasQueuedRequests ? (
               <span className="tag text-[10px] text-emerald-600">健康</span>
             ) : (
               abnormalRuntime.slice(0, 4).map((entry) => (
@@ -1571,6 +1641,23 @@ function ProviderRoutesCard({
                     : entry.circuitState}
                 </span>
               ))
+            )}
+            {capacityRuntime && (
+              <span
+                className={cn(
+                  "tag text-[10px]",
+                  capacityRuntime.queuedRequests > 0 ||
+                    capacityRuntime.activeRequests >= capacityRuntime.maxConcurrentRequests
+                    ? "text-amber-600"
+                    : "text-muted-foreground",
+                )}
+                title={`并发 ${capacityRuntime.activeRequests}/${capacityRuntime.maxConcurrentRequests} · 排队 ${capacityRuntime.queuedRequests}`}
+              >
+                并发 {capacityRuntime.activeRequests}/{capacityRuntime.maxConcurrentRequests}
+                {capacityRuntime.queuedRequests > 0
+                  ? ` · 排队 ${capacityRuntime.queuedRequests}`
+                  : ""}
+              </span>
             )}
           </div>
           <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
@@ -2219,6 +2306,62 @@ function ProviderEditorModal({
                 </Field>
               </div>
             )}
+          </div>
+          <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
+            <div className="text-xs font-medium">容量与背压</div>
+            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+              并发上限为 0 时不限制。达到上限后优先尝试其它可用 Provider；全部满载时才进入有界队列。
+            </p>
+            <div className="mt-3 grid gap-3 sm:grid-cols-3">
+              <Field label="最大并发">
+                <input
+                  className="input w-full font-mono"
+                  type="number"
+                  min={0}
+                  max={10000}
+                  value={provider.maxConcurrentRequests ?? 0}
+                  onChange={(event) =>
+                    onChange({
+                      ...provider,
+                      maxConcurrentRequests: Math.max(0, Number(event.target.value) || 0),
+                    })
+                  }
+                  placeholder="0 = 不限"
+                />
+              </Field>
+              <Field label="排队上限">
+                <input
+                  className="input w-full font-mono"
+                  type="number"
+                  min={0}
+                  max={100000}
+                  value={provider.queueLimit ?? 32}
+                  disabled={(provider.maxConcurrentRequests ?? 0) === 0}
+                  onChange={(event) =>
+                    onChange({
+                      ...provider,
+                      queueLimit: Math.max(0, Number(event.target.value) || 0),
+                    })
+                  }
+                />
+              </Field>
+              <Field label="排队超时 (ms)">
+                <input
+                  className="input w-full font-mono"
+                  type="number"
+                  min={0}
+                  max={3600000}
+                  value={provider.queueTimeoutMs ?? 30000}
+                  disabled={(provider.maxConcurrentRequests ?? 0) === 0}
+                  onChange={(event) =>
+                    onChange({
+                      ...provider,
+                      queueTimeoutMs: Math.max(0, Number(event.target.value) || 0),
+                    })
+                  }
+                />
+              </Field>
+            </div>
           </div>
           <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
             <div className="text-xs font-medium">推理兼容（高级）</div>
