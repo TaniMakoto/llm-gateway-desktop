@@ -1,5 +1,5 @@
 name: Package Windows
-# Rebuild marker: canonical capability registry
+# Rebuild marker: adaptive routing and backpressure P1
 
 on:
   workflow_dispatch:
