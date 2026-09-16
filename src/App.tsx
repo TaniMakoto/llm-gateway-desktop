@@ -41,11 +41,8 @@ import { Markdown } from "@/components/markdown";
 
 type ApiFormat = "openai_chat" | "openai_responses" | "anthropic";
 type RoutingPolicy =
-  | "priority"
-  | "round_robin"
-  | "weighted_round_robin"
-  | "least_outstanding";
-type Tab = "dashboard" | "providers" | "routes" | "settings";
+  "priority" | "round_robin" | "weighted_round_robin" | "least_outstanding";
+type Tab = "dashboard" | "providers" | "routes" | "registry" | "settings";
 type ProxyMode = "follow_global" | "bypass" | "custom";
 
 interface CachedModel {
@@ -76,6 +73,20 @@ interface ModelCapabilityResolution {
   metadata: ModelMetadata;
   defaultReasoningLevel?: string | null;
   source: "registry" | "unknown" | string;
+}
+
+interface ModelRegistryEntry {
+  canonicalModel: string;
+  ids: string[];
+  baseMetadata: ModelMetadata;
+  metadata: ModelMetadata;
+  defaultReasoningLevel?: string | null;
+  overridden: boolean;
+}
+
+interface ModelRegistrySnapshot {
+  overrideFile: string;
+  entries: ModelRegistryEntry[];
 }
 
 interface GatewayProvider {
@@ -271,9 +282,9 @@ const COMMON_MODALITIES = ["text", "image", "audio", "video", "pdf"];
 function hasMetadataValues(metadata?: ModelMetadata): boolean {
   return Boolean(
     metadata?.contextLength ||
-      metadata?.maxOutputTokens ||
-      (metadata?.inputModalities?.length ?? 0) > 0 ||
-      (metadata?.reasoningLevels?.length ?? 0) > 0,
+    metadata?.maxOutputTokens ||
+    (metadata?.inputModalities?.length ?? 0) > 0 ||
+    (metadata?.reasoningLevels?.length ?? 0) > 0,
   );
 }
 
@@ -307,7 +318,8 @@ function conservativeLimit(
 
 function formatTokenLimit(value?: number | null): string {
   if (!value) return "未知";
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2).replace(/\.00$/, "")}M`;
+  if (value >= 1_000_000)
+    return `${(value / 1_000_000).toFixed(2).replace(/\.00$/, "")}M`;
   if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
   return String(value);
 }
@@ -362,7 +374,11 @@ function App() {
   const [config, setConfig] = useState<GatewayConfig>(DEFAULT_CONFIG);
   const [savedConfig, setSavedConfig] = useState<GatewayConfig>(DEFAULT_CONFIG);
   const [status, setStatus] = useState<ProxyStatus | null>(null);
-  const [providerRuntime, setProviderRuntime] = useState<ProviderRuntimeStatus[]>([]);
+  const [providerRuntime, setProviderRuntime] = useState<
+    ProviderRuntimeStatus[]
+  >([]);
+  const [modelRegistry, setModelRegistry] =
+    useState<ModelRegistrySnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [startupPreferences, setStartupPreferences] =
@@ -412,6 +428,20 @@ function App() {
       toast.error(`读取网关配置失败：${String(error)}`);
     } finally {
       if (showSpinner) setLoading(false);
+    }
+  };
+
+  const loadModelRegistry = async (notifyOnError = false) => {
+    try {
+      const snapshot = await invoke<ModelRegistrySnapshot>(
+        "get_gateway_model_registry",
+      );
+      setModelRegistry(snapshot);
+    } catch (error) {
+      console.warn("Failed to load model registry", error);
+      if (notifyOnError) {
+        toast.error(`读取模型元数据失败：${String(error)}`);
+      }
     }
   };
 
@@ -481,6 +511,7 @@ function App() {
     void loadSnapshot(true);
     void loadGlobalProxy();
     void loadStartupPreferences();
+    void loadModelRegistry();
     const timer = window.setInterval(() => void refreshStatus(), 2000);
     return () => window.clearInterval(timer);
   }, []);
@@ -491,6 +522,7 @@ function App() {
       await invoke("save_gateway_config", { config: nextConfig });
       setConfig(nextConfig);
       setSavedConfig(nextConfig);
+      void loadModelRegistry();
       if (!silent) toast.success("网关配置已保存");
       return true;
     } catch (error) {
@@ -915,6 +947,13 @@ function App() {
               badge={enabledAliases.length}
             />
             <NavButton
+              icon={Database}
+              label="模型元数据"
+              active={tab === "registry"}
+              onClick={() => setTab("registry")}
+              badge={modelRegistry?.entries.length}
+            />
+            <NavButton
               icon={Settings}
               label="网关设置"
               active={tab === "settings"}
@@ -1077,22 +1116,28 @@ function App() {
                         <div>
                           <div className="text-sm font-semibold">路由策略</div>
                           <div className="mt-0.5 text-xs text-muted-foreground">
-                            策略只决定新会话的首选目标；已有会话仍优先保持 Session Affinity。
+                            策略只决定新会话的首选目标；已有会话仍优先保持
+                            Session Affinity。
                           </div>
                         </div>
                       </div>
                       <div className="grid gap-2 md:grid-cols-2">
                         {enabledAliases.map((alias) => {
-                          const policy = config.routingPolicies?.[alias] ?? "priority";
+                          const policy =
+                            config.routingPolicies?.[alias] ?? "priority";
                           const targets = config.providers.filter(
                             (provider) =>
                               provider.enabled &&
                               provider.models.some(
-                                (model) => model.enabled && model.alias === alias,
+                                (model) =>
+                                  model.enabled && model.alias === alias,
                               ),
                           );
                           return (
-                            <div key={alias} className="rounded-md border px-3 py-2">
+                            <div
+                              key={alias}
+                              className="rounded-md border px-3 py-2"
+                            >
                               <div className="flex items-center gap-3">
                                 <span className="min-w-0 flex-1 truncate font-mono text-xs">
                                   {alias}
@@ -1105,15 +1150,22 @@ function App() {
                                       ...config,
                                       routingPolicies: {
                                         ...(config.routingPolicies ?? {}),
-                                        [alias]: event.target.value as RoutingPolicy,
+                                        [alias]: event.target
+                                          .value as RoutingPolicy,
                                       },
                                     })
                                   }
                                 >
                                   <option value="priority">Priority</option>
-                                  <option value="round_robin">Round Robin</option>
-                                  <option value="weighted_round_robin">Weighted Round Robin</option>
-                                  <option value="least_outstanding">Least Outstanding</option>
+                                  <option value="round_robin">
+                                    Round Robin
+                                  </option>
+                                  <option value="weighted_round_robin">
+                                    Weighted Round Robin
+                                  </option>
+                                  <option value="least_outstanding">
+                                    Least Outstanding
+                                  </option>
                                 </select>
                               </div>
                               {policy === "weighted_round_robin" && (
@@ -1132,19 +1184,26 @@ function App() {
                                         min={1}
                                         max={1000}
                                         value={
-                                          config.routingWeights?.[alias]?.[provider.id] ?? 1
+                                          config.routingWeights?.[alias]?.[
+                                            provider.id
+                                          ] ?? 1
                                         }
                                         onChange={(event) => {
                                           const value = Math.max(
                                             1,
-                                            Math.min(1000, Number(event.target.value) || 1),
+                                            Math.min(
+                                              1000,
+                                              Number(event.target.value) || 1,
+                                            ),
                                           );
                                           setConfig({
                                             ...config,
                                             routingWeights: {
                                               ...(config.routingWeights ?? {}),
                                               [alias]: {
-                                                ...(config.routingWeights?.[alias] ?? {}),
+                                                ...(config.routingWeights?.[
+                                                  alias
+                                                ] ?? {}),
                                                 [provider.id]: value,
                                               },
                                             },
@@ -1165,7 +1224,9 @@ function App() {
                     <ProviderRoutesCard
                       key={provider.id}
                       provider={provider}
-                      modelRegistryOverrides={config.modelRegistryOverrides ?? {}}
+                      modelRegistryOverrides={
+                        config.modelRegistryOverrides ?? {}
+                      }
                       onPatchModelRegistryOverride={patchModelRegistryOverride}
                       runtime={providerRuntime.filter(
                         (entry) => entry.sourceProviderId === provider.id,
@@ -1206,6 +1267,15 @@ function App() {
                 </div>
               )}
             </section>
+          )}
+
+          {tab === "registry" && (
+            <ModelRegistryView
+              snapshot={modelRegistry}
+              overrides={config.modelRegistryOverrides ?? {}}
+              onPatchOverride={patchModelRegistryOverride}
+              onReload={() => void loadModelRegistry(true)}
+            />
           )}
 
           {tab === "settings" && (
@@ -1555,6 +1625,235 @@ function App() {
   );
 }
 
+function ModelRegistryView({
+  snapshot,
+  overrides,
+  onPatchOverride,
+  onReload,
+}: {
+  snapshot: ModelRegistrySnapshot | null;
+  overrides: Record<string, ModelMetadata>;
+  onPatchOverride: (
+    canonicalModel: string,
+    metadata: ModelMetadata | null,
+  ) => void;
+  onReload: () => void;
+}) {
+  return (
+    <section className="mx-auto max-w-5xl">
+      <PageHeader
+        title="模型元数据"
+        description="统一维护模型上下文、输出限制、输入模态和 Reasoning 档位。内置 Registry 作为默认值，用户修改仅保存为全局 override。"
+        action={
+          <button className="secondary-button" onClick={onReload}>
+            <RefreshCw className="h-4 w-4" />
+            重新读取
+          </button>
+        }
+      />
+
+      {!snapshot ? (
+        <div className="panel flex items-center gap-2 p-5 text-sm text-muted-foreground">
+          <RefreshCw className="h-4 w-4 animate-spin" />
+          正在读取 Model Registry…
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <div className="panel p-4">
+            <div className="text-xs font-medium">Override 文件</div>
+            <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
+              {snapshot.overrideFile}
+            </div>
+            <div className="mt-2 text-[11px] leading-5 text-muted-foreground">
+              便携模式下该路径位于可执行文件旁的 data
+              目录；安装版使用应用数据目录。软件升级只更新内置默认值，不会覆盖这里的用户修改。
+            </div>
+          </div>
+
+          {snapshot.entries.map((entry) => {
+            const override = overrides[entry.canonicalModel];
+            const base = entry.baseMetadata ?? {};
+            const effective: ModelMetadata = {
+              contextLength:
+                override?.contextLength ?? base.contextLength ?? null,
+              maxOutputTokens:
+                override?.maxOutputTokens ?? base.maxOutputTokens ?? null,
+              inputModalities: override?.inputModalities?.length
+                ? override.inputModalities
+                : (base.inputModalities ?? []),
+              reasoningLevels: override?.reasoningLevels?.length
+                ? override.reasoningLevels
+                : (base.reasoningLevels ?? []),
+            };
+            const patch = (next: Partial<ModelMetadata>) =>
+              onPatchOverride(entry.canonicalModel, {
+                ...override,
+                ...next,
+              });
+            const reasoningChoices = Array.from(
+              new Set([
+                ...COMMON_REASONING_LEVELS,
+                ...(base.reasoningLevels ?? []),
+                ...(override?.reasoningLevels ?? []),
+              ]),
+            );
+
+            return (
+              <div key={entry.canonicalModel} className="panel p-5">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="font-mono text-sm font-semibold">
+                        {entry.canonicalModel}
+                      </h3>
+                      <span className="tag text-[10px]">
+                        {hasMetadataValues(override)
+                          ? "全局覆盖"
+                          : hasMetadataValues(base)
+                            ? "Built-in"
+                            : "未知 · 可补全"}
+                      </span>
+                      {entry.defaultReasoningLevel && (
+                        <span className="tag text-[10px]">
+                          默认 reasoning: {entry.defaultReasoningLevel}
+                        </span>
+                      )}
+                    </div>
+                    {entry.ids.length > 1 && (
+                      <div className="mt-1 break-all text-[10px] text-muted-foreground">
+                        aliases: {entry.ids.join(", ")}
+                      </div>
+                    )}
+                  </div>
+                  {hasMetadataValues(override) && (
+                    <button
+                      className="secondary-button"
+                      onClick={() =>
+                        onPatchOverride(entry.canonicalModel, null)
+                      }
+                    >
+                      <RotateCcw className="h-4 w-4" />
+                      恢复默认
+                    </button>
+                  )}
+                </div>
+
+                <div className="mt-4 grid gap-3 md:grid-cols-2">
+                  <Field label="Context length">
+                    <input
+                      className="input w-full font-mono"
+                      type="number"
+                      min={1}
+                      value={override?.contextLength ?? ""}
+                      placeholder={
+                        base.contextLength ? String(base.contextLength) : "未知"
+                      }
+                      onChange={(event) => {
+                        const value = event.target.value.trim();
+                        patch({ contextLength: value ? Number(value) : null });
+                      }}
+                    />
+                  </Field>
+                  <Field label="Max output tokens">
+                    <input
+                      className="input w-full font-mono"
+                      type="number"
+                      min={1}
+                      value={override?.maxOutputTokens ?? ""}
+                      placeholder={
+                        base.maxOutputTokens
+                          ? String(base.maxOutputTokens)
+                          : "未知"
+                      }
+                      onChange={(event) => {
+                        const value = event.target.value.trim();
+                        patch({
+                          maxOutputTokens: value ? Number(value) : null,
+                        });
+                      }}
+                    />
+                  </Field>
+                </div>
+
+                <div className="mt-4">
+                  <div className="mb-1 text-[11px] text-muted-foreground">
+                    输入模态
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {COMMON_MODALITIES.map((value) => {
+                      const current = effective.inputModalities ?? [];
+                      const active = current.includes(value);
+                      return (
+                        <button
+                          key={value}
+                          className={cn(
+                            "tag",
+                            active && "bg-primary text-primary-foreground",
+                          )}
+                          onClick={() =>
+                            patch({
+                              inputModalities: active
+                                ? current.filter((item) => item !== value)
+                                : [...current, value],
+                            })
+                          }
+                        >
+                          {value}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="mt-4">
+                  <div className="mb-1 text-[11px] text-muted-foreground">
+                    Reasoning 档位
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {reasoningChoices.map((value) => {
+                      const current = effective.reasoningLevels ?? [];
+                      const active = current.includes(value);
+                      return (
+                        <button
+                          key={value}
+                          className={cn(
+                            "tag",
+                            active && "bg-primary text-primary-foreground",
+                          )}
+                          onClick={() =>
+                            patch({
+                              reasoningLevels: active
+                                ? current.filter((item) => item !== value)
+                                : [...current, value],
+                            })
+                          }
+                        >
+                          {value}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="mt-4 flex flex-wrap gap-2 text-[10px] text-muted-foreground">
+                  <span className="tag">
+                    Effective Context{" "}
+                    {formatTokenLimit(effective.contextLength)}
+                  </span>
+                  <span className="tag">
+                    Effective Output{" "}
+                    {formatTokenLimit(effective.maxOutputTokens)}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ProviderRoutesCard({
   provider,
   modelRegistryOverrides,
@@ -1596,7 +1895,9 @@ function ProviderRoutesCard({
   const abnormalRuntime = runtime.filter(
     (entry) => entry.cooldownSeconds || entry.circuitState !== "closed",
   );
-  const capacityRuntime = runtime.find((entry) => entry.maxConcurrentRequests > 0);
+  const capacityRuntime = runtime.find(
+    (entry) => entry.maxConcurrentRequests > 0,
+  );
   const hasQueuedRequests = (capacityRuntime?.queuedRequests ?? 0) > 0;
   return (
     <div className="panel overflow-hidden">
@@ -1626,7 +1927,9 @@ function ProviderRoutesCard({
             <span className="text-[11px] text-muted-foreground">
               #{providerIndex + 1}
             </span>
-            {abnormalRuntime.length === 0 && runtime.length > 0 && !hasQueuedRequests ? (
+            {abnormalRuntime.length === 0 &&
+            runtime.length > 0 &&
+            !hasQueuedRequests ? (
               <span className="tag text-[10px] text-emerald-600">健康</span>
             ) : (
               abnormalRuntime.slice(0, 4).map((entry) => (
@@ -1647,13 +1950,15 @@ function ProviderRoutesCard({
                 className={cn(
                   "tag text-[10px]",
                   capacityRuntime.queuedRequests > 0 ||
-                    capacityRuntime.activeRequests >= capacityRuntime.maxConcurrentRequests
+                    capacityRuntime.activeRequests >=
+                      capacityRuntime.maxConcurrentRequests
                     ? "text-amber-600"
                     : "text-muted-foreground",
                 )}
                 title={`并发 ${capacityRuntime.activeRequests}/${capacityRuntime.maxConcurrentRequests} · 排队 ${capacityRuntime.queuedRequests}`}
               >
-                并发 {capacityRuntime.activeRequests}/{capacityRuntime.maxConcurrentRequests}
+                并发 {capacityRuntime.activeRequests}/
+                {capacityRuntime.maxConcurrentRequests}
                 {capacityRuntime.queuedRequests > 0
                   ? ` · 排队 ${capacityRuntime.queuedRequests}`
                   : ""}
@@ -1764,7 +2069,8 @@ function ModelRow({
     useState<ModelCapabilityResolution | null>(null);
   const [showMetadataOverride, setShowMetadataOverride] = useState(false);
   const cachedMetadata = useMemo(
-    () => cachedModels.find((item) => item.id === model.upstreamModel)?.metadata,
+    () =>
+      cachedModels.find((item) => item.id === model.upstreamModel)?.metadata,
     [cachedModels, model.upstreamModel],
   );
 
@@ -1775,9 +2081,12 @@ function ModelRow({
       return;
     }
     let cancelled = false;
-    void invoke<ModelCapabilityResolution>("resolve_gateway_model_capabilities", {
-      request: { modelId, apiFormat: model.apiFormat },
-    })
+    void invoke<ModelCapabilityResolution>(
+      "resolve_gateway_model_capabilities",
+      {
+        request: { modelId, apiFormat: model.apiFormat },
+      },
+    )
       .then((result) => {
         if (!cancelled) setRegistryCapability(result);
       })
@@ -1795,9 +2104,13 @@ function ModelRow({
     : undefined;
   const globalAutoMetadata: ModelMetadata = {
     contextLength:
-      registryCapability?.metadata.contextLength ?? cachedMetadata?.contextLength ?? null,
+      registryCapability?.metadata.contextLength ??
+      cachedMetadata?.contextLength ??
+      null,
     maxOutputTokens:
-      registryCapability?.metadata.maxOutputTokens ?? cachedMetadata?.maxOutputTokens ?? null,
+      registryCapability?.metadata.maxOutputTokens ??
+      cachedMetadata?.maxOutputTokens ??
+      null,
     inputModalities: firstNonEmptyList(
       registryCapability?.metadata.inputModalities,
       cachedMetadata?.inputModalities,
@@ -1808,7 +2121,8 @@ function ModelRow({
     ),
   };
   const registryOrGlobalMetadata: ModelMetadata = {
-    contextLength: globalOverride?.contextLength ?? globalAutoMetadata.contextLength,
+    contextLength:
+      globalOverride?.contextLength ?? globalAutoMetadata.contextLength,
     maxOutputTokens:
       globalOverride?.maxOutputTokens ?? globalAutoMetadata.maxOutputTokens,
     inputModalities: firstNonEmptyList(
@@ -1850,11 +2164,11 @@ function ModelRow({
     ? "旧路由覆盖"
     : globalOverrideActive
       ? "全局覆盖"
-    : hasMetadataValues(cachedMetadata)
-      ? "自动（上游 / Registry）"
-      : registryCapability?.source === "registry"
-        ? "Registry"
-        : "未知";
+      : hasMetadataValues(cachedMetadata)
+        ? "自动（上游 / Registry）"
+        : registryCapability?.source === "registry"
+          ? "Registry"
+          : "未知";
   const reasoningChoices = Array.from(
     new Set([
       ...COMMON_REASONING_LEVELS,
@@ -1956,7 +2270,9 @@ function ModelRow({
       </div>
       <div className="basis-full rounded-md border bg-muted/30 p-3">
         <div className="flex flex-wrap items-center gap-2">
-          <div className="text-[11px] font-medium text-muted-foreground">模型能力</div>
+          <div className="text-[11px] font-medium text-muted-foreground">
+            模型能力
+          </div>
           <span className="tag text-[10px]">{capabilitySource}</span>
           {registryCapability?.canonicalModel && (
             <span className="text-[10px] text-muted-foreground">
@@ -1973,16 +2289,24 @@ function ModelRow({
 
         {capabilityKnown ? (
           <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
-            <span className="tag">Context {formatTokenLimit(effectiveMetadata.contextLength)}</span>
-            <span className="tag">Max output {formatTokenLimit(effectiveMetadata.maxOutputTokens)}</span>
+            <span className="tag">
+              Context {formatTokenLimit(effectiveMetadata.contextLength)}
+            </span>
+            <span className="tag">
+              Max output {formatTokenLimit(effectiveMetadata.maxOutputTokens)}
+            </span>
             {(effectiveMetadata.inputModalities ?? []).map((value) => (
-              <span key={`modality-${value}`} className="tag">{value}</span>
+              <span key={`modality-${value}`} className="tag">
+                {value}
+              </span>
             ))}
             {(effectiveMetadata.reasoningLevels ?? []).length > 0 && (
               <span className="flex flex-wrap items-center gap-1">
                 <span className="text-muted-foreground">Reasoning:</span>
                 {(effectiveMetadata.reasoningLevels ?? []).map((value) => (
-                  <span key={`reasoning-${value}`} className="tag">{value}</span>
+                  <span key={`reasoning-${value}`} className="tag">
+                    {value}
+                  </span>
                 ))}
               </span>
             )}
@@ -1990,12 +2314,15 @@ function ModelRow({
               (effectiveMetadata.reasoningLevels ?? []).includes(
                 registryCapability.defaultReasoningLevel,
               ) && (
-              <span className="tag">默认 reasoning: {registryCapability.defaultReasoningLevel}</span>
+                <span className="tag">
+                  默认 reasoning: {registryCapability.defaultReasoningLevel}
+                </span>
               )}
           </div>
         ) : (
           <div className="mt-2 text-[11px] text-muted-foreground">
-            Registry 与上游模型列表都没有提供能力信息。可以保持未知，只有确实需要时再使用高级覆盖。
+            Registry
+            与上游模型列表都没有提供能力信息。可以保持未知，只有确实需要时再使用高级覆盖。
           </div>
         )}
 
@@ -2003,13 +2330,16 @@ function ModelRow({
           <div className="mt-3 space-y-3 rounded-md border bg-background p-3">
             <div className="flex items-center justify-between gap-3">
               <div className="text-[11px] text-muted-foreground">
-                全局覆盖 canonical 模型 {canonicalModel || "（尚未识别）"}；所有 Provider 共用。正常情况下保持自动即可。
+                全局覆盖 canonical 模型 {canonicalModel || "（尚未识别）"}；所有
+                Provider 共用。正常情况下保持自动即可。
               </div>
               <div className="flex flex-wrap gap-2">
                 {globalOverrideActive && canonicalModel && (
                   <button
                     className="secondary-button"
-                    onClick={() => onPatchModelRegistryOverride(canonicalModel, null)}
+                    onClick={() =>
+                      onPatchModelRegistryOverride(canonicalModel, null)
+                    }
                   >
                     清除全局覆盖
                   </button>
@@ -2033,7 +2363,9 @@ function ModelRow({
                 value={globalOverride?.contextLength ?? ""}
                 onChange={(event) => {
                   const value = event.target.value.trim();
-                  patchGlobalMetadata({ contextLength: value ? Number(value) : null });
+                  patchGlobalMetadata({
+                    contextLength: value ? Number(value) : null,
+                  });
                 }}
                 placeholder={`Context；Registry ${formatTokenLimit(globalAutoMetadata.contextLength)}`}
               />
@@ -2044,24 +2376,31 @@ function ModelRow({
                 value={globalOverride?.maxOutputTokens ?? ""}
                 onChange={(event) => {
                   const value = event.target.value.trim();
-                  patchGlobalMetadata({ maxOutputTokens: value ? Number(value) : null });
+                  patchGlobalMetadata({
+                    maxOutputTokens: value ? Number(value) : null,
+                  });
                 }}
                 placeholder={`Max output；Registry ${formatTokenLimit(globalAutoMetadata.maxOutputTokens)}`}
               />
             </div>
 
             <div>
-              <div className="mb-1 text-[11px] text-muted-foreground">输入模态</div>
+              <div className="mb-1 text-[11px] text-muted-foreground">
+                输入模态
+              </div>
               <div className="flex flex-wrap gap-1">
                 {COMMON_MODALITIES.map((value) => {
                   const current = globalOverride?.inputModalities?.length
                     ? globalOverride.inputModalities
-                    : globalAutoMetadata.inputModalities ?? [];
+                    : (globalAutoMetadata.inputModalities ?? []);
                   const active = current.includes(value);
                   return (
                     <button
                       key={value}
-                      className={cn("tag", active && "bg-primary text-primary-foreground")}
+                      className={cn(
+                        "tag",
+                        active && "bg-primary text-primary-foreground",
+                      )}
                       onClick={() => {
                         const next = active
                           ? current.filter((item) => item !== value)
@@ -2084,12 +2423,15 @@ function ModelRow({
                 {reasoningChoices.map((value) => {
                   const current = globalOverride?.reasoningLevels?.length
                     ? globalOverride.reasoningLevels
-                    : globalAutoMetadata.reasoningLevels ?? [];
+                    : (globalAutoMetadata.reasoningLevels ?? []);
                   const active = current.includes(value);
                   return (
                     <button
                       key={value}
-                      className={cn("tag", active && "bg-primary text-primary-foreground")}
+                      className={cn(
+                        "tag",
+                        active && "bg-primary text-primary-foreground",
+                      )}
                       onClick={() => {
                         const next = active
                           ? current.filter((item) => item !== value)
@@ -2310,7 +2652,8 @@ function ProviderEditorModal({
           <div className="sm:col-span-2 rounded-lg border bg-muted/30 p-3">
             <div className="text-xs font-medium">容量与背压</div>
             <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-              并发上限为 0 时不限制。达到上限后优先尝试其它可用 Provider；全部满载时才进入有界队列。
+              并发上限为 0 时不限制。达到上限后优先尝试其它可用
+              Provider；全部满载时才进入有界队列。
             </p>
             <div className="mt-3 grid gap-3 sm:grid-cols-3">
               <Field label="最大并发">
@@ -2323,7 +2666,10 @@ function ProviderEditorModal({
                   onChange={(event) =>
                     onChange({
                       ...provider,
-                      maxConcurrentRequests: Math.max(0, Number(event.target.value) || 0),
+                      maxConcurrentRequests: Math.max(
+                        0,
+                        Number(event.target.value) || 0,
+                      ),
                     })
                   }
                   placeholder="0 = 不限"
@@ -2356,7 +2702,10 @@ function ProviderEditorModal({
                   onChange={(event) =>
                     onChange({
                       ...provider,
-                      queueTimeoutMs: Math.max(0, Number(event.target.value) || 0),
+                      queueTimeoutMs: Math.max(
+                        0,
+                        Number(event.target.value) || 0,
+                      ),
                     })
                   }
                 />

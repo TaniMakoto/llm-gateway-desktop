@@ -55,18 +55,88 @@ pub fn is_openai_o_series(model: &str) -> bool {
         && model.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit())
 }
 
-/// Detect OpenAI models that support reasoning_effort.
+/// Detect models that support an OpenAI-style reasoning effort control.
 ///
-/// Supported families:
-/// - o-series: o1, o3, o4-mini, etc.
-/// - GPT-5+: gpt-5, gpt-5.1, gpt-5.4, gpt-5-codex, etc.
+/// Prefer the central capability registry. The legacy OpenAI family heuristic
+/// remains only as a compatibility fallback for models not yet present there.
 pub fn supports_reasoning_effort(model: &str) -> bool {
+    if let Some(capabilities) =
+        crate::model_capabilities::registry_model_capabilities(model, None)
+    {
+        if !capabilities.reasoning_levels.is_empty() {
+            return true;
+        }
+    }
     is_openai_o_series(model)
         || model
             .to_lowercase()
             .strip_prefix("gpt-")
             .and_then(|rest| rest.chars().next())
             .is_some_and(|c| c.is_ascii_digit() && c >= '5')
+}
+
+fn fallback_reasoning_levels(model: &str) -> Vec<String> {
+    if supports_reasoning_effort(model) {
+        vec![
+            "minimal".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+            "xhigh".to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+pub(crate) fn reasoning_levels_for_model(model: &str, api_format: &str) -> Vec<String> {
+    crate::model_capabilities::registry_model_capabilities(model, Some(api_format))
+        .map(|capabilities| capabilities.reasoning_levels)
+        .filter(|levels| !levels.is_empty())
+        .unwrap_or_else(|| fallback_reasoning_levels(model))
+}
+
+/// Map a normalized client request effort to the closest level the upstream
+/// model actually advertises. This intentionally keeps provider/model metadata
+/// authoritative instead of assuming OpenAI's `xhigh` spelling everywhere.
+pub(crate) fn map_reasoning_effort_to_levels(
+    requested: &str,
+    supported_levels: &[String],
+) -> Option<String> {
+    let levels: Vec<String> = supported_levels
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if levels.is_empty() {
+        return None;
+    }
+    let has = |candidate: &str| levels.iter().any(|level| level == candidate);
+    let pick = |candidates: &[&str]| {
+        candidates
+            .iter()
+            .find(|candidate| has(candidate))
+            .map(|candidate| (*candidate).to_string())
+    };
+
+    match requested.trim().to_ascii_lowercase().as_str() {
+        "max" | "xhigh" => pick(&["xhigh", "max", "high"]),
+        "high" => pick(&["high", "xhigh", "max", "medium"]),
+        "medium" => pick(&["medium", "high", "low"]),
+        "low" => pick(&["low", "minimal", "medium"]),
+        "minimal" => pick(&["minimal", "low"]),
+        "none" => has("none").then(|| "none".to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn reasoning_effort_for_model(
+    model: &str,
+    api_format: &str,
+    requested: &str,
+) -> Option<String> {
+    let levels = reasoning_levels_for_model(model, api_format);
+    map_reasoning_effort_to_levels(requested, &levels)
 }
 
 /// Resolve the appropriate OpenAI `reasoning_effort` from an Anthropic request body.
@@ -195,8 +265,8 @@ pub fn anthropic_to_openai_with_reasoning_content(
     }
 
     // Map Anthropic thinking → OpenAI reasoning_effort
-    if supports_reasoning_effort(model) {
-        if let Some(effort) = resolve_reasoning_effort(&body) {
+    if let Some(requested) = resolve_reasoning_effort(&body) {
+        if let Some(effort) = reasoning_effort_for_model(model, "openai_chat", requested) {
             result["reasoning_effort"] = json!(effort);
         }
     }
@@ -1634,8 +1704,29 @@ mod tests {
         assert!(supports_reasoning_effort("gpt-5"));
         assert!(supports_reasoning_effort("gpt-5.4"));
         assert!(supports_reasoning_effort("gpt-5-codex"));
+        assert!(supports_reasoning_effort("deepseek-v4-flash"));
         assert!(!supports_reasoning_effort("gpt-4o"));
         assert!(!supports_reasoning_effort("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn registry_reasoning_levels_translate_protocol_specific_max() {
+        assert_eq!(
+            reasoning_effort_for_model("deepseek-v4-flash", "openai_chat", "xhigh"),
+            Some("max".to_string())
+        );
+        assert_eq!(
+            reasoning_effort_for_model(
+                "deepseek-v4-flash",
+                "openai_responses",
+                "xhigh"
+            ),
+            Some("xhigh".to_string())
+        );
+        assert_eq!(
+            reasoning_effort_for_model("deepseek-v4-flash", "openai_chat", "medium"),
+            Some("high".to_string())
+        );
     }
 
     // ── resolve_reasoning_effort unit tests ──

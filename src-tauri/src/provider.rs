@@ -499,6 +499,15 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub reasoning_request_mode: Option<String>,
+    /// Per-upstream-model reasoning levels materialized by the unified gateway.
+    /// The Claude protocol adapter consumes this in `auto` mode instead of
+    /// guessing capability from model-name prefixes.
+    #[serde(
+        default,
+        rename = "reasoningModelLevels",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub reasoning_model_levels: HashMap<String, Vec<String>>,
     /// Claude -> OpenAI Chat 历史 thinking 回传策略：
     /// - auto: 沿用供应商/模型启发式（默认）
     /// - reasoning_content: 强制写入 assistant.reasoning_content

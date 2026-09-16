@@ -19,6 +19,8 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use tauri::menu::{Menu, MenuBuilder, MenuItem};
@@ -27,6 +29,8 @@ use tauri_plugin_opener::OpenerExt;
 
 const CONFIG_KEY: &str = "unified_gateway_config_v1";
 const GENERATED_CATEGORY: &str = "unified_gateway";
+const MODEL_REGISTRY_OVERRIDES_FILE: &str = "model-registry.overrides.json";
+const MODEL_REGISTRY_OVERRIDES_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +38,24 @@ pub enum GatewayApiFormat {
     OpenaiChat,
     OpenaiResponses,
     Anthropic,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelRegistryEntry {
+    pub canonical_model: String,
+    pub ids: Vec<String>,
+    pub base_metadata: GatewayModelMetadata,
+    pub metadata: GatewayModelMetadata,
+    pub default_reasoning_level: Option<String>,
+    pub overridden: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelRegistrySnapshot {
+    pub override_file: String,
+    pub entries: Vec<GatewayModelRegistryEntry>,
 }
 
 pub fn routing_weights_for_alias(
@@ -75,6 +97,99 @@ pub fn resolve_gateway_model_capabilities(
             source: "unknown".to_string(),
         },
     }
+}
+
+#[tauri::command]
+pub fn get_gateway_model_registry(
+    state: tauri::State<'_, AppState>,
+) -> Result<GatewayModelRegistrySnapshot, String> {
+    reload_model_registry_overrides_file().map_err(|e| e.to_string())?;
+    let config = load_config(&state.db).map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for catalog in crate::model_capabilities::registry_catalog_models(None) {
+        let canonical = crate::model_capabilities::canonical_model_key(&catalog.canonical_model);
+        let base_metadata = GatewayModelMetadata {
+            context_length: catalog.capabilities.context_length,
+            max_output_tokens: catalog.capabilities.max_output_tokens,
+            input_modalities: catalog.capabilities.input_modalities,
+            reasoning_levels: catalog.capabilities.reasoning_levels,
+        };
+        let mut metadata = base_metadata.clone();
+        let overridden = config.model_registry_overrides.contains_key(&canonical);
+        if let Some(override_metadata) = config.model_registry_overrides.get(&canonical) {
+            metadata.apply_explicit_override(override_metadata);
+        }
+        let default_reasoning_level = catalog
+            .capabilities
+            .default_reasoning_level
+            .filter(|value| metadata.reasoning_levels.iter().any(|level| level == value));
+        seen.insert(canonical.clone());
+        entries.push(GatewayModelRegistryEntry {
+            canonical_model: canonical,
+            ids: catalog.ids,
+            base_metadata,
+            metadata,
+            default_reasoning_level,
+            overridden,
+        });
+    }
+
+    let mut configured_unknown: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    for provider in &config.providers {
+        for model in &provider.models {
+            let canonical = crate::model_capabilities::canonical_model_key(&model.upstream_model);
+            if canonical.is_empty() || seen.contains(&canonical) {
+                continue;
+            }
+            configured_unknown
+                .entry(canonical)
+                .or_default()
+                .insert(model.upstream_model.trim().to_string());
+        }
+    }
+
+    for (canonical, ids) in configured_unknown {
+        let metadata = config
+            .model_registry_overrides
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_default();
+        let overridden = config.model_registry_overrides.contains_key(&canonical);
+        seen.insert(canonical.clone());
+        let mut ids: Vec<String> = ids.into_iter().collect();
+        ids.sort();
+        entries.push(GatewayModelRegistryEntry {
+            canonical_model: canonical,
+            ids,
+            base_metadata: GatewayModelMetadata::default(),
+            metadata,
+            default_reasoning_level: None,
+            overridden,
+        });
+    }
+
+    for (canonical, metadata) in &config.model_registry_overrides {
+        if seen.contains(canonical) {
+            continue;
+        }
+        seen.insert(canonical.clone());
+        entries.push(GatewayModelRegistryEntry {
+            canonical_model: canonical.clone(),
+            ids: vec![canonical.clone()],
+            base_metadata: GatewayModelMetadata::default(),
+            metadata: metadata.clone(),
+            default_reasoning_level: None,
+            overridden: true,
+        });
+    }
+
+    entries.sort_by(|a, b| a.canonical_model.cmp(&b.canonical_model));
+    Ok(GatewayModelRegistrySnapshot {
+        override_file: model_registry_overrides_path().display().to_string(),
+        entries,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -150,6 +265,127 @@ pub struct GatewayModelMetadata {
     pub input_modalities: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_levels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelRegistryOverridesFile {
+    #[serde(default = "default_model_registry_overrides_version")]
+    version: u32,
+    #[serde(default)]
+    overrides: HashMap<String, GatewayModelMetadata>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModelRegistryOverridesCache {
+    path: Option<PathBuf>,
+    loaded: bool,
+    overrides: Option<HashMap<String, GatewayModelMetadata>>,
+}
+
+fn model_registry_overrides_cache() -> &'static RwLock<ModelRegistryOverridesCache> {
+    static CACHE: OnceLock<RwLock<ModelRegistryOverridesCache>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(ModelRegistryOverridesCache::default()))
+}
+
+fn default_model_registry_overrides_version() -> u32 {
+    MODEL_REGISTRY_OVERRIDES_VERSION
+}
+
+fn model_registry_overrides_path() -> PathBuf {
+    crate::config::get_app_config_dir().join(MODEL_REGISTRY_OVERRIDES_FILE)
+}
+
+fn normalize_registry_overrides(
+    overrides: HashMap<String, GatewayModelMetadata>,
+) -> HashMap<String, GatewayModelMetadata> {
+    overrides
+        .into_iter()
+        .filter_map(|(model_id, mut metadata)| {
+            let canonical = crate::model_capabilities::canonical_model_key(&model_id);
+            if canonical.is_empty() {
+                return None;
+            }
+            normalize_model_metadata(&mut metadata);
+            has_model_metadata_values(&metadata).then_some((canonical, metadata))
+        })
+        .collect()
+}
+
+fn read_model_registry_overrides_file(
+    path: &std::path::Path,
+) -> Result<Option<HashMap<String, GatewayModelMetadata>>, AppError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|e| AppError::Config(format!("模型 Registry 覆盖文件解析失败: {e}")))?;
+
+    // v1 正式格式：{ "version": 1, "overrides": { ... } }。
+    // 同时兼容早期手工维护过的直接 map 形状，避免升级后丢配置。
+    let overrides = if value.get("overrides").is_some() || value.get("version").is_some() {
+        let file: ModelRegistryOverridesFile = serde_json::from_value(value)
+            .map_err(|e| AppError::Config(format!("模型 Registry 覆盖文件结构无效: {e}")))?;
+        if file.version > MODEL_REGISTRY_OVERRIDES_VERSION {
+            return Err(AppError::Config(format!(
+                "模型 Registry 覆盖文件版本 {} 高于当前支持版本 {}",
+                file.version, MODEL_REGISTRY_OVERRIDES_VERSION
+            )));
+        }
+        file.overrides
+    } else {
+        serde_json::from_value::<HashMap<String, GatewayModelMetadata>>(value)
+            .map_err(|e| AppError::Config(format!("模型 Registry 覆盖文件结构无效: {e}")))?
+    };
+    Ok(Some(normalize_registry_overrides(overrides)))
+}
+
+fn reload_model_registry_overrides_file(
+) -> Result<Option<HashMap<String, GatewayModelMetadata>>, AppError> {
+    let path = model_registry_overrides_path();
+    let overrides = read_model_registry_overrides_file(&path)?;
+    let mut cache = model_registry_overrides_cache()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.path = Some(path);
+    cache.loaded = true;
+    cache.overrides = overrides.clone();
+    Ok(overrides)
+}
+
+fn load_model_registry_overrides_file(
+) -> Result<Option<HashMap<String, GatewayModelMetadata>>, AppError> {
+    let path = model_registry_overrides_path();
+    {
+        let cache = model_registry_overrides_cache()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.loaded && cache.path.as_ref() == Some(&path) {
+            return Ok(cache.overrides.clone());
+        }
+    }
+    reload_model_registry_overrides_file()
+}
+
+fn save_model_registry_overrides_file(
+    overrides: &HashMap<String, GatewayModelMetadata>,
+) -> Result<(), AppError> {
+    let path = model_registry_overrides_path();
+    let file = ModelRegistryOverridesFile {
+        version: MODEL_REGISTRY_OVERRIDES_VERSION,
+        overrides: normalize_registry_overrides(overrides.clone()),
+    };
+    let bytes = serde_json::to_vec_pretty(&file)
+        .map_err(|e| AppError::JsonSerialize { source: e })?;
+    crate::config::atomic_write(&path, &bytes)?;
+    let mut cache = model_registry_overrides_cache()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.path = Some(path);
+    cache.loaded = true;
+    cache.overrides = Some(file.overrides);
+    Ok(())
 }
 
 impl GatewayModelMetadata {
@@ -443,11 +679,22 @@ pub fn generate_local_key() -> String {
 }
 
 pub fn load_config(db: &Database) -> Result<GatewayConfig, AppError> {
-    match db.get_setting(CONFIG_KEY)? {
+    let mut config = match db.get_setting(CONFIG_KEY)? {
         Some(raw) => parse_config_with_migration(&raw)
-            .map_err(|e| AppError::Config(format!("统一网关配置解析失败: {e}"))),
-        None => Ok(GatewayConfig::default()),
+            .map_err(|e| AppError::Config(format!("统一网关配置解析失败: {e}")))?,
+        None => GatewayConfig::default(),
+    };
+
+    // New SSOT: user-editable registry overrides live beside the rest of the
+    // application data. Legacy DB-embedded overrides are still accepted and
+    // are used as a migration fallback until the next save.
+    if let Some(file_overrides) = load_model_registry_overrides_file()? {
+        config.model_registry_overrides = file_overrides;
+    } else {
+        config.model_registry_overrides =
+            normalize_registry_overrides(config.model_registry_overrides);
     }
+    Ok(config)
 }
 
 /// 先按新结构解析；失败或未含 `models` 时，按旧结构（providers 顶层带 apiFormat +
@@ -734,6 +981,13 @@ fn normalize_model_metadata(metadata: &mut GatewayModelMetadata) {
     metadata.reasoning_levels.dedup();
 }
 
+fn has_model_metadata_values(metadata: &GatewayModelMetadata) -> bool {
+    metadata.context_length.is_some()
+        || metadata.max_output_tokens.is_some()
+        || !metadata.input_modalities.is_empty()
+        || !metadata.reasoning_levels.is_empty()
+}
+
 pub fn routing_policy_for_alias(config: &GatewayConfig, alias: &str) -> GatewayRoutingPolicy {
     config
         .routing_policies
@@ -888,9 +1142,10 @@ fn generated_provider_id(provider_id: &str, format: GatewayApiFormat) -> String 
     format!("{}::{}", provider_id, format.generated_suffix())
 }
 
-fn provider_meta(
+fn provider_meta_with_registry(
     provider: &GatewayProvider,
     format: GatewayApiFormat,
+    registry_overrides: &HashMap<String, GatewayModelMetadata>,
 ) -> ProviderMeta {
     let mut meta = ProviderMeta::default();
     meta.gateway_source_provider_id = Some(provider.id.clone());
@@ -899,6 +1154,18 @@ fn provider_meta(
     meta.gateway_queue_timeout_ms = Some(provider.queue_timeout_ms);
     meta.api_format = Some(format.as_wire_name().to_string());
     meta.reasoning_request_mode = Some(provider.reasoning_request_mode.clone());
+    for model in &provider.models {
+        if !model.enabled || model.api_format != format {
+            continue;
+        }
+        let effective = effective_provider_model_metadata(provider, model, registry_overrides);
+        if !effective.reasoning_levels.is_empty() {
+            meta.reasoning_model_levels.insert(
+                model.upstream_model.trim().to_ascii_lowercase(),
+                effective.reasoning_levels,
+            );
+        }
+    }
     meta.reasoning_history_mode = Some(provider.reasoning_history_mode.clone());
     meta.adaptive_thinking_display =
         Some(provider.adaptive_thinking_display.clone());
@@ -953,6 +1220,10 @@ fn provider_meta(
     meta
 }
 
+fn provider_meta(provider: &GatewayProvider, format: GatewayApiFormat) -> ProviderMeta {
+    provider_meta_with_registry(provider, format, &HashMap::new())
+}
+
 /// 计算一个供应商对外发请求时应使用的“客户端指纹”：
 /// 返回 (有效 User-Agent, 需要额外注入的请求头)。
 ///
@@ -986,6 +1257,7 @@ fn materialize_provider(
     format: GatewayApiFormat,
     app_type: &str,
     sort_index: usize,
+    registry_overrides: &HashMap<String, GatewayModelMetadata>,
 ) -> Provider {
     let exact_model_map = provider_model_map(provider, format);
     let auth_is_x_api_key = matches!(provider.auth_style.as_str(), "x-api-key")
@@ -1026,7 +1298,7 @@ fn materialize_provider(
         created_at: Some(chrono::Utc::now().timestamp_millis()),
         sort_index: Some(sort_index),
         notes: (!provider.notes.trim().is_empty()).then(|| provider.notes.clone()),
-        meta: Some(provider_meta(provider, format)),
+        meta: Some(provider_meta_with_registry(provider, format, registry_overrides)),
         icon: Some(match format {
             GatewayApiFormat::Anthropic => "anthropic".to_string(),
             _ => "openai".to_string(),
@@ -1124,7 +1396,13 @@ fn sync_generated_providers(db: &Database, config: &GatewayConfig) -> Result<(),
         for (index, (_, provider, format)) in combos.iter().enumerate() {
             db.save_provider(
                 app_type,
-                &materialize_provider(provider, *format, app_type, index),
+                &materialize_provider(
+                    provider,
+                    *format,
+                    app_type,
+                    index,
+                    &config.model_registry_overrides,
+                ),
             )?;
         }
     }
@@ -1369,7 +1647,15 @@ pub async fn save_gateway_config(
     let config = normalize_config(config);
     validate_config(&config)?;
     apply_runtime_config(&state, &config).await?;
-    let serialized = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    save_model_registry_overrides_file(&config.model_registry_overrides)
+        .map_err(|e| e.to_string())?;
+
+    // Keep the legacy field in the Rust/IPC shape for backwards compatibility,
+    // but stop persisting a duplicate copy in the DB. load_config() hydrates it
+    // from model-registry.overrides.json on every load.
+    let mut persisted = config.clone();
+    persisted.model_registry_overrides.clear();
+    let serialized = serde_json::to_string_pretty(&persisted).map_err(|e| e.to_string())?;
     state
         .db
         .set_setting(CONFIG_KEY, &serialized)
@@ -3165,8 +3451,13 @@ mod tests {
         p.models[0].upstream_model = "gpt-test".to_string();
         config.providers.push(p);
 
-        let generated =
-            materialize_provider(&config.providers[0], GatewayApiFormat::OpenaiResponses, "codex", 0);
+        let generated = materialize_provider(
+            &config.providers[0],
+            GatewayApiFormat::OpenaiResponses,
+            "codex",
+            0,
+            &config.model_registry_overrides,
+        );
         assert_eq!(
             generated.settings_config["gateway_model_map"]["best-code"],
             Value::String("gpt-test".to_string())

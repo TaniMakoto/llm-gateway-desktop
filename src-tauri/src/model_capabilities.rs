@@ -12,7 +12,7 @@ struct RegistryFile {
     text_only_models: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RegistryEntry {
     ids: Vec<String>,
@@ -42,6 +42,38 @@ pub(crate) struct RegistryModelCapabilities {
     pub input_modalities: Vec<String>,
     pub reasoning_levels: Vec<String>,
     pub default_reasoning_level: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RegistryCatalogModel {
+    pub canonical_model: String,
+    pub ids: Vec<String>,
+    pub capabilities: RegistryModelCapabilities,
+}
+
+pub(crate) fn registry_catalog_models(api_format: Option<&str>) -> Vec<RegistryCatalogModel> {
+    registry_file()
+        .models
+        .iter()
+        .filter_map(|entry| {
+            let canonical_model = entry.ids.first()?.clone();
+            let reasoning_levels = api_format
+                .and_then(|format| entry.protocol_reasoning_levels.get(format))
+                .cloned()
+                .unwrap_or_else(|| entry.reasoning_levels.clone());
+            Some(RegistryCatalogModel {
+                canonical_model,
+                ids: entry.ids.clone(),
+                capabilities: RegistryModelCapabilities {
+                    context_length: entry.context_length,
+                    max_output_tokens: entry.max_output_tokens,
+                    input_modalities: entry.input_modalities.clone(),
+                    reasoning_levels,
+                    default_reasoning_level: entry.default_reasoning_level.clone(),
+                },
+            })
+        })
+        .collect()
 }
 
 /// Conservative built-in capability fallback used only when upstream/user

@@ -375,9 +375,11 @@ fn apply_reasoning_options(
     config: Option<&CodexChatReasoningConfig>,
 ) {
     let Some(config) = config else {
-        if super::transform::supports_reasoning_effort(model) {
-            if let Some(effort) = body.pointer("/reasoning/effort") {
-                result["reasoning_effort"] = effort.clone();
+        if let Some(requested) = body.pointer("/reasoning/effort").and_then(Value::as_str) {
+            if let Some(effort) =
+                super::transform::reasoning_effort_for_model(model, "openai_chat", requested)
+            {
+                result["reasoning_effort"] = json!(effort);
             }
         }
         return;
