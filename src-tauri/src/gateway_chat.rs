@@ -533,6 +533,7 @@ fn responses_sse_to_chat_response(response: Response, requested_model: String) -
     let log_model = requested_model.clone();
     let converted = stream! {
         let mut buffer = String::new();
+        let mut utf8_remainder = Vec::new();
         let mut converter = ResponsesChatSseConverter::new(requested_model);
         // 只喂给断流日志，不影响下发的字节。
         let stream_start = Instant::now();
@@ -543,10 +544,8 @@ fn responses_sse_to_chat_response(response: Response, requested_model: String) -
             match next {
                 Ok(bytes) => {
                     forwarded_bytes += bytes.len() as u64;
-                    buffer.push_str(&String::from_utf8_lossy(&bytes).replace("\r\n", "\n"));
-                    while let Some(position) = buffer.find("\n\n") {
-                        let event = buffer[..position].to_string();
-                        buffer.drain(..position + 2);
+                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    while let Some(event) = crate::proxy::sse::take_sse_block(&mut buffer) {
                         for output in converter.process_sse_event(&event) {
                             forwarded_chunks += 1;
                             yield Ok::<Bytes, axum::Error>(Bytes::from(output));

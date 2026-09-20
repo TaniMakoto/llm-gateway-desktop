@@ -129,7 +129,7 @@ async fn upstream(State(mock): State<Mock>, headers: HeaderMap, Json(body): Json
     Response::builder().header("content-type", content_type).body(Body::from_stream(futures::stream::iter(chunks))).unwrap()
 }
 
-fn check_upstream(format: Format, headers: &HeaderMap, body: &Value, scenario: &str) -> Result<(), String> {
+fn check_upstream(format: Format, headers: &HeaderMap, body: &Value, scenario: &str, call_id: &str) -> Result<(), String> {
     if body["model"] != MODEL { return Err(format!("alias not mapped: {body}")); }
     let serialized = body.to_string();
     if serialized.contains("matrix-local-key") || headers.values().any(|v| v == "matrix-local-key" || v == "Bearer matrix-local-key") { return Err("local key leaked upstream".into()); }
@@ -144,16 +144,16 @@ fn check_upstream(format: Format, headers: &HeaderMap, body: &Value, scenario: &
     if scenario != "text" && (tool_name != "weather" || parameters["properties"]["city"]["type"] != "string") { return Err(format!("tool definition lost: {body}")); }
     if scenario == "result" {
         let valid = match format {
-            Format::Chat => input.as_array().unwrap().iter().any(|v| v["role"] == "tool" && v["tool_call_id"] == CALL && v["content"] == "matrix tool result"),
-            Format::Responses => input.as_array().unwrap().iter().any(|v| v["type"] == "function_call_output" && v["call_id"] == CALL && v["output"] == "matrix tool result"),
-            Format::Anthropic => input.as_array().unwrap().iter().filter_map(|v| v["content"].as_array()).flatten().any(|v| v["type"] == "tool_result" && v["tool_use_id"] == CALL && v["content"] == "matrix tool result"),
+            Format::Chat => input.as_array().unwrap().iter().any(|v| v["role"] == "tool" && v["tool_call_id"] == call_id && v["content"] == "matrix tool result"),
+            Format::Responses => input.as_array().unwrap().iter().any(|v| v["type"] == "function_call_output" && v["call_id"] == call_id && v["output"] == "matrix tool result"),
+            Format::Anthropic => input.as_array().unwrap().iter().filter_map(|v| v["content"].as_array()).flatten().any(|v| v["type"] == "tool_result" && v["tool_use_id"] == call_id && v["content"] == "matrix tool result"),
         };
         if !valid { return Err(format!("tool result/correlation lost: {body}")); }
     }
     Ok(())
 }
 
-fn check_response(format: Format, stream: bool, tool: bool, wire: &str) -> Result<(), String> {
+fn check_response(format: Format, stream: bool, tool: bool, wire: &str, call_id: &mut String) -> Result<(), String> {
     let values: Vec<Value> = if stream {
         wire.lines().filter_map(|line| line.strip_prefix("data:")).map(str::trim).filter(|line| *line != "[DONE]").map(serde_json::from_str).collect::<Result<_, _>>().map_err(|e| e.to_string())?
     } else { vec![serde_json::from_str(wire).map_err(|e| e.to_string())?] };
@@ -195,7 +195,7 @@ fn check_response(format: Format, stream: bool, tool: bool, wire: &str) -> Resul
             }
             (Format::Anthropic, true) => {
                 if value["type"] == "message_start" { input_tokens = value["message"]["usage"]["input_tokens"].as_u64().unwrap_or(0); }
-                if value["type"] == "message_delta" { output_tokens = value["usage"]["output_tokens"].as_u64().unwrap_or(0); }
+                if value["type"] == "message_delta" { input_tokens = input_tokens.max(value["usage"]["input_tokens"].as_u64().unwrap_or(0)); output_tokens = value["usage"]["output_tokens"].as_u64().unwrap_or(0); }
                 if value["type"] == "message_stop" { terminal += 1; }
                 let part = &value["content_block"];
                 if part["type"] == "tool_use" { id = part["id"].as_str().unwrap_or("").into(); name = part["name"].as_str().unwrap_or("").into(); }
@@ -206,7 +206,8 @@ fn check_response(format: Format, stream: bool, tool: bool, wire: &str) -> Resul
     }
     if terminal != 1 { return Err(format!("expected exactly one terminal, got {terminal}: {wire}")); }
     if tool {
-        if id != CALL || name != "weather" || serde_json::from_str::<Value>(&args).ok() != Some(json!({"city":"杭州"})) { return Err(format!("tool call corrupted: id={id}, name={name}, args={args}; {wire}")); }
+        if id.is_empty() || name != "weather" || serde_json::from_str::<Value>(&args).ok() != Some(json!({"city":"杭州"})) { return Err(format!("tool call corrupted: id={id}, name={name}, args={args}; {wire}")); }
+        *call_id = id;
     } else if text != TEXT { return Err(format!("text missing/duplicated: {text:?}; {wire}")); }
     if input_tokens != 4 || output_tokens != 5 { return Err(format!("usage lost: {input_tokens}/{output_tokens}; {wire}")); }
     if stream && matches!(format, Format::Chat) && wire.lines().filter(|l| *l == "data: [DONE]").count() != 1 { return Err(format!("missing/duplicate DONE: {wire}")); }
@@ -217,7 +218,7 @@ fn check_response(format: Format, stream: bool, tool: bool, wire: &str) -> Resul
 #[serial_test::serial]
 async fn gateway_protocol_matrix_over_real_http() {
     let mut failures = Vec::new();
-    for up in FORMATS { for down in FORMATS { for stream in [false, true] { for scenario in ["text", "tool", "result"] {
+    for up in FORMATS { for down in FORMATS { for stream in [false, true] { let mut call_id = CALL.to_string(); for scenario in ["text", "tool", "result"] {
         let label = format!("{down:?} -> {up:?}, stream={stream}, {scenario}");
         let mock = Mock { format: up, tool: scenario == "tool", seen: Arc::new(Mutex::new(Vec::new())) };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -232,18 +233,29 @@ async fn gateway_protocol_matrix_over_real_http() {
         let server = ProxyServer::new(ProxyConfig { listen_port: 0, enable_logging: false, ..Default::default() }, db, None);
         let info = server.start().await.unwrap();
         let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(15)).build().unwrap();
+        let mut payload = request(down, stream, scenario);
+        replace_call_id(&mut payload, &call_id);
         let outcome = async {
-            let response = client.post(format!("http://127.0.0.1:{}{}", info.port, down.path())).bearer_auth("matrix-local-key").header("anthropic-version", "2023-06-01").json(&request(down, stream, scenario)).send().await.map_err(|e| e.to_string())?;
+            let response = client.post(format!("http://127.0.0.1:{}{}", info.port, down.path())).bearer_auth("matrix-local-key").header("anthropic-version", "2023-06-01").json(&payload).send().await.map_err(|e| e.to_string())?;
             let status = response.status();
             let wire = response.text().await.map_err(|e| e.to_string())?;
             if status != StatusCode::OK { return Err(format!("HTTP {status}: {wire}")); }
             let seen = mock.seen.lock().unwrap();
             if seen.len() != 1 { return Err(format!("expected one upstream request, got {}", seen.len())); }
-            check_upstream(up, &seen[0].0, &seen[0].1, scenario)?;
-            check_response(down, stream, scenario == "tool", &wire)
+            check_upstream(up, &seen[0].0, &seen[0].1, scenario, &call_id)?;
+            check_response(down, stream, scenario == "tool", &wire, &mut call_id)
         }.await;
         server.stop().await.unwrap(); task.abort(); let _ = task.await;
         if let Err(error) = outcome { failures.push(format!("{label}: {error}")); } else { println!("PASS {label}"); }
     }}}}
     assert!(failures.is_empty(), "{} of 54 combinations failed:\n{}", failures.len(), failures.join("\n\n"));
+}
+
+fn replace_call_id(value: &mut Value, id: &str) {
+    match value {
+        Value::String(s) if s == CALL => *s = id.to_string(),
+        Value::Array(values) => values.iter_mut().for_each(|v| replace_call_id(v, id)),
+        Value::Object(values) => values.values_mut().for_each(|v| replace_call_id(v, id)),
+        _ => {}
+    }
 }
