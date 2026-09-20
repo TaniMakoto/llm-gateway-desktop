@@ -572,13 +572,12 @@ fn responses_sse_to_chat_response(response: Response, requested_model: String) -
             }
         }
         if !converter.finished {
-            // 行为不变（仍然用 finish(None) 补一个正常收尾）：只记一条 ERROR，方便
-            // 事后把"上游提前 EOF 被补成正常结束"和真正的正常结束区分开。
+            // EOF without a protocol terminal is a failed response, not a stop.
             log::error!(
                 "[Chat] 上游流式响应提前结束（未收到 Responses 正常结束标记）: model={log_model}, 已转发 {forwarded_chunks} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms",
                 stream_start.elapsed().as_millis()
             );
-            for output in converter.finish(None) {
+            for output in converter.fail(json!({"type":"stream_error","code":"incomplete_stream","message":"Upstream stream ended before a terminal response event"})) {
                 yield Ok::<Bytes, axum::Error>(Bytes::from(output));
             }
         }
@@ -623,6 +622,7 @@ impl ResponsesChatSseConverter {
     }
 
     fn process_sse_event(&mut self, raw: &str) -> Vec<String> {
+        if self.finished { return Vec::new(); }
         let data = raw
             .lines()
             .filter_map(|line| line.strip_prefix("data:"))
@@ -702,12 +702,20 @@ impl ResponsesChatSseConverter {
                 output.extend(self.finish(response));
             }
             "response.failed" | "error" => {
-                output.push(format!("data: {}\n\n", event));
-                output.extend(self.finish(None));
+                let error = event.pointer("/response/error").or_else(|| event.get("error"))
+                    .filter(|value| !value.is_null()).cloned()
+                    .unwrap_or_else(|| json!({"type":"upstream_error","message":"Upstream response failed"}));
+                output.extend(self.fail(error));
             }
             _ => {}
         }
         output
+    }
+
+    fn fail(&mut self, error: Value) -> Vec<String> {
+        if self.finished { return Vec::new(); }
+        self.finished = true;
+        vec![format!("data: {}\n\n", json!({"error":error})), "data: [DONE]\n\n".into()]
     }
 
     fn update_metadata(&mut self, event: &Value) {
@@ -824,6 +832,44 @@ fn chat_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn converted_wire(wire: String) -> String {
+        let chunks: Vec<_> = wire.as_bytes().iter().map(|byte| Ok::<_, std::io::Error>(Bytes::from(vec![*byte]))).collect();
+        let response = Response::new(Body::from_stream(futures::stream::iter(chunks)));
+        let converted = responses_sse_to_chat_response(response, "test".into());
+        let bytes = converted.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gateway_chat_sse_handles_single_byte_utf8_and_crlf_chunks() {
+        let wire = format!("data: {}\r\n\r\ndata: {}\r\n\r\n", json!({"type":"response.output_text.delta","delta":"杭州 🌏"}), json!({"type":"response.completed","response":{"status":"completed"}}));
+        let converted = converted_wire(wire).await;
+        assert!(converted.contains("杭州 🌏"), "{converted}");
+        assert_eq!(converted.matches("data: [DONE]").count(), 1);
+        assert_eq!(converted.matches("\"finish_reason\":\"stop\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_chat_truncated_stream_never_reports_success() {
+        let converted = converted_wire(format!("data: {}\n\n", json!({"type":"response.output_text.delta","delta":"partial"}))).await;
+        assert!(converted.contains("incomplete_stream"), "{converted}");
+        assert!(!converted.contains("\"finish_reason\":\"stop\""));
+        assert_eq!(converted.matches("data: [DONE]").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_chat_error_is_normalized_and_terminal_is_not_repeated() {
+        let failed = json!({"type":"response.failed","response":{"error":{"type":"server_error","message":"mock failure"}}});
+        let late = json!({"type":"response.completed","response":{"status":"completed"}});
+        let converted = converted_wire(format!("data: {failed}\n\ndata: {late}\n\n")).await;
+        let error: Value = serde_json::from_str(converted.lines().find_map(|line| line.strip_prefix("data: ")).unwrap()).unwrap();
+        assert_eq!(error["error"]["type"], "server_error");
+        assert_eq!(error["error"]["message"], "mock failure");
+        assert!(!converted.contains("\"finish_reason\":\"stop\""));
+        assert_eq!(converted.matches("data: [DONE]").count(), 1);
+        assert_eq!(converted.matches("mock failure").count(), 1);
+    }
 
     #[test]
     fn chat_request_maps_messages_tools_and_limits() {
