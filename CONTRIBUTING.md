@@ -15,10 +15,13 @@ Thanks for helping improve LLM Gateway Desktop.
 pnpm install --frozen-lockfile
 pnpm typecheck
 pnpm format:check
-cargo test --locked --manifest-path src-tauri/Cargo.toml gateway --lib
+cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+cargo test --locked --manifest-path src-tauri/Cargo.toml gateway::protocol_tests --lib -- --nocapture
 ```
 
 For user-facing changes, also test at least one non-streaming request, one SSE request, and one tool call through `tools/mock_upstream.py`.
+
+The inline `gateway::protocol_tests` suite starts the real gateway and local mock upstreams on ephemeral ports with in-memory databases. It covers all nine client/upstream protocol pairs in JSON and SSE, including tool calls and replay of the returned tool IDs. It also checks authentication, failover and 429 cooldown. It needs no external API credentials or desktop window. Do not substitute a direct mock-server smoke test for this suite.
 
 ## Commit scope
 

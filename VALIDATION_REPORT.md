@@ -1,5 +1,7 @@
 # Source Validation Report
 
+> Historical report from 2026-07-22. For the 2026-09-20 source review and checks, see [Development status](docs/DEVELOPMENT_STATUS.md). The reproduction command below targets the mock server directly, so its 8/8 result does not establish end-to-end validation of the Rust gateway. Statements below about missing dependencies describe the historical environment, not the current checkout.
+
 Project: LLM Gateway Desktop 0.1.0 alpha  
 Validation date: 2026-07-22
 

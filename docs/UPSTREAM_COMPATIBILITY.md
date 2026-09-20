@@ -2,7 +2,7 @@
 
 Each provider can define the public HTTP compatibility settings used by normal inference requests and by model discovery:
 
-- API format: OpenAI Chat, OpenAI Responses, or Anthropic Messages
+- API format per model entry: OpenAI Chat, OpenAI Responses, or Anthropic Messages
 - Authentication: automatic, Bearer, or `x-api-key`
 - Custom User-Agent
 - Custom request headers
@@ -24,7 +24,13 @@ When the model-list URL is empty, the application derives common candidates from
 
 OpenAI-style providers are queried with `Authorization: Bearer ...`. Anthropic-style providers in automatic authentication mode are queried with `x-api-key` and `anthropic-version: 2023-06-01`. The parser accepts both OpenAI and Anthropic model-list response shapes.
 
-Fetched models are cached in the local provider configuration and appear as suggestions in the model-route editor. The local public `GET /v1/models` endpoint continues to expose local route aliases, because clients must call aliases rather than bypass the configured routing policy.
+Fetched models are cached in the local provider configuration and appear as suggestions when editing provider model entries. The local public `GET /v1/models` endpoint exposes local aliases. Configure and call these aliases to use the intended routing policy; the inherited router still has a fallback path for unknown aliases, so the model list alone should not be treated as an enforced allowlist.
+
+## Model capabilities and reasoning
+
+The gateway combines the built-in `model_capabilities.json` registry with discovered metadata and manual overrides. Global model corrections are persisted through `model-registry.overrides.json` in the application data directory. Provider settings also expose reasoning request mapping, reasoning history replay, and adaptive thinking display options. These settings describe compatibility behavior; they cannot guarantee that an upstream implements every advertised capability.
+
+Providers and individual model entries can enable request/response body recording for diagnosis. It is disabled by default and can contain prompt text and tool content when enabled.
 
 ## Compatibility boundary
 

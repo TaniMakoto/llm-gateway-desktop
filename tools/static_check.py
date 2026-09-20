@@ -21,6 +21,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUST_FILES = [
     "src-tauri/src/gateway.rs",
     "src-tauri/src/gateway_chat.rs",
+    "src-tauri/src/gateway_runtime.rs",
+    "src-tauri/src/gateway/protocol_tests.rs",
     "src-tauri/src/lib.rs",
     "src-tauri/src/main.rs",
     "src-tauri/src/config.rs",
