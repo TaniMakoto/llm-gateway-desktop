@@ -330,8 +330,8 @@ async fn responses_json_to_chat_response(
     let responses_value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| ProxyError::TransformError(format!("Responses JSON 无效: {error}")))?;
     let chat_value = responses_response_to_chat(responses_value, requested_model)?;
-    let encoded = serde_json::to_vec(&chat_value)
-        .map_err(|error| ProxyError::Internal(error.to_string()))?;
+    let encoded =
+        serde_json::to_vec(&chat_value).map_err(|error| ProxyError::Internal(error.to_string()))?;
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.remove(header::CONTENT_ENCODING);
     parts.headers.insert(
@@ -399,10 +399,7 @@ pub fn responses_response_to_chat(
                     .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
                     .unwrap_or("call_gateway");
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool");
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
                 let arguments = item
                     .get("arguments")
                     .map(arguments_as_string)
@@ -589,10 +586,9 @@ fn responses_sse_to_chat_response(response: Response, requested_model: String) -
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/event-stream"),
     );
-    parts.headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache"),
-    );
+    parts
+        .headers
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     Response::from_parts(parts, Body::from_stream(converted))
 }
 
@@ -622,7 +618,9 @@ impl ResponsesChatSseConverter {
     }
 
     fn process_sse_event(&mut self, raw: &str) -> Vec<String> {
-        if self.finished { return Vec::new(); }
+        if self.finished {
+            return Vec::new();
+        }
         let data = raw
             .lines()
             .filter_map(|line| line.strip_prefix("data:"))
@@ -639,7 +637,10 @@ impl ResponsesChatSseConverter {
             return Vec::new();
         };
         self.update_metadata(&event);
-        let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let mut output = Vec::new();
 
         match event_type {
@@ -685,7 +686,10 @@ impl ResponsesChatSseConverter {
                     .or_else(|| self.last_tool_key.clone())
                     .unwrap_or_else(|| "gateway_tool".to_string());
                 let index = self.tool_index(&key);
-                let delta = event.get("delta").and_then(Value::as_str).unwrap_or_default();
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 output.push(self.chunk(
                     json!({
                         "tool_calls": [{
@@ -702,9 +706,14 @@ impl ResponsesChatSseConverter {
                 output.extend(self.finish(response));
             }
             "response.failed" | "error" => {
-                let error = event.pointer("/response/error").or_else(|| event.get("error"))
-                    .filter(|value| !value.is_null()).cloned()
-                    .unwrap_or_else(|| json!({"type":"upstream_error","message":"Upstream response failed"}));
+                let error = event
+                    .pointer("/response/error")
+                    .or_else(|| event.get("error"))
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .unwrap_or_else(
+                        || json!({"type":"upstream_error","message":"Upstream response failed"}),
+                    );
                 output.extend(self.fail(error));
             }
             _ => {}
@@ -713,9 +722,14 @@ impl ResponsesChatSseConverter {
     }
 
     fn fail(&mut self, error: Value) -> Vec<String> {
-        if self.finished { return Vec::new(); }
+        if self.finished {
+            return Vec::new();
+        }
         self.finished = true;
-        vec![format!("data: {}\n\n", json!({"error":error})), "data: [DONE]\n\n".into()]
+        vec![
+            format!("data: {}\n\n", json!({"error":error})),
+            "data: [DONE]\n\n".into(),
+        ]
     }
 
     fn update_metadata(&mut self, event: &Value) {
@@ -749,10 +763,7 @@ impl ResponsesChatSseConverter {
             .or_else(|| item.get("id"))
             .and_then(Value::as_str)
             .unwrap_or("call_gateway");
-        let name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
         vec![self.chunk(
             json!({
                 "tool_calls": [{
@@ -834,7 +845,11 @@ mod tests {
     use super::*;
 
     async fn converted_wire(wire: String) -> String {
-        let chunks: Vec<_> = wire.as_bytes().iter().map(|byte| Ok::<_, std::io::Error>(Bytes::from(vec![*byte]))).collect();
+        let chunks: Vec<_> = wire
+            .as_bytes()
+            .iter()
+            .map(|byte| Ok::<_, std::io::Error>(Bytes::from(vec![*byte])))
+            .collect();
         let response = Response::new(Body::from_stream(futures::stream::iter(chunks)));
         let converted = responses_sse_to_chat_response(response, "test".into());
         let bytes = converted.into_body().collect().await.unwrap().to_bytes();
@@ -843,7 +858,11 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_chat_sse_handles_single_byte_utf8_and_crlf_chunks() {
-        let wire = format!("data: {}\r\n\r\ndata: {}\r\n\r\n", json!({"type":"response.output_text.delta","delta":"杭州 🌏"}), json!({"type":"response.completed","response":{"status":"completed"}}));
+        let wire = format!(
+            "data: {}\r\n\r\ndata: {}\r\n\r\n",
+            json!({"type":"response.output_text.delta","delta":"杭州 🌏"}),
+            json!({"type":"response.completed","response":{"status":"completed"}})
+        );
         let converted = converted_wire(wire).await;
         assert!(converted.contains("杭州 🌏"), "{converted}");
         assert_eq!(converted.matches("data: [DONE]").count(), 1);
@@ -852,7 +871,11 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_chat_truncated_stream_never_reports_success() {
-        let converted = converted_wire(format!("data: {}\n\n", json!({"type":"response.output_text.delta","delta":"partial"}))).await;
+        let converted = converted_wire(format!(
+            "data: {}\n\n",
+            json!({"type":"response.output_text.delta","delta":"partial"})
+        ))
+        .await;
         assert!(converted.contains("incomplete_stream"), "{converted}");
         assert!(!converted.contains("\"finish_reason\":\"stop\""));
         assert_eq!(converted.matches("data: [DONE]").count(), 1);
@@ -863,7 +886,13 @@ mod tests {
         let failed = json!({"type":"response.failed","response":{"error":{"type":"server_error","message":"mock failure"}}});
         let late = json!({"type":"response.completed","response":{"status":"completed"}});
         let converted = converted_wire(format!("data: {failed}\n\ndata: {late}\n\n")).await;
-        let error: Value = serde_json::from_str(converted.lines().find_map(|line| line.strip_prefix("data: ")).unwrap()).unwrap();
+        let error: Value = serde_json::from_str(
+            converted
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(error["error"]["type"], "server_error");
         assert_eq!(error["error"]["message"], "mock failure");
         assert!(!converted.contains("\"finish_reason\":\"stop\""));
