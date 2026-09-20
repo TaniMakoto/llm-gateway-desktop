@@ -1,7 +1,7 @@
 //! Contract tests over real loopback HTTP: client -> gateway -> strict mock upstream.
 //! No desktop, external credentials, or user database is required.
 use super::*;
-use crate::{gateway_runtime::GatewayRuntime, proxy::ProxyConfig};
+use crate::gateway_runtime::GatewayRuntime;
 use axum::{
     body::Body, extract::State, http::StatusCode, response::Response, routing::post, Json, Router,
 };
@@ -491,16 +491,7 @@ async fn gateway_protocol_matrix_over_real_http() {
                     };
                     db.set_setting(CONFIG_KEY, &serde_json::to_string(&config).unwrap())
                         .unwrap();
-                    sync_generated_providers(&db, &config).unwrap();
-                    let server = GatewayRuntime::new(db);
-                    server
-                        .update_config(&ProxyConfig {
-                            listen_port: 0,
-                            enable_logging: false,
-                            ..Default::default()
-                        })
-                        .await
-                        .unwrap();
+                    let server = configured_runtime(db, &config).await;
                     let info = server.start().await.unwrap();
                     let client = reqwest::Client::builder()
                         .no_proxy()
@@ -601,16 +592,7 @@ async fn gateway_http_auth_failover_and_rate_limit_cooldown() {
             };
             db.set_setting(CONFIG_KEY, &serde_json::to_string(&config).unwrap())
                 .unwrap();
-            sync_generated_providers(&db, &config).unwrap();
-            let runtime = GatewayRuntime::new(db);
-            runtime
-                .update_config(&ProxyConfig {
-                    listen_port: 0,
-                    enable_logging: false,
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
+            let runtime = configured_runtime(db, &config).await;
             let info = runtime.start().await.unwrap();
             let client = reqwest::Client::builder()
                 .no_proxy()
@@ -672,4 +654,14 @@ async fn gateway_http_auth_failover_and_rate_limit_cooldown() {
             }
         }
     }
+}
+
+// Use the same configuration/materialization path as desktop startup, including
+// the app-level retry/failover settings consumed by RequestContext.
+async fn configured_runtime(db: Arc<Database>, config: &GatewayConfig) -> GatewayRuntime {
+    let state = AppState::new(db);
+    let mut config = config.clone();
+    config.listen_port = 0;
+    apply_runtime_config(&state, &config).await.unwrap();
+    state.gateway_runtime
 }
