@@ -34,7 +34,6 @@ mod provider;
 mod provider_defaults;
 mod proxy;
 mod services;
-mod session_manager;
 mod settings;
 mod store;
 
