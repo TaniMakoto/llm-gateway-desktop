@@ -58,3 +58,6 @@ jobs:
 
       - name: Rust lib tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Protocol matrix over real gateway HTTP
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml gateway::protocol_tests --lib -- --nocapture

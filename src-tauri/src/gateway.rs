@@ -3088,6 +3088,9 @@ pub fn handle_gateway_tray_menu_event(app: &tauri::AppHandle, id: &str) {
 }
 
 #[cfg(test)]
+mod protocol_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
