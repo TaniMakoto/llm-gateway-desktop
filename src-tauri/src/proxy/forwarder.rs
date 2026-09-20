@@ -554,7 +554,9 @@ impl RequestForwarder {
             }
         }
 
-        if should_sync_current {
+        // Gateway providers are request-local routing targets, never CLI live
+        // configuration selections. Do not invoke the inherited takeover service.
+        if should_sync_current && provider.category.as_deref() != Some("unified_gateway") {
             let failover_manager = self.failover_manager.clone();
             let app_handle = self.app_handle.clone();
             let provider_id = provider.id.clone();

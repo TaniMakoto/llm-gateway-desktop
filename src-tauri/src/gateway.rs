@@ -1561,8 +1561,8 @@ pub async fn get_gateway_snapshot(
     state: tauri::State<'_, AppState>,
 ) -> Result<GatewaySnapshot, String> {
     let config = load_config(&state.db).map_err(|e| e.to_string())?;
-    let status = state.proxy_service.get_status().await?;
-    let provider_runtime = gateway_runtime_statuses_for_service(&state.proxy_service, &config).await;
+    let status = state.gateway_runtime.get_status().await?;
+    let provider_runtime = gateway_runtime_statuses_for_service(&state.gateway_runtime, &config).await;
     Ok(GatewaySnapshot {
         config,
         status,
@@ -1571,7 +1571,7 @@ pub async fn get_gateway_snapshot(
 }
 
 async fn gateway_runtime_statuses_for_service(
-    proxy_service: &crate::services::ProxyService,
+    proxy_service: &crate::gateway_runtime::GatewayRuntime,
     config: &GatewayConfig,
 ) -> Vec<GatewayProviderRuntimeStatus> {
     let mut result = Vec::new();
@@ -1618,11 +1618,11 @@ async fn gateway_runtime_statuses_for_service(
 pub(crate) async fn apply_runtime_config(state: &AppState, config: &GatewayConfig) -> Result<(), String> {
     sync_generated_providers(&state.db, config).map_err(|e| e.to_string())?;
 
-    let mut proxy_config = state.proxy_service.get_config().await?;
+    let mut proxy_config = state.gateway_runtime.get_config().await?;
     proxy_config.listen_address = config.listen_address.clone();
     proxy_config.listen_port = config.listen_port;
     proxy_config.enable_logging = config.enable_logging;
-    state.proxy_service.update_config(&proxy_config).await?;
+    state.gateway_runtime.update_config(&proxy_config).await?;
 
     for app_type in ["claude", "codex"] {
         if let Ok(mut app_config) = state.db.get_proxy_config_for_app(app_type).await {
@@ -1670,12 +1670,12 @@ pub async fn start_gateway(
     let config = normalize_config(load_config(&state.db).map_err(|e| e.to_string())?);
     validate_config(&config)?;
     apply_runtime_config(&state, &config).await?;
-    state.proxy_service.start().await
+    state.gateway_runtime.start().await
 }
 
 #[tauri::command]
 pub async fn stop_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.proxy_service.stop().await
+    state.gateway_runtime.stop().await
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3062,7 +3062,7 @@ pub fn handle_gateway_tray_menu_event(app: &tauri::AppHandle, id: &str) {
                     Ok(config) => {
                         if let Err(error) = apply_runtime_config(&state, &config).await {
                             log::error!("应用网关配置失败: {error}");
-                        } else if let Err(error) = state.proxy_service.start().await {
+                        } else if let Err(error) = state.gateway_runtime.start().await {
                             log::error!("从托盘启动网关失败: {error}");
                         }
                     }
@@ -3074,7 +3074,7 @@ pub fn handle_gateway_tray_menu_event(app: &tauri::AppHandle, id: &str) {
             let handle = app.clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
-                if let Err(error) = state.proxy_service.stop().await {
+                if let Err(error) = state.gateway_runtime.stop().await {
                     log::error!("从托盘停止网关失败: {error}");
                 }
             });

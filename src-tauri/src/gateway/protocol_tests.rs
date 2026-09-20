@@ -3,7 +3,7 @@
 use super::*;
 use axum::{body::Body, extract::State, http::StatusCode, response::Response, routing::post, Json, Router};
 use std::sync::{Arc, Mutex};
-use crate::proxy::{server::ProxyServer, ProxyConfig};
+use crate::{gateway_runtime::GatewayRuntime, proxy::ProxyConfig};
 
 const ALIAS: &str = "matrix-alias";
 const MODEL: &str = "matrix-upstream";
@@ -230,7 +230,8 @@ async fn gateway_protocol_matrix_over_real_http() {
         let config = GatewayConfig { local_api_key: "matrix-local-key".into(), enable_logging: false, providers: vec![provider], ..Default::default() };
         db.set_setting(CONFIG_KEY, &serde_json::to_string(&config).unwrap()).unwrap();
         sync_generated_providers(&db, &config).unwrap();
-        let server = ProxyServer::new(ProxyConfig { listen_port: 0, enable_logging: false, ..Default::default() }, db, None);
+        let server = GatewayRuntime::new(db);
+        server.update_config(&ProxyConfig { listen_port: 0, enable_logging: false, ..Default::default() }).await.unwrap();
         let info = server.start().await.unwrap();
         let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(15)).build().unwrap();
         let mut payload = request(down, stream, scenario);
