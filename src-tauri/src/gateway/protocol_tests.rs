@@ -665,3 +665,170 @@ async fn configured_runtime(db: Arc<Database>, config: &GatewayConfig) -> Gatewa
     apply_runtime_config(&state, &config).await.unwrap();
     state.gateway_runtime
 }
+
+
+// Routing contracts use the same public listeners and materialized config as the desktop.
+// Each candidate may use a different protocol and reject an otherwise valid request.
+async fn routing_contract(
+    down: Format,
+    payload: Value,
+    candidates: Vec<(Format, Value, Option<Value>)>,
+) -> (StatusCode, String, Vec<Vec<Value>>) {
+    let mut tasks = Vec::new();
+    let mut captures = Vec::new();
+    let mut providers = Vec::new();
+    for (index, (format, options, rejection)) in candidates.into_iter().enumerate() {
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(format.path(), post(move |Json(body): Json<Value>| {
+            let captured = captured.clone();
+            let rejection = rejection.clone();
+            async move {
+                captured.lock().unwrap().push(body.clone());
+                if let Some(error) = rejection {
+                    return Response::builder().status(400).header("content-type", "application/json")
+                        .body(Body::from(error.to_string())).unwrap();
+                }
+                if body["stream"] == true {
+                    Response::builder().header("content-type", "text/event-stream")
+                        .body(Body::from(response_sse(format, false))).unwrap()
+                } else {
+                    let mut response = response_json(format, false);
+                    response["vendor_extension"] = json!({"preserve":true});
+                    Response::builder().header("content-type", "application/json")
+                        .body(Body::from(response.to_string())).unwrap()
+                }
+            }
+        }));
+        tasks.push(tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); }));
+        let mut provider = json!({"id":format!("route-{index}"),"name":format!("route-{index}"),
+            "baseUrl":format!("http://{addr}/v1"),"apiKey":"upstream-key",
+            "models":[{"alias":ALIAS,"upstreamModel":"deepseek-v4-flash","apiFormat":format.gateway()}]});
+        for (key, value) in options.as_object().unwrap() { provider[key] = value.clone(); }
+        providers.push(serde_json::from_value::<GatewayProvider>(provider).unwrap());
+        captures.push(seen);
+    }
+    let db = Arc::new(Database::memory().unwrap());
+    let config = GatewayConfig { providers, local_api_key:"matrix-local-key".into(), enable_logging:false, ..Default::default() };
+    db.set_setting(CONFIG_KEY, &serde_json::to_string(&config).unwrap()).unwrap();
+    let runtime = configured_runtime(db, &config).await;
+    let info = runtime.start().await.unwrap();
+    let response = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(15)).build().unwrap()
+        .post(format!("http://127.0.0.1:{}{}?trace=contract", info.port, down.path()))
+        .bearer_auth("matrix-local-key").json(&payload).send().await.unwrap();
+    let status = response.status();
+    let wire = response.text().await.unwrap();
+    runtime.stop().await.unwrap();
+    for task in tasks { task.abort(); let _ = task.await; }
+    (status, wire, captures.iter().map(|seen| seen.lock().unwrap().clone()).collect())
+}
+
+fn agent_chat_request(stream: bool) -> Value {
+    json!({"model":ALIAS,"stream":stream,"reasoning_effort":"xhigh",
+        "messages":[{"role":"user","content":"continue"},
+            {"role":"assistant","content":null,"reasoning_content":"preserve prior reasoning",
+             "tool_calls":[{"id":"call_delegate","type":"function","function":{"name":"delegate_task","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"call_delegate","content":"done"}],
+        "tools":[{"type":"function","function":{"name":"delegate_task","strict":false,"parameters":{
+            "type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"goal":{"type":"string"}},"required":["goal"]}},
+            "mode":{"enum":[null,"a","b"]}}}}}],
+        "stop":["STOP"],"frequency_penalty":0.4,"presence_penalty":0.2,"seed":12,
+        "response_format":{"type":"json_object"},"logprobs":true,"top_logprobs":2,
+        "stream_options":{"include_usage":true},"vendor_extension":{"keep":true}})
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn native_chat_preserves_agent_fields_schema_and_response() {
+    for stream in [false, true] {
+        let payload = agent_chat_request(stream);
+        let (status, wire, seen) = routing_contract(Format::Chat, payload.clone(), vec![(Format::Chat, json!({}), None)]).await;
+        assert_eq!(status, StatusCode::OK, "{wire}");
+        let mut expected = payload;
+        expected["model"] = json!("deepseek-v4-flash");
+        assert_eq!(seen[0], vec![expected]);
+        if !stream {
+            let response: Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(response["vendor_extension"]["preserve"], true);
+            assert_eq!(response["id"], "chatcmpl_matrix");
+        } else {
+            check_response(Format::Chat, true, false, &wire, &mut String::new()).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mixed_protocol_failover_rebuilds_each_candidate_from_original() {
+    for (first, second) in [(Format::Responses, Format::Chat), (Format::Chat, Format::Responses)] {
+        for stream in [false, true] {
+            let payload = agent_chat_request(stream);
+            let rejection = json!({"error":{"code":"unsupported_parameter","message":"reasoning is not supported"}});
+            let (status, wire, seen) = routing_contract(Format::Chat, payload.clone(), vec![
+                (first, json!({"chatReasoningProfile":"deepseek"}), Some(rejection)),
+                (second, json!({}), None),
+            ]).await;
+            assert_eq!(status, StatusCode::OK, "{first:?} -> {second:?}: {wire}");
+            assert_eq!(seen[0].len(), 1);
+            assert_eq!(seen[1].len(), 1);
+            if matches!(second, Format::Chat) {
+                let mut expected = payload;
+                expected["model"] = json!("deepseek-v4-flash");
+                assert_eq!(seen[1][0], expected);
+            } else {
+                assert!(seen[1][0].get("messages").is_none());
+                assert_eq!(seen[1][0]["reasoning"]["effort"], "xhigh");
+                assert!(seen[1][0].get("thinking").is_none());
+            }
+            check_response(Format::Chat, stream, false, &wire, &mut String::new()).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn responses_bridge_uses_explicit_reasoning_wire_profile() {
+    for (profile, thinking, effort) in [("auto", false, "xhigh"), ("openai", false, "xhigh"), ("deepseek", true, "max")] {
+        let mut payload = request(Format::Responses, false, "text");
+        payload["reasoning"] = json!({"effort":"xhigh"});
+        let (status, wire, seen) = routing_contract(Format::Responses, payload, vec![(Format::Chat, json!({"chatReasoningProfile":profile}), None)]).await;
+        assert_eq!(status, StatusCode::OK, "{wire}");
+        assert_eq!(seen[0][0].get("thinking").is_some(), thinking);
+        assert_eq!(seen[0][0]["reasoning_effort"], effort);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn schema_compatibility_is_opt_in_and_preserves_nested_constraints() {
+    let payload = agent_chat_request(false);
+    let (status, wire, seen) = routing_contract(Format::Chat, payload.clone(), vec![(Format::Chat, json!({"chatSchemaRequiredDefaults":true}), None)]).await;
+    assert_eq!(status, StatusCode::OK, "{wire}");
+    let mut expected = payload;
+    expected["model"] = json!("deepseek-v4-flash");
+    expected["tools"][0]["function"]["parameters"]["required"] = json!([]);
+    assert_eq!(seen[0][0], expected);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn invalid_input_stops_but_relay_schema_rejection_can_fail_over() {
+    for (message, succeeds) in [
+        ("Invalid schema for function 'delegate_task': null is not of type array", true),
+        ("Invalid JSON", false), ("tool_call_id does not match", false),
+    ] {
+        let (status, wire, seen) = routing_contract(Format::Chat, agent_chat_request(false), vec![
+            (Format::Chat, json!({}), Some(json!({"error":{"message":message}}))),
+            (Format::Chat, json!({}), None),
+        ]).await;
+        assert_eq!(status.is_success(), succeeds, "{wire}");
+        assert_eq!(seen[1].len(), usize::from(succeeds));
+    }
+    let mut payload = agent_chat_request(false);
+    payload["model"] = json!("unconfigured-alias");
+    let (status, _, seen) = routing_contract(Format::Chat, payload, vec![(Format::Chat, json!({}), None)]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(seen[0].is_empty());
+}

@@ -27,7 +27,7 @@ use tauri::menu::{Menu, MenuBuilder, MenuItem};
 use tauri::Manager;
 use tauri_plugin_opener::OpenerExt;
 
-const CONFIG_KEY: &str = "unified_gateway_config_v1";
+pub(crate) const CONFIG_KEY: &str = "unified_gateway_config_v1";
 const GENERATED_CATEGORY: &str = "unified_gateway";
 const MODEL_REGISTRY_OVERRIDES_FILE: &str = "model-registry.overrides.json";
 const MODEL_REGISTRY_OVERRIDES_VERSION: u32 = 1;
@@ -536,6 +536,12 @@ pub struct GatewayProvider {
     /// Claude -> OpenAI reasoning 请求参数映射：auto / force / disabled。
     #[serde(default = "default_auto_mode")]
     pub reasoning_request_mode: String,
+    /// Chat upstream wire profile. Auto preserves native Chat and infers only known hosts for bridges.
+    #[serde(default = "default_auto_mode")]
+    pub chat_reasoning_profile: String,
+    /// Opt-in for relays requiring explicit empty required arrays in non-strict tools.
+    #[serde(default)]
+    pub chat_schema_required_defaults: bool,
     /// Claude -> OpenAI Chat 历史 reasoning 回传：auto / reasoning_content / disabled。
     #[serde(default = "default_auto_mode")]
     pub reasoning_history_mode: String,
@@ -862,6 +868,8 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
             impersonate_codex_client: p.impersonate_codex_client,
             codex_client_version: p.codex_client_version,
             reasoning_request_mode: default_auto_mode(),
+            chat_reasoning_profile: default_auto_mode(),
+            chat_schema_required_defaults: false,
             reasoning_history_mode: default_auto_mode(),
             adaptive_thinking_display: default_auto_mode(),
             notes: p.notes,
@@ -1013,6 +1021,9 @@ fn validate_config(config: &GatewayConfig) -> Result<(), String> {
 
     let mut provider_ids = HashSet::new();
     for provider in &config.providers {
+        if !matches!(provider.chat_reasoning_profile.as_str(), "auto" | "openai" | "deepseek" | "openrouter" | "siliconflow" | "disabled") {
+            return Err(format!("供应商 {} 的 Chat 推理接口配置无效", provider.name));
+        }
         if !matches!(
             provider.reasoning_request_mode.as_str(),
             "auto" | "force" | "disabled"
@@ -1154,6 +1165,8 @@ fn provider_meta_with_registry(
     meta.gateway_queue_timeout_ms = Some(provider.queue_timeout_ms);
     meta.api_format = Some(format.as_wire_name().to_string());
     meta.reasoning_request_mode = Some(provider.reasoning_request_mode.clone());
+    meta.codex_chat_reasoning = crate::proxy::providers::chat_reasoning_profile(&provider.chat_reasoning_profile);
+    meta.chat_schema_required_defaults = provider.chat_schema_required_defaults;
     for model in &provider.models {
         if !model.enabled || model.api_format != format {
             continue;
@@ -3268,6 +3281,8 @@ mod tests {
             impersonate_codex_client: false,
             codex_client_version: String::new(),
             reasoning_request_mode: default_auto_mode(),
+            chat_reasoning_profile: default_auto_mode(),
+            chat_schema_required_defaults: false,
             reasoning_history_mode: default_auto_mode(),
             adaptive_thinking_display: default_auto_mode(),
             notes: String::new(),

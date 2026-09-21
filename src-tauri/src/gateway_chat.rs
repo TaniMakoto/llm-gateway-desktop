@@ -1,16 +1,13 @@
 //! OpenAI Chat Completions compatibility facade.
 //!
-//! Internally the unified gateway uses the Responses endpoint as the canonical
-//! path. The inherited Responses handler already supports Responses, Chat and
-//! Anthropic upstreams with failover, so this module only translates the local
-//! Chat request/response surface.
+//! Cross-protocol conversion only. Native Chat requests and responses bypass
+//! this module; routing chooses the upstream before any conversion.
 
-use crate::proxy::{handlers, server::ProxyState, ProxyError};
+use crate::proxy::ProxyError;
 use async_stream::stream;
 use axum::{
     body::{Body, Bytes},
-    extract::State,
-    http::{header, HeaderValue, Uri},
+    http::{header, HeaderValue},
     response::Response,
 };
 use futures::StreamExt;
@@ -18,59 +15,6 @@ use http_body_util::BodyExt;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::time::Instant;
-
-pub async fn handle_chat_completions(
-    State(state): State<ProxyState>,
-    request: axum::extract::Request,
-) -> Result<Response, ProxyError> {
-    crate::gateway::validate_local_auth(state.db.as_ref(), request.headers())?;
-
-    let (mut parts, body) = request.into_parts();
-    let body_bytes = body
-        .collect()
-        .await
-        .map_err(|error| ProxyError::InvalidRequest(format!("读取 Chat 请求失败: {error}")))?
-        .to_bytes();
-    let body_bytes = handlers::decode_codex_request_body(&mut parts.headers, body_bytes)?;
-    let chat_body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|error| ProxyError::InvalidRequest(format!("Chat 请求 JSON 无效: {error}")))?;
-    let requested_model = chat_body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("local-model")
-        .to_string();
-    let is_stream = chat_body
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    let responses_body = chat_request_to_responses(chat_body)?;
-    parts.uri = Uri::from_static("/v1/responses");
-    parts.headers.remove(header::CONTENT_LENGTH);
-    parts.headers.remove(header::CONTENT_ENCODING);
-    parts.headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    let responses_request = axum::extract::Request::from_parts(
-        parts,
-        Body::from(
-            serde_json::to_vec(&responses_body)
-                .map_err(|error| ProxyError::Internal(error.to_string()))?,
-        ),
-    );
-
-    let response = handlers::handle_responses(State(state), responses_request).await?;
-    if !response.status().is_success() {
-        return Ok(response);
-    }
-
-    if is_stream {
-        Ok(responses_sse_to_chat_response(response, requested_model))
-    } else {
-        responses_json_to_chat_response(response, &requested_model).await
-    }
-}
 
 pub fn chat_request_to_responses(body: Value) -> Result<Value, ProxyError> {
     let object = body
@@ -317,7 +261,7 @@ fn copy_field(source: &Map<String, Value>, target: &mut Map<String, Value>, fiel
     }
 }
 
-async fn responses_json_to_chat_response(
+pub(crate) async fn responses_json_to_chat_response(
     response: Response,
     requested_model: &str,
 ) -> Result<Response, ProxyError> {
@@ -524,7 +468,7 @@ fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
     })
 }
 
-fn responses_sse_to_chat_response(response: Response, requested_model: String) -> Response {
+pub(crate) fn responses_sse_to_chat_response(response: Response, requested_model: String) -> Response {
     let (mut parts, body) = response.into_parts();
     let mut upstream = body.into_data_stream();
     let log_model = requested_model.clone();

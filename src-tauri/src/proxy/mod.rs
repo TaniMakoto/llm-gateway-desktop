@@ -25,6 +25,7 @@ pub mod media_sanitizer;
 pub mod model_mapper;
 pub mod provider_router;
 pub mod providers;
+pub(crate) mod request_plan;
 pub mod response_handler;
 pub mod response_processor;
 pub(crate) mod server;
@@ -36,6 +37,7 @@ pub mod thinking_budget_rectifier;
 pub mod thinking_optimizer;
 pub mod thinking_rectifier;
 pub(crate) mod types;
+pub(crate) mod upstream_error;
 pub mod usage;
 
 // 公开导出给外部使用（commands, services等模块需要）

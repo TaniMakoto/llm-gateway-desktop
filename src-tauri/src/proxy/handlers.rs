@@ -13,7 +13,7 @@ use super::{
     forwarder::ActiveConnectionGuard,
     handler_config::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
-        CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG,
+        CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
     providers::{
@@ -707,14 +707,22 @@ pub async fn handle_chat_completions(
     state: State<ProxyState>,
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, ProxyError> {
-    crate::gateway_chat::handle_chat_completions(state, request).await
+    handle_openai_request(state, request, true).await
 }
 
 
 /// 处理 /v1/responses 请求（OpenAI Responses API - Codex CLI 透传）
 pub async fn handle_responses(
+    state: State<ProxyState>,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    handle_openai_request(state, request, false).await
+}
+
+async fn handle_openai_request(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
+    source_chat: bool,
 ) -> Result<axum::response::Response, ProxyError> {
     crate::gateway::validate_local_auth(state.db.as_ref(), request.headers())?;
     let (parts, req_body) = request.into_parts();
@@ -729,17 +737,21 @@ pub async fn handle_responses(
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+        .map_err(|e| ProxyError::InvalidRequest(format!("Invalid request JSON: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex", Some("openai_responses")).await?;
-    let endpoint = endpoint_with_query(&uri, "/responses");
+    super::request_plan::validate_openai_request(&body, source_chat)?;
+    let format = if source_chat { "openai_chat" } else { "openai_responses" };
+    let tag = if source_chat { "Chat" } else { "Responses" };
+    let mut ctx = RequestContext::new(
+        &state, &body, &headers, AppType::Codex, tag, "codex", Some(format),
+    ).await?;
+    let endpoint = endpoint_with_query(&uri, if source_chat { "/chat/completions" } else { "/responses" });
 
     let is_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
+    let original_body = body.clone();
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -769,38 +781,38 @@ pub async fn handle_responses(
     ctx.provider = result.provider;
     let response = result.response;
 
-    if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
-        return handle_codex_anthropic_to_responses_transform(
-            response,
-            &ctx,
-            &state,
-            is_stream,
-            connection_guard,
-            codex_tool_context,
-        )
-        .await;
+    // Select response processing using the actual successful candidate, not the first route.
+    let native_chat = source_chat
+        && super::providers::codex_provider_uses_chat_completions(&ctx.provider);
+    if native_chat {
+        return process_response(response, &ctx, &state, &OPENAI_PARSER_CONFIG, connection_guard).await;
     }
-
-    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
-        return handle_codex_chat_to_responses_transform(
-            response,
-            &ctx,
-            &state,
-            is_stream,
-            connection_guard,
-            codex_tool_context,
-        )
-        .await;
+    let context_body = if source_chat {
+        crate::gateway_chat::chat_request_to_responses(original_body)?
+    } else {
+        original_body
+    };
+    let tool_context = transform_codex_chat::build_codex_tool_context_from_request(&context_body);
+    let response = if super::providers::codex_provider_uses_anthropic(&ctx.provider) {
+        handle_codex_anthropic_to_responses_transform(
+            response, &ctx, &state, is_stream, connection_guard, tool_context,
+        ).await?
+    } else if super::providers::codex_provider_uses_chat_completions(&ctx.provider) {
+        handle_codex_chat_to_responses_transform(
+            response, &ctx, &state, is_stream, connection_guard, tool_context,
+        ).await?
+    } else {
+        process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG, connection_guard).await?
+    };
+    if source_chat && response.status().is_success() {
+        if is_stream {
+            Ok(crate::gateway_chat::responses_sse_to_chat_response(response, ctx.request_model))
+        } else {
+            crate::gateway_chat::responses_json_to_chat_response(response, &ctx.request_model).await
+        }
+    } else {
+        Ok(response)
     }
-
-    process_response(
-        response,
-        &ctx,
-        &state,
-        &CODEX_PARSER_CONFIG,
-        connection_guard,
-    )
-    .await
 }
 
 /// 处理 /v1/responses/compact 请求（OpenAI Responses Compact API - Codex CLI 透传）
@@ -1554,7 +1566,7 @@ fn codex_proxy_error_json(
             .map(|status| format!("; upstream_status: HTTP {status}"))
             .unwrap_or_default();
         format!(
-            "LLM Gateway Desktop local proxy failed while handling Codex endpoint {endpoint}. Provider: {provider_name}; model: {request_model}{status_fragment}; cause: {cause}"
+            "LLM Gateway Desktop local proxy failed while handling endpoint {endpoint}. Provider: {provider_name}; model: {request_model}{status_fragment}; cause: {cause}"
         )
     };
 

@@ -192,7 +192,7 @@ pub async fn handle_streaming(
         stream,
         PassthroughDiagnostics {
             tag: ctx.tag,
-            protocol: client_sse_protocol_for_app(ctx.app_type_str),
+            protocol: parser_config.stream_protocol,
             provider_id: ctx.provider.id.clone(),
             model: ctx
                 .outbound_model

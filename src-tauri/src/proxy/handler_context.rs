@@ -173,6 +173,10 @@ impl RequestContext {
                 }
             }
             Some(_) => return Err(ProxyError::NoAvailableProvider),
+            None if state.db.get_setting(crate::gateway::CONFIG_KEY)
+                .map_err(|e| ProxyError::DatabaseError(e.to_string()))?.is_some() => {
+                return Err(ProxyError::InvalidRequest(format!("未知模型别名: {request_model}")));
+            }
             None => state
                 .provider_router
                 .select_providers(app_type_str)

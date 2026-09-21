@@ -1312,12 +1312,12 @@ impl RequestForwarder {
                     let category = self.categorize_proxy_error(&e, provider);
 
                     match category {
-                        ErrorCategory::Retryable => {
+                        ErrorCategory::Retryable | ErrorCategory::ProviderIncompatible => {
                             let rate_limited = matches!(
                                 &e,
                                 ProxyError::UpstreamError { status: 429, .. }
                             );
-                            if rate_limited {
+                            if rate_limited || category == ErrorCategory::ProviderIncompatible {
                                 // 429 表示当前配额/速率窗口不可用，不等价于上游服务故障。
                                 // cooldown 已在读取响应头时写入，这里只释放 HalfOpen permit，
                                 // 不累计 circuit breaker / provider_health 的失败计数。
@@ -1460,6 +1460,16 @@ impl RequestForwarder {
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        // Each attempt starts from the immutable ingress payload. Only cross-protocol
+        // candidates enter the bridge; native Chat keeps tools, history and extensions.
+        let plan = if matches!(app_type, AppType::Codex) {
+            Some(super::request_plan::OpenAiRequestPlan::for_provider(endpoint, body, provider)?)
+        } else {
+            None
+        };
+        let endpoint = plan.as_ref().map_or(endpoint, |plan| plan.endpoint.as_str());
+        let body = plan.as_ref().map_or(body, |plan| &plan.body);
+        let native_chat = plan.as_ref().is_some_and(|plan| plan.native_chat);
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
 
@@ -1504,7 +1514,13 @@ impl RequestForwarder {
         };
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
-        let mut mapped_body = normalize_thinking_type(mapped_body);
+        let mut mapped_body = if native_chat { mapped_body } else { normalize_thinking_type(mapped_body) };
+        if native_chat {
+            super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            if let Some(config) = provider.meta.as_ref().and_then(|meta| meta.codex_chat_reasoning.as_ref()) {
+                super::providers::transform_codex_chat::apply_native_chat_reasoning(&mut mapped_body, config);
+            }
+        }
 
         if is_copilot {
             mapped_body =
@@ -1704,7 +1720,7 @@ impl RequestForwarder {
         };
 
         let codex_chat_base_is_full_endpoint =
-            codex_responses_to_chat && base_url_is_full_endpoint(&base_url, "/chat/completions");
+            (codex_responses_to_chat || native_chat) && base_url_is_full_endpoint(&base_url, "/chat/completions");
 
         // Defensive fallback mirroring `codex_chat_base_is_full_endpoint`: if a user pastes
         // a base URL already ending in the Anthropic `/v1/messages` endpoint but leaves the
@@ -1851,6 +1867,12 @@ impl RequestForwarder {
 
         if matches!(app_type, AppType::Codex) {
             self.apply_media_prevention(&mut request_body, provider);
+        }
+
+        if (native_chat || codex_responses_to_chat || resolved_claude_api_format.as_deref() == Some("openai_chat"))
+            && provider.meta.as_ref().is_some_and(|meta| meta.chat_schema_required_defaults)
+        {
+            super::request_plan::default_chat_tool_required_arrays(&mut request_body);
         }
 
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游
@@ -3037,6 +3059,7 @@ impl RequestForwarder {
             //   501 ← 某一家未实现该协议/端点，另一家可能支持
             //   401/403/404/429 与全部 5xx ← 换 key、配额、通道或节点后可能恢复
             ProxyError::UpstreamError { status, body } => match *status {
+                400 | 422 if super::upstream_error::is_capability_rejection(error) => ErrorCategory::ProviderIncompatible,
                 400 | 406 | 414 | 415 | 422 => ErrorCategory::NonRetryable,
                 // 405：默认允许换源。若响应体是明确的 JSON 应用层“方法不允许”，
                 // 且完全不像边缘/反代 HTML，才视为客户端协议问题并中止 failover。
@@ -3156,6 +3179,7 @@ fn build_nonretryable_failure_log(
         ErrorCategory::ClientAbort => "客户端已断开",
         ErrorCategory::NonRetryable => "判定为客户端/协议层错误，换源通常无效",
         ErrorCategory::Retryable => "不可重试",
+        ErrorCategory::ProviderIncompatible => "当前供应商接口不兼容",
     };
 
     (

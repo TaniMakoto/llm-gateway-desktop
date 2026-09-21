@@ -368,6 +368,23 @@ pub fn responses_to_chat_completions_with_reasoning(
     Ok(result)
 }
 
+/// Only explicit provider profiles may rewrite a native Chat request.
+pub(crate) fn apply_native_chat_reasoning(body: &mut Value, config: &CodexChatReasoningConfig) {
+    let effort = body.get("reasoning_effort").cloned()
+        .or_else(|| body.pointer("/reasoning/effort").cloned());
+    let disabled = config.effort_param.as_deref() == Some("none")
+        && config.thinking_param.as_deref() == Some("none");
+    if effort.is_none() && !disabled { return; }
+    let normalized = effort.map(|effort| json!({"reasoning":{"effort":effort}})).unwrap_or_else(|| json!({}));
+    if let Some(object) = body.as_object_mut() {
+        for key in ["reasoning_effort", "reasoning", "thinking", "enable_thinking", "reasoning_split"] {
+            object.remove(key);
+        }
+    }
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    apply_reasoning_options(body, &normalized, &model, Some(config));
+}
+
 fn apply_reasoning_options(
     result: &mut Value,
     body: &Value,
@@ -386,7 +403,7 @@ fn apply_reasoning_options(
     };
 
     let supports_effort = config.supports_effort.unwrap_or(false);
-    let supports_thinking = config.supports_thinking.unwrap_or(false) || supports_effort;
+    let supports_thinking = config.supports_thinking.unwrap_or(false);
     let Some(reasoning_enabled) = reasoning_requested(body) else {
         return;
     };
@@ -433,6 +450,8 @@ fn apply_reasoning_options(
         // 不会走到这里，故只有上游「显式」表达关闭才透传 none。
         if effort_param == "reasoning.effort" {
             result["reasoning"] = json!({ "effort": "none" });
+        } else if effort_param == "reasoning_effort" && config.effort_value_mode.as_deref() == Some("passthrough") {
+            result["reasoning_effort"] = json!("none");
         }
         return;
     }

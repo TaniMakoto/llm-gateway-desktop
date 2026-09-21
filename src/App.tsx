@@ -104,6 +104,9 @@ interface GatewayProvider {
   impersonateCodexClient: boolean;
   codexClientVersion: string;
   reasoningRequestMode: "auto" | "force" | "disabled";
+  chatSchemaRequiredDefaults: boolean;
+  chatReasoningProfile:
+    "auto" | "openai" | "deepseek" | "openrouter" | "siliconflow" | "disabled";
   reasoningHistoryMode: "auto" | "reasoning_content" | "disabled";
   adaptiveThinkingDisplay: "auto" | "summarized" | "omitted";
   notes: string;
@@ -636,6 +639,8 @@ function App() {
       impersonateCodexClient: false,
       codexClientVersion: "",
       reasoningRequestMode: "auto",
+      chatReasoningProfile: "auto",
+      chatSchemaRequiredDefaults: false,
       reasoningHistoryMode: "auto",
       adaptiveThinkingDisplay: "auto",
       notes: "",
@@ -663,6 +668,8 @@ function App() {
       impersonateCodexClient: provider.impersonateCodexClient ?? false,
       codexClientVersion: provider.codexClientVersion ?? "",
       reasoningRequestMode: provider.reasoningRequestMode ?? "auto",
+      chatReasoningProfile: provider.chatReasoningProfile ?? "auto",
+      chatSchemaRequiredDefaults: provider.chatSchemaRequiredDefaults ?? false,
       reasoningHistoryMode: provider.reasoningHistoryMode ?? "auto",
       adaptiveThinkingDisplay: provider.adaptiveThinkingDisplay ?? "auto",
       recordBodies: provider.recordBodies ?? false,
@@ -2719,7 +2726,45 @@ function ProviderEditorModal({
               400，或原生 Claude adaptive thinking 不展示摘要时才需要调整。
             </p>
             <div className="mt-3 grid gap-3 sm:grid-cols-3">
-              <Field label="推理请求映射">
+              <Field label="Chat 工具兼容">
+                <label className="switch-label">
+                  <input
+                    type="checkbox"
+                    checked={provider.chatSchemaRequiredDefaults}
+                    onChange={(event) =>
+                      onChange({
+                        ...provider,
+                        chatSchemaRequiredDefaults: event.target.checked,
+                      })
+                    }
+                  />
+                  补齐缺省 required 数组
+                </label>
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  仅用于要求此字段的中转接口；保留已有约束与 strict 工具。
+                </p>
+              </Field>
+              <Field label="Chat 推理接口">
+                <select
+                  className="input w-full"
+                  value={provider.chatReasoningProfile}
+                  onChange={(event) =>
+                    onChange({
+                      ...provider,
+                      chatReasoningProfile: event.target
+                        .value as GatewayProvider["chatReasoningProfile"],
+                    })
+                  }
+                >
+                  <option value="auto">自动（原生 Chat 保真）</option>
+                  <option value="openai">OpenAI（reasoning_effort）</option>
+                  <option value="deepseek">DeepSeek 官方格式</option>
+                  <option value="openrouter">OpenRouter</option>
+                  <option value="siliconflow">SiliconFlow</option>
+                  <option value="disabled">不发送推理参数</option>
+                </select>
+              </Field>
+              <Field label="Claude 推理请求映射">
                 <select
                   className="input w-full"
                   value={provider.reasoningRequestMode}
