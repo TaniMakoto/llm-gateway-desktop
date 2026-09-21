@@ -27,6 +27,28 @@ struct ProviderQueueWaiterGuard {
     states: Arc<Mutex<HashMap<String, ProviderCapacityState>>>,
 }
 
+#[derive(Debug, Default)]
+struct SmoothWeightedState {
+    current: HashMap<String, i64>,
+    weights: HashMap<String, i64>,
+}
+
+const MAX_SMOOTH_WEIGHTED_STATE_ENTRIES: usize = 1024;
+
+fn weighted_config_changed(
+    previous: &HashMap<String, i64>,
+    current: &HashMap<String, i64>,
+) -> bool {
+    if previous.is_empty() {
+        return false;
+    }
+    current.iter().any(|(provider_id, weight)| {
+        previous
+            .get(provider_id)
+            .is_some_and(|previous_weight| previous_weight != weight)
+    })
+}
+
 impl Drop for ProviderQueueWaiterGuard {
     fn drop(&mut self) {
         let mut states = self.states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -72,17 +94,14 @@ pub struct ProviderRouter {
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
     /// Provider 临时冷却表（典型来源：HTTP 429 / Retry-After）。
     /// 与熔断器分离：限流/配额耗尽不等价于服务故障。
-    cooldowns: Arc<RwLock<HashMap<String, Instant>>>,
-    /// Candidate capability rejections keyed by app/provider/model/request profile.
-    /// These are deliberately narrower than provider health or rate-limit cooldowns.
-    route_rejections: Arc<RwLock<HashMap<(String, String, String, String), Instant>>>,
+    cooldowns: Arc<RwLock<HashMap<(String, String, String), Instant>>>,
     /// Last selected candidate keyed by app_type + public model alias.
     ///
     /// Keeping an identity instead of an array index makes round-robin stable when
     /// a config reload adds, removes, or reorders candidates between requests.
     route_last_picked: Arc<RwLock<HashMap<String, String>>>,
-    /// Smooth weighted round-robin current scores keyed by app_type + alias.
-    weighted_route_scores: Arc<RwLock<HashMap<String, HashMap<String, i64>>>>,
+    /// Smooth weighted round-robin state keyed by app_type + alias.
+    weighted_route_states: Arc<RwLock<HashMap<String, SmoothWeightedState>>>,
     /// Source-provider admission state shared across app types and protocol materializations.
     capacity_states: Arc<Mutex<HashMap<String, ProviderCapacityState>>>,
 }
@@ -94,9 +113,8 @@ impl ProviderRouter {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
             cooldowns: Arc::new(RwLock::new(HashMap::new())),
-            route_rejections: Arc::new(RwLock::new(HashMap::new())),
             route_last_picked: Arc::new(RwLock::new(HashMap::new())),
-            weighted_route_scores: Arc::new(RwLock::new(HashMap::new())),
+            weighted_route_states: Arc::new(RwLock::new(HashMap::new())),
             capacity_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -220,21 +238,28 @@ impl ProviderRouter {
         provider_id: &str,
         app_type: &str,
     ) -> Option<u64> {
-        let key = Self::provider_key(app_type, provider_id);
         let now = Instant::now();
         let mut cooldowns = self.cooldowns.write().await;
-        match cooldowns.get(&key).copied() {
-            Some(until) if until > now => Some(until.duration_since(now).as_secs().max(1)),
-            Some(_) => {
-                cooldowns.remove(&key);
-                None
-            }
-            None => None,
-        }
+        cooldowns.retain(|_, until| *until > now);
+        cooldowns
+            .iter()
+            .filter(|((entry_app, entry_provider, _), _)| {
+                entry_app == app_type && entry_provider == provider_id
+            })
+            .map(|(_, until)| until.duration_since(now).as_secs().max(1))
+            .max()
     }
 
     fn provider_key(app_type: &str, provider_id: &str) -> String {
         format!("{app_type}:{provider_id}")
+    }
+
+    fn cooldown_key(app_type: &str, provider_id: &str, model: &str) -> (String, String, String) {
+        (
+            app_type.to_string(),
+            provider_id.to_string(),
+            model.trim().to_ascii_lowercase(),
+        )
     }
 
     /// 暂时把 Provider 从调度候选中移除；重复冷却只延长、不缩短已有期限。
@@ -242,10 +267,11 @@ impl ProviderRouter {
         &self,
         provider_id: &str,
         app_type: &str,
+        model: &str,
         duration: Duration,
     ) {
         let until = Instant::now() + duration.max(Duration::from_secs(1));
-        let key = Self::provider_key(app_type, provider_id);
+        let key = Self::cooldown_key(app_type, provider_id, model);
         let mut cooldowns = self.cooldowns.write().await;
         cooldowns
             .entry(key)
@@ -258,91 +284,27 @@ impl ProviderRouter {
     }
 
     /// Provider 是否仍处于临时冷却；到期记录会惰性清理。
-    pub async fn is_provider_cooled_down(&self, provider_id: &str, app_type: &str) -> bool {
-        let key = Self::provider_key(app_type, provider_id);
+    pub async fn is_provider_cooled_down(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        model: &str,
+    ) -> bool {
+        let key = Self::cooldown_key(app_type, provider_id, model);
+        let credential_key = Self::cooldown_key(app_type, provider_id, "");
         let now = Instant::now();
         let mut cooldowns = self.cooldowns.write().await;
-        match cooldowns.get(&key).copied() {
-            Some(until) if until > now => true,
-            Some(_) => {
-                cooldowns.remove(&key);
-                false
-            }
-            None => false,
-        }
+        cooldowns.retain(|_, until| *until > now);
+        cooldowns.contains_key(&key) || cooldowns.contains_key(&credential_key)
     }
 
     pub async fn clear_provider_cooldown(&self, provider_id: &str, app_type: &str) {
-        let key = Self::provider_key(app_type, provider_id);
-        self.cooldowns.write().await.remove(&key);
-    }
-
-    fn route_rejection_key(
-        provider_id: &str,
-        app_type: &str,
-        model: &str,
-        request_profile: &str,
-    ) -> (String, String, String, String) {
-        (
-            app_type.to_string(),
-            provider_id.to_string(),
-            model.to_string(),
-            request_profile.to_string(),
-        )
-    }
-
-    /// Temporarily suppress one candidate for one model/request capability shape.
-    /// A schema rejection must not cool down unrelated models or simpler requests.
-    pub async fn reject_route_candidate(
-        &self,
-        provider_id: &str,
-        app_type: &str,
-        model: &str,
-        request_profile: &str,
-        duration: Duration,
-    ) {
-        let key = Self::route_rejection_key(provider_id, app_type, model, request_profile);
-        let until = Instant::now() + duration.max(Duration::from_secs(1));
-        let mut rejections = self.route_rejections.write().await;
-        rejections
-            .entry(key)
-            .and_modify(|existing| {
-                if until > *existing {
-                    *existing = until;
-                }
-            })
-            .or_insert(until);
-    }
-
-    pub async fn is_route_candidate_rejected(
-        &self,
-        provider_id: &str,
-        app_type: &str,
-        model: &str,
-        request_profile: &str,
-    ) -> bool {
-        let key = Self::route_rejection_key(provider_id, app_type, model, request_profile);
-        let now = Instant::now();
-        let mut rejections = self.route_rejections.write().await;
-        match rejections.get(&key).copied() {
-            Some(until) if until > now => true,
-            Some(_) => {
-                rejections.remove(&key);
-                false
-            }
-            None => false,
-        }
-    }
-
-    pub async fn clear_route_candidate_rejection(
-        &self,
-        provider_id: &str,
-        app_type: &str,
-        model: &str,
-        request_profile: &str,
-    ) {
-        let key = Self::route_rejection_key(provider_id, app_type, model, request_profile);
-        self.route_rejections.write().await.remove(&key);
+        self.cooldowns
+            .write()
+            .await
+            .retain(|(entry_app, entry_provider, _), _| {
+                entry_app != app_type || entry_provider != provider_id
+            });
     }
 
     /// Apply the configured scheduling policy to one gateway alias.
@@ -384,23 +346,43 @@ impl ProviderRouter {
             GatewayRoutingPolicy::WeightedRoundRobin => {
                 let key = format!("{app_type}:{}", alias.trim());
                 let selected_id = {
-                    let mut all_scores = self.weighted_route_scores.write().await;
-                    let scores = all_scores.entry(key).or_default();
-                    let active_ids: std::collections::HashSet<&str> =
-                        providers.iter().map(|provider| provider.id.as_str()).collect();
-                    scores.retain(|provider_id, _| active_ids.contains(provider_id.as_str()));
-
-                    let mut total_weight = 0i64;
-                    let mut selected: Option<(String, i64)> = None;
-                    for provider in &providers {
-                        let weight = weights
+                    let current_weights = providers
+                        .iter()
+                        .map(|provider| {
+                            let weight = weights
                             .get(provider.gateway_source_provider_id())
                             .copied()
                             .unwrap_or(1)
                             .max(1) as i64;
-                        total_weight += weight;
-                        let score = scores.entry(provider.id.clone()).or_insert(0);
-                        *score += weight;
+                            (provider.id.clone(), weight)
+                        })
+                        .collect::<HashMap<_, _>>();
+                    let mut all_states = self.weighted_route_states.write().await;
+                    let state = all_states.entry(key).or_default();
+                    if weighted_config_changed(&state.weights, &current_weights) {
+                        state.current.clear();
+                    }
+                    for (provider_id, weight) in &current_weights {
+                        state.weights.insert(provider_id.clone(), *weight);
+                    }
+                    if state.current.len() > MAX_SMOOTH_WEIGHTED_STATE_ENTRIES
+                        || state.weights.len() > MAX_SMOOTH_WEIGHTED_STATE_ENTRIES
+                    {
+                        state
+                            .current
+                            .retain(|provider_id, _| current_weights.contains_key(provider_id));
+                        state
+                            .weights
+                            .retain(|provider_id, _| current_weights.contains_key(provider_id));
+                    }
+
+                    let mut total_weight = 0i64;
+                    let mut selected: Option<(String, i64)> = None;
+                    for provider in &providers {
+                        let weight = current_weights[&provider.id];
+                        total_weight = total_weight.saturating_add(weight);
+                        let score = state.current.entry(provider.id.clone()).or_insert(0);
+                        *score = score.saturating_add(weight);
                         if selected
                             .as_ref()
                             .is_none_or(|(_, selected_score)| *score > *selected_score)
@@ -409,8 +391,8 @@ impl ProviderRouter {
                         }
                     }
                     if let Some((provider_id, _)) = selected {
-                        if let Some(score) = scores.get_mut(&provider_id) {
-                            *score -= total_weight;
+                        if let Some(score) = state.current.get_mut(&provider_id) {
+                            *score = score.saturating_add(-total_weight);
                         }
                         Some(provider_id)
                     } else {
@@ -530,8 +512,13 @@ impl ProviderRouter {
     ///
     /// 注意：调用方必须在请求结束后通过 `record_result()` 释放 HalfOpen 名额，
     /// 否则会导致该 Provider 长时间无法进入探测状态。
-    pub async fn allow_provider_request(&self, provider_id: &str, app_type: &str) -> AllowResult {
-        if self.is_provider_cooled_down(provider_id, app_type).await {
+    pub async fn allow_provider_request(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        model: &str,
+    ) -> AllowResult {
+        if self.is_provider_cooled_down(provider_id, app_type, model).await {
             return AllowResult {
                 allowed: false,
                 used_half_open_permit: false,
@@ -550,13 +537,35 @@ impl ProviderRouter {
         &self,
         provider_id: &str,
         app_type: &str,
+        model: &str,
     ) -> bool {
-        if self.is_provider_cooled_down(provider_id, app_type).await {
+        if self.is_provider_cooled_down(provider_id, app_type, model).await {
             return false;
         }
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
         breaker.is_available().await
+    }
+
+    /// CPA selectors apply scheduling policy only after removing unavailable
+    /// credentials. Keep that boundary explicit so open/cooling providers do not
+    /// consume round-robin or weighted turns.
+    pub async fn schedulable_providers(
+        &self,
+        app_type: &str,
+        model: &str,
+        providers: Vec<Provider>,
+    ) -> Vec<Provider> {
+        let mut available = Vec::with_capacity(providers.len());
+        for provider in providers {
+            if self
+                .provider_available_for_scheduling(&provider.id, app_type, model)
+                .await
+            {
+                available.push(provider);
+            }
+        }
+        available
     }
 
     /// 记录供应商请求结果
@@ -783,82 +792,41 @@ mod tests {
         let router = ProviderRouter::new(db);
 
         router
-            .cooldown_provider("p1", "claude", Duration::from_secs(30))
+            .cooldown_provider("p1", "claude", "model-a", Duration::from_secs(30))
             .await;
-        assert!(router.is_provider_cooled_down("p1", "claude").await);
-        assert!(!router.allow_provider_request("p1", "claude").await.allowed);
+        assert!(router.is_provider_cooled_down("p1", "claude", "model-a").await);
+        assert!(!router.is_provider_cooled_down("p1", "claude", "model-b").await);
+        assert!(!router.allow_provider_request("p1", "claude", "model-a").await.allowed);
+        assert!(router.allow_provider_request("p1", "claude", "model-b").await.allowed);
+
+        let schedulable = router
+            .schedulable_providers(
+                "claude",
+                "model-a",
+                vec![
+                    Provider::with_id("p1".to_string(), "P1".to_string(), json!({}), None),
+                    Provider::with_id("p2".to_string(), "P2".to_string(), json!({}), None),
+                ],
+            )
+            .await;
+        assert_eq!(
+            schedulable
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p2"]
+        );
 
         router.clear_provider_cooldown("p1", "claude").await;
-        assert!(!router.is_provider_cooled_down("p1", "claude").await);
-        assert!(router.allow_provider_request("p1", "claude").await.allowed);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_route_rejection_is_scoped_to_model_and_request_profile() {
-        let _home = TempHome::new();
-        let db = Arc::new(Database::memory().unwrap());
-        let router = ProviderRouter::new(db);
+        assert!(!router.is_provider_cooled_down("p1", "claude", "model-a").await);
+        assert!(router.allow_provider_request("p1", "claude", "model-a").await.allowed);
 
         router
-            .reject_route_candidate(
-                "p1::chat",
-                "codex",
-                "agent-model",
-                "tools-and-reasoning",
-                Duration::from_secs(30),
-            )
+            .cooldown_provider("p1", "claude", "", Duration::from_secs(30))
             .await;
-
-        assert!(
-            router
-                .is_route_candidate_rejected(
-                    "p1::chat",
-                    "codex",
-                    "agent-model",
-                    "tools-and-reasoning",
-                )
-                .await
-        );
-        assert!(
-            !router
-                .is_route_candidate_rejected(
-                    "p1::chat",
-                    "codex",
-                    "agent-model",
-                    "plain-text",
-                )
-                .await
-        );
-        assert!(
-            !router
-                .is_route_candidate_rejected(
-                    "p1::chat",
-                    "codex",
-                    "another-model",
-                    "tools-and-reasoning",
-                )
-                .await
-        );
-
-        router
-            .clear_route_candidate_rejection(
-                "p1::chat",
-                "codex",
-                "agent-model",
-                "tools-and-reasoning",
-            )
-            .await;
-        assert!(
-            !router
-                .is_route_candidate_rejected(
-                    "p1::chat",
-                    "codex",
-                    "agent-model",
-                    "tools-and-reasoning",
-                )
-                .await
-        );
+        assert!(router.is_provider_cooled_down("p1", "claude", "model-a").await);
+        assert!(router.is_provider_cooled_down("p1", "claude", "model-b").await);
+        router.clear_provider_cooldown("p1", "claude").await;
     }
 
     #[tokio::test]
@@ -1011,6 +979,69 @@ mod tests {
         assert_eq!(counts.get("a").copied(), Some(5));
         assert_eq!(counts.get("b").copied(), Some(3));
         assert_eq!(counts.get("c").copied(), Some(2));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_weighted_round_robin_keeps_credit_across_temporary_exclusion() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let router = ProviderRouter::new(db);
+        let provider = |id: &str| {
+            Provider::with_id(id.to_string(), id.to_uppercase(), json!({}), None)
+        };
+        let weights = HashMap::from([
+            ("a".to_string(), 1),
+            ("b".to_string(), 1),
+            ("c".to_string(), 1),
+        ]);
+        let active = HashMap::new();
+
+        let first = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "transient-subset",
+                GatewayRoutingPolicy::WeightedRoundRobin,
+                &weights,
+                &active,
+                vec![provider("a"), provider("b"), provider("c")],
+            )
+            .await;
+        let second = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "transient-subset",
+                GatewayRoutingPolicy::WeightedRoundRobin,
+                &weights,
+                &active,
+                vec![provider("a"), provider("b"), provider("c")],
+            )
+            .await;
+        let subset = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "transient-subset",
+                GatewayRoutingPolicy::WeightedRoundRobin,
+                &weights,
+                &active,
+                vec![provider("a"), provider("b")],
+            )
+            .await;
+        let restored = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "transient-subset",
+                GatewayRoutingPolicy::WeightedRoundRobin,
+                &weights,
+                &active,
+                vec![provider("a"), provider("b"), provider("c")],
+            )
+            .await;
+
+        assert_eq!(first[0].id, "a");
+        assert_eq!(second[0].id, "b");
+        assert_eq!(subset[0].id, "a");
+        assert_eq!(restored[0].id, "c");
     }
 
     #[tokio::test]
@@ -1258,7 +1289,7 @@ mod tests {
         let providers = router.select_providers("claude").await.unwrap();
         assert_eq!(providers.len(), 2);
 
-        assert!(router.allow_provider_request("b", "claude").await.allowed);
+        assert!(router.allow_provider_request("b", "claude", "").await.allowed);
     }
 
     #[tokio::test]
@@ -1295,12 +1326,12 @@ mod tests {
             .unwrap();
 
         // 第一次请求：获取 HalfOpen 探测名额
-        let first = router.allow_provider_request("a", "claude").await;
+        let first = router.allow_provider_request("a", "claude", "").await;
         assert!(first.allowed);
         assert!(first.used_half_open_permit);
 
         // 第二次请求应被拒绝（名额已被占用）
-        let second = router.allow_provider_request("a", "claude").await;
+        let second = router.allow_provider_request("a", "claude", "").await;
         assert!(!second.allowed);
 
         // 使用 release_permit_neutral 释放名额（不影响健康统计）
@@ -1309,7 +1340,7 @@ mod tests {
             .await;
 
         // 第三次请求应被允许（名额已释放）
-        let third = router.allow_provider_request("a", "claude").await;
+        let third = router.allow_provider_request("a", "claude", "").await;
         assert!(third.allowed);
         assert!(third.used_half_open_permit);
     }

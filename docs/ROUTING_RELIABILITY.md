@@ -2,7 +2,7 @@
 
 ## 改造依据
 
-参考本地 CPA 快照的 `sdk/translator/registry.go`、`internal/runtime/executor/openai_compat_executor.go`、`sdk/cliproxy/auth/conductor_cooldown.go`：区分源/目标协议、在执行候选时适配、结合错误语义判断模型支持。没有引入 Go 依赖或复制整个 CPA 调度器；现有权重、容量、冷却、会话亲和和桌面配置继续使用。
+参考本地 CPA 快照的 `sdk/translator/registry.go`、`internal/runtime/executor/openai_compat_executor.go`、`sdk/cliproxy/auth/selector.go`、`sdk/cliproxy/auth/conductor_cooldown.go` 和 `internal/clienterror/client_error.go`：区分源/目标协议、在执行候选时适配、先过滤不可用候选、结合错误语义判断模型支持和请求错误。没有引入 Go 依赖或复制整个 CPA 调度器；桌面端继续使用现有配置和数据模型。
 
 ## 请求契约
 
@@ -22,15 +22,16 @@
 
 ## 故障转移
 
-- 网络、服务端故障、限流：沿用有界候选循环和冷却策略。
-- 明确参数或模型不支持的 400/422：换候选，不把整家供应商标坏。
+- 网络、服务端故障、限流：使用有界候选循环；同一请求不会重复尝试同一候选。
+- 明确参数或模型不支持的 400/404/422：换候选，不把整家供应商标坏；模型不支持和普通 404 按 CPA 规则对该供应商的当前模型冷却 12 小时。
 - 已识别的 relay 工具 schema null-array 拒绝：允许换候选，不自动放宽工具约束。
-- 输入损坏、工具历史不匹配、普通未知 400：终止，避免无意义扇出。
+- 400、409、413、422，以及结构化 `invalid_request`、`invalid_prompt`、`context_length_exceeded` 等请求错误：终止，避免无意义扇出；即使中转把它包装成 5xx，也不轮换供应商。
 - HTTP 200 中的错误正文，以及 SSE 实际输出前失败：仍可换源。
-- HTTP 200 必须通过实际候选协议的响应结构校验后才记为成功；Chat、Responses、Anthropic 的错误结构不会留到下游转换阶段才暴露。
-- 404/405/406/413/414/415/501、配置桥接失败和响应格式不兼容属于候选能力问题：允许换源，但不累计供应商熔断失败。
-- 能力拒绝按供应商、模型别名和请求能力指纹短时缓存；相同工具 schema/推理参数不重复撞坏节点，普通文本或不同 schema 不受影响。
+- HTTP 200 必须通过实际候选协议的响应结构校验后才记为成功；Chat、Responses、Anthropic 的错误结构，以及已完成 Responses 工具调用中无法转换的参数，不会留到下游转换阶段才暴露。
+- 可轮换候选的 401/402/403 按 CPA 的 credential scope 冷却 30 分钟；429 按 `Retry-After` 仅冷却当前模型，同一供应商的其他模型仍可调度。UI 上的供应商冷却时间显示其所有模型冷却的最大剩余值。
+- 候选能力拒绝不生成自定义请求指纹缓存。CPA 没有这一层；每次请求只依赖显式模型/凭据冷却、熔断和当前候选排除。
 - 单候选同样使用熔断器，持续故障期间不会无限请求上游；Round Robin 按上次候选 ID 推进，配置热更新删改候选后不会因旧数组下标跳号。
+- Round Robin、Weighted Round Robin 和 Least Outstanding 在应用策略前过滤熔断/冷却候选。Weighted Round Robin 保留临时排除候选的累计 credit，只在权重变化时重置，并按 CPA 使用 1024 项状态上限。
 - SSE 内容已经提交：不重放请求，保留失败状态。
 
 ## 验证

@@ -162,6 +162,16 @@ impl RequestContext {
         .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
         {
             Some((providers, routing_policy, routing_weights)) if !providers.is_empty() => {
+                // CPA filters blocked credentials before Round Robin/Weighted
+                // selection. Otherwise an open circuit still consumes a turn and
+                // biases traffic toward the candidate immediately behind it.
+                let providers = state
+                    .provider_router
+                    .schedulable_providers(app_type_str, &request_model, providers)
+                    .await;
+                if providers.is_empty() {
+                    return Err(ProxyError::NoAvailableProvider);
+                }
                 let affinity_is_valid = existing_affinity_provider
                     .as_deref()
                     .is_some_and(|bound| providers.iter().any(|provider| provider.id == bound));

@@ -42,39 +42,6 @@ use tokio::sync::RwLock;
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(30);
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
-const ROUTE_CAPABILITY_REJECTION_TTL: Duration = Duration::from_secs(2 * 60);
-
-fn request_capability_profile(endpoint: &str, body: &Value) -> String {
-    let serialized = body.to_string();
-    let media = [
-        "input_image",
-        "image_url",
-        "input_audio",
-        "audio_url",
-        "document",
-    ]
-    .iter()
-    .filter(|kind| serialized.contains(**kind))
-    .copied()
-    .collect::<Vec<_>>();
-    let mut parameters = body.clone();
-    if let Some(object) = parameters.as_object_mut() {
-        for content_key in ["model", "messages", "input", "instructions", "system"] {
-            object.remove(content_key);
-        }
-    }
-    let profile = serde_json::json!({
-        "endpoint": split_endpoint_and_query(endpoint).0,
-        "parameters": parameters,
-        "media": media,
-        "has_reasoning_history": serialized.contains("reasoning_content")
-            || serialized.contains("reasoning_details"),
-        "has_tool_history": serialized.contains("tool_call_id")
-            || serialized.contains("function_call_output")
-            || serialized.contains("tool_result"),
-    });
-    short_value_hash(Some(&profile))
-}
 
 fn retry_after_duration(headers: &http::HeaderMap) -> Duration {
     let Some(raw) = headers
@@ -774,9 +741,6 @@ impl RequestForwarder {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let capability_profile = request_capability_profile(endpoint, &body);
-        let cache_candidate_rejections = providers.len() > 1;
-
         // 会话亲和：命中绑定的 provider 提到最前。只重排尝试顺序，
         // `providers` 本身（配置顺序）仍是首选与故障转移链的权威定义；
         // affinity_preferred 同时传给成功路径，避免把亲和命中记成一次故障转移。
@@ -784,28 +748,15 @@ impl RequestForwarder {
         let mut ordered_providers = Self::order_providers(&providers, affinity_preferred.as_deref());
 
         // Backpressure only queues when every schedulable candidate is currently at capacity.
-        // Open circuits and request-profile rejections are not immediate capacity: counting one
+        // Open circuits are not immediate capacity: counting one
         // would make a saturated healthy fallback get skipped instead of queued.
         let mut queue_candidate = None;
         let mut has_immediate_capacity = false;
         for provider in &ordered_providers {
             if !self
                 .router
-                .provider_available_for_scheduling(&provider.id, app_type_str)
+                .provider_available_for_scheduling(&provider.id, app_type_str, &route_model)
                 .await
-            {
-                continue;
-            }
-            if cache_candidate_rejections
-                && self
-                    .router
-                    .is_route_candidate_rejected(
-                        &provider.id,
-                        app_type_str,
-                        &route_model,
-                        &capability_profile,
-                    )
-                    .await
             {
                 continue;
             }
@@ -855,8 +806,7 @@ impl RequestForwarder {
         }
 
         // 依次尝试每个供应商
-        let ordered_provider_count = ordered_providers.len();
-        for (provider_index, provider) in ordered_providers.into_iter().enumerate() {
+        for provider in ordered_providers {
             // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
             // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
             let mut rectifier_retried = false;
@@ -878,7 +828,7 @@ impl RequestForwarder {
             // Retry-After，避免形成紧密重试环。
             if self
                 .router
-                .is_provider_cooled_down(&provider.id, app_type_str)
+                .is_provider_cooled_down(&provider.id, app_type_str, &route_model)
                 .await
             {
                 log::debug!(
@@ -888,23 +838,6 @@ impl RequestForwarder {
                 continue;
             }
 
-            if cache_candidate_rejections
-                && self
-                    .router
-                    .is_route_candidate_rejected(
-                        &provider.id,
-                        app_type_str,
-                        &route_model,
-                        &capability_profile,
-                    )
-                    .await
-            {
-                log::debug!(
-                    "[{app_type_str}] Provider {} rejected this model/capability profile recently; skipping",
-                    provider.id
-                );
-                continue;
-            }
 
             let capacity_permit = if reserved_capacity
                 .as_ref()
@@ -931,7 +864,7 @@ impl RequestForwarder {
             // 单候选也必须经过熔断器，否则持续故障时网关会无限敲击上游。
             let permit = self
                 .router
-                .allow_provider_request(&provider.id, app_type_str)
+                .allow_provider_request(&provider.id, app_type_str, &route_model)
                 .await;
             let (allowed, used_half_open_permit) =
                 (permit.allowed, permit.used_half_open_permit);
@@ -987,15 +920,6 @@ impl RequestForwarder {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
-                        .await;
-
-                    self.router
-                        .clear_route_candidate_rejection(
-                            &provider.id,
-                            app_type_str,
-                            &route_model,
-                            &capability_profile,
-                        )
                         .await;
 
                     self.update_success_state(
@@ -1392,10 +1316,19 @@ impl RequestForwarder {
                                 &e,
                                 ProxyError::UpstreamError { status: 429, .. }
                             );
-                            if rate_limited || category == ErrorCategory::ProviderIncompatible {
-                                // 429 表示当前配额/速率窗口不可用，不等价于上游服务故障。
-                                // cooldown 已在读取响应头时写入，这里只释放 HalfOpen permit，
-                                // 不累计 circuit breaker / provider_health 的失败计数。
+                            let credential_limited = matches!(
+                                &e,
+                                ProxyError::UpstreamError {
+                                    status: 401 | 402 | 403,
+                                    ..
+                                }
+                            );
+                            if rate_limited
+                                || credential_limited
+                                || category == ErrorCategory::ProviderIncompatible
+                            {
+                                // Quota/auth/model availability is tracked as a cooldown,
+                                // independently from transport health and the circuit breaker.
                                 self.router
                                     .release_permit_neutral(
                                         &provider.id,
@@ -1403,16 +1336,28 @@ impl RequestForwarder {
                                         used_half_open_permit,
                                     )
                                     .await;
+                                if credential_limited {
+                                    self.router
+                                        .cooldown_provider(
+                                            &provider.id,
+                                            app_type_str,
+                                            "",
+                                            Duration::from_secs(30 * 60),
+                                        )
+                                        .await;
+                                }
                                 if category == ErrorCategory::ProviderIncompatible
-                                    && provider_index + 1 < ordered_provider_count
+                                    && (matches!(
+                                        &e,
+                                        ProxyError::UpstreamError { status: 404, .. }
+                                    ) || super::upstream_error::is_model_support_rejection(&e))
                                 {
                                     self.router
-                                        .reject_route_candidate(
+                                        .cooldown_provider(
                                             &provider.id,
                                             app_type_str,
                                             &route_model,
-                                            &capability_profile,
-                                            ROUTE_CAPABILITY_REJECTION_TTL,
+                                            Duration::from_secs(12 * 60 * 60),
                                         )
                                         .await;
                                 }
@@ -2695,7 +2640,12 @@ impl RequestForwarder {
             if status_code == 429 {
                 let cooldown = retry_after_duration(response.headers());
                 self.router
-                    .cooldown_provider(&provider.id, app_type.as_str(), cooldown)
+                    .cooldown_provider(
+                        &provider.id,
+                        app_type.as_str(),
+                        body.get("model").and_then(Value::as_str).unwrap_or(""),
+                        cooldown,
+                    )
                     .await;
                 log::warn!(
                     "[{}] Provider {} returned HTTP 429; cooling it down for {}s",
@@ -3259,23 +3209,29 @@ impl RequestForwarder {
             ProxyError::Timeout(_) => ErrorCategory::Retryable,
             ProxyError::ForwardFailed(_) => ErrorCategory::Retryable,
             ProxyError::ProviderUnhealthy(_) => ErrorCategory::Retryable,
-            // 上游 HTTP 错误：按状态码分桶。
-            //
-            // 400/422 中明确的请求语义错误才会终止整条链。端点、媒体类型、
-            // body 大小、模型支持等限制属于当前候选的能力边界：继续换源，但不把
-            // 健康的供应商记成故障并触发熔断。
-            ProxyError::UpstreamError { status, .. } => match *status {
-                400 | 422 if super::upstream_error::is_capability_rejection(error) => ErrorCategory::ProviderIncompatible,
-                400 | 422 => ErrorCategory::NonRetryable,
-                404 | 405 | 406 | 413 | 414 | 415 | 501 => {
-                    ErrorCategory::ProviderIncompatible
-                }
-                _ => ErrorCategory::Retryable,
-            },
-            // Provider 级配置、请求桥接或响应结构不兼容：换一个候选可能成功，
-            // 但这些都不代表上游服务不健康。
-            ProxyError::ConfigError(_) | ProxyError::TransformError(_) => {
+            // Match CPA's request-fault boundary. A provider-specific capability
+            // rejection may rotate without poisoning health; malformed/oversized
+            // requests stop immediately even when an upstream wraps them in 5xx.
+            ProxyError::UpstreamError { .. }
+                if super::upstream_error::is_capability_rejection(error) =>
+            {
                 ErrorCategory::ProviderIncompatible
+            }
+            ProxyError::UpstreamError { .. }
+                if super::upstream_error::is_request_fault(error) =>
+            {
+                ErrorCategory::NonRetryable
+            }
+            // CPA records 404 against the attempted model for twelve hours,
+            // leaving sibling models on the same credential available.
+            ProxyError::UpstreamError { status: 404, .. } => {
+                ErrorCategory::ProviderIncompatible
+            }
+            ProxyError::UpstreamError { .. } => ErrorCategory::Retryable,
+            // CPA records executor preparation/translation failures against the
+            // attempted candidate and continues with another credential.
+            ProxyError::ConfigError(_) | ProxyError::TransformError(_) => {
+                ErrorCategory::Retryable
             }
             ProxyError::AuthError(_) => ErrorCategory::Retryable,
             ProxyError::StreamIdleTimeout(_) => ErrorCategory::Retryable,
@@ -3611,13 +3567,44 @@ fn validate_chat_response_shape(body: &[u8]) -> Result<(), ProxyError> {
 
 fn validate_responses_response_shape(body: &[u8]) -> Result<(), ProxyError> {
     let value = parse_upstream_json(body, "Responses")?;
-    if value.get("output").is_some_and(Value::is_array) {
-        Ok(())
-    } else {
-        Err(ProxyError::TransformError(
-            "Responses upstream returned HTTP 2xx without an output array".to_string(),
-        ))
+    let output = value
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProxyError::TransformError(
+                "Responses upstream returned HTTP 2xx without an output array".to_string(),
+            )
+        })?;
+
+    // CPA translates the response inside the executor before reporting success.
+    // Our Responses→Anthropic translator can reject completed function calls, so
+    // preflight the same invariant here before provider health is marked healthy.
+    if value.get("status").and_then(Value::as_str) == Some("completed") {
+        for item in output.iter().filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call")
+        }) {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            if arguments.trim().is_empty() {
+                continue;
+            }
+            let parsed: Value = serde_json::from_str(arguments).map_err(|error| {
+                ProxyError::TransformError(format!(
+                    "Invalid function_call arguments for '{name}': {error}"
+                ))
+            })?;
+            if !parsed.is_object() {
+                return Err(ProxyError::TransformError(format!(
+                    "Function call arguments for '{name}' must be a JSON object"
+                )));
+            }
+        }
     }
+
+    Ok(())
 }
 
 fn validate_anthropic_response_shape(body: &[u8]) -> Result<(), ProxyError> {
@@ -5402,6 +5389,18 @@ mod tests {
             br#"{"id":"resp_1","status":"completed","output":[]}"#
         )
         .is_ok());
+        assert!(validate_responses_response_shape(
+            br#"{"id":"resp_1","status":"completed","output":[{"type":"function_call","name":"lookup","arguments":"{\"q\":\"ok\"}"}]}"#
+        )
+        .is_ok());
+        assert!(validate_responses_response_shape(
+            br#"{"id":"resp_1","status":"completed","output":[{"type":"function_call","name":"lookup","arguments":"{"}]}"#
+        )
+        .is_err());
+        assert!(validate_responses_response_shape(
+            br#"{"id":"resp_1","status":"completed","output":[{"type":"function_call","name":"lookup","arguments":"[]"}]}"#
+        )
+        .is_err());
         assert!(validate_responses_response_shape(br#"{"choices":[]}"#).is_err());
 
         assert!(validate_anthropic_response_shape(
@@ -5488,20 +5487,45 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_and_payload_limit_errors_are_candidate_incompatible() {
+    fn cpa_request_fault_statuses_stop_while_other_statuses_rotate() {
         let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
         let provider = test_provider_with_type(None);
-        for status in [404_u16, 405, 406, 413, 414, 415, 501] {
+        for status in [400_u16, 409, 413, 422] {
             assert_eq!(
                 forwarder.categorize_proxy_error(
                     &ProxyError::UpstreamError {
                         status,
-                        body: Some(r#"{"error":{"message":"unsupported here"}}"#.to_string()),
+                        body: Some(r#"{"error":{"message":"request failed"}}"#.to_string()),
                     },
                     &provider,
                 ),
-                ErrorCategory::ProviderIncompatible,
-                "status {status} should fail over without poisoning provider health"
+                ErrorCategory::NonRetryable,
+                "status {status} should remain request-scoped"
+            );
+        }
+
+        assert_eq!(
+            forwarder.categorize_proxy_error(
+                &ProxyError::UpstreamError {
+                    status: 404,
+                    body: Some(r#"{"error":{"message":"not found"}}"#.to_string()),
+                },
+                &provider,
+            ),
+            ErrorCategory::ProviderIncompatible
+        );
+
+        for status in [405_u16, 406, 414, 415, 501] {
+            assert_eq!(
+                forwarder.categorize_proxy_error(
+                    &ProxyError::UpstreamError {
+                        status,
+                        body: Some(r#"{"error":{"message":"upstream failed"}}"#.to_string()),
+                    },
+                    &provider,
+                ),
+                ErrorCategory::Retryable,
+                "status {status} should remain eligible for CPA-style candidate rotation"
             );
         }
     }
