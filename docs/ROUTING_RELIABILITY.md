@@ -28,9 +28,9 @@
 - 400、409、413、422，以及结构化 `invalid_request`、`invalid_prompt`、`context_length_exceeded` 等请求错误：终止，避免无意义扇出；即使中转把它包装成 5xx，也不轮换供应商。
 - HTTP 200 中的错误正文，以及 SSE 实际输出前失败：仍可换源。
 - HTTP 200 必须通过实际候选协议的响应结构校验后才记为成功；Chat、Responses、Anthropic、Gemini 的错误结构，以及已完成 Responses 工具调用中无法转换的参数，不会留到下游转换阶段才暴露。流式请求收到 JSON 时，该候选按协议不匹配换源，不把 JSON 合成为 SSE。
-- 可轮换候选的 401/402/403 按 CPA 的 credential scope 冷却 30 分钟；429 按 `Retry-After` 仅冷却当前模型，同一供应商的其他模型仍可调度。同一源供应商物化出的 Chat、Responses、Anthropic 候选共享凭据/模型冷却，但协议熔断分别记录。UI 上的供应商冷却时间显示其所有模型冷却的最大剩余值。
+- 可轮换候选的 401/402/403 按 CPA 的 credential scope 冷却 30 分钟；429 按 `Retry-After` 和公开路由模型冷却，同一供应商的其他模型仍可调度。冷却查询与写入使用同一公开模型键，不受各候选上游模型映射影响。同一源供应商物化出的 Chat、Responses、Anthropic 候选共享凭据/模型冷却，但协议熔断分别记录。UI 上的供应商冷却时间显示其所有模型冷却的最大剩余值。
 - 候选能力拒绝不生成自定义请求指纹缓存。CPA 没有这一层；每次请求只依赖显式模型/凭据冷却、熔断和当前候选排除。
-- 单候选同样使用熔断器，持续故障期间不会无限请求上游；Round Robin 按上次候选 ID 推进，配置热更新删改候选后不会因旧数组下标跳号。
+- 单候选同样使用熔断器，持续故障期间不会无限请求上游；Round Robin 与 CPA 一样在候选 ID 环上按上次 ID 的有序后继推进，配置热更新删改候选后不会因旧数组下标跳号。Round Robin 与 Weighted Round Robin 的模型状态键都使用 CPA 的 4096 项上限。
 - Round Robin、Weighted Round Robin 和 Least Outstanding 在应用策略前过滤熔断/冷却候选。Weighted Round Robin 保留临时排除候选的累计 credit，只在权重变化时重置，并按 CPA 使用 1024 项状态上限。
 - SSE 内容已经提交：不重放请求，保留失败状态。
 

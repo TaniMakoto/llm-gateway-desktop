@@ -895,7 +895,8 @@ async fn malformed_http_2xx_protocol_body_fails_over_before_recording_success() 
 #[serial_test::serial]
 async fn streaming_request_rejects_json_candidate_and_fails_over_to_sse() {
     for format in FORMATS {
-        let json_instead_of_sse = response_json(format, false);
+        let mut json_instead_of_sse = response_json(format, false);
+        json_instead_of_sse["_http_status"] = json!(200);
         let (status, wire, seen) = routing_contract(
             format,
             request(format, true, "text"),

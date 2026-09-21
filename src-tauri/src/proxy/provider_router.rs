@@ -34,6 +34,7 @@ struct SmoothWeightedState {
 }
 
 const MAX_SMOOTH_WEIGHTED_STATE_ENTRIES: usize = 1024;
+const MAX_ROUTING_STATE_KEYS: usize = 4096;
 
 fn weighted_config_changed(
     previous: &HashMap<String, i64>,
@@ -328,16 +329,22 @@ impl ProviderRouter {
         match policy {
             GatewayRoutingPolicy::Priority => {}
             GatewayRoutingPolicy::RoundRobin => {
+                providers.sort_by(|left, right| left.id.cmp(&right.id));
                 let key = format!("{app_type}:{}", alias.trim());
                 let start = {
                     let mut last_picked = self.route_last_picked.write().await;
+                    if !last_picked.contains_key(&key)
+                        && last_picked.len() >= MAX_ROUTING_STATE_KEYS
+                    {
+                        last_picked.clear();
+                    }
                     let start = last_picked
                         .get(&key)
-                        .and_then(|last_id| {
+                        .map(|last_id| {
                             providers
                                 .iter()
-                                .position(|provider| &provider.id == last_id)
-                                .map(|index| (index + 1) % providers.len())
+                                .position(|provider| provider.id.as_str() > last_id.as_str())
+                                .unwrap_or(0)
                         })
                         .unwrap_or(0);
                     last_picked.insert(key, providers[start].id.clone());
@@ -346,6 +353,7 @@ impl ProviderRouter {
                 providers.rotate_left(start);
             }
             GatewayRoutingPolicy::WeightedRoundRobin => {
+                providers.sort_by(|left, right| left.id.cmp(&right.id));
                 let key = format!("{app_type}:{}", alias.trim());
                 let selected_id = {
                     let current_weights = providers
@@ -360,6 +368,11 @@ impl ProviderRouter {
                         })
                         .collect::<HashMap<_, _>>();
                     let mut all_states = self.weighted_route_states.write().await;
+                    if !all_states.contains_key(&key)
+                        && all_states.len() >= MAX_ROUTING_STATE_KEYS
+                    {
+                        all_states.clear();
+                    }
                     let state = all_states.entry(key).or_default();
                     if weighted_config_changed(&state.weights, &current_weights) {
                         state.current.clear();
@@ -414,10 +427,7 @@ impl ProviderRouter {
                     active_provider_counts
                         .iter()
                         .filter(|((_, materialized_id), _)| {
-                            materialized_id
-                                .rsplit_once("::")
-                                .map(|(source, _)| source == source_id)
-                                .unwrap_or(materialized_id == source_id)
+                            source_provider_id_for_materialized(materialized_id) == source_id
                         })
                         .map(|(_, (count, _))| *count)
                         .sum::<usize>()
@@ -933,7 +943,7 @@ mod tests {
                 GatewayRoutingPolicy::RoundRobin,
                 &weights,
                 &active,
-                vec![provider("a"), provider("b"), provider("c")],
+                vec![provider("c"), provider("a"), provider("b")],
             )
             .await;
         assert_eq!(first[0].id, "a");
@@ -951,8 +961,8 @@ mod tests {
             .await;
         assert_eq!(after_reload[0].id, "b");
 
-        // If the remembered identity disappears, start from the current first
-        // candidate rather than applying a stale index to the new vector.
+        // If the remembered identity disappears, continue with its ordered
+        // successor in the ID ring, matching CPA's selector behavior.
         let after_second_reload = router
             .apply_gateway_routing_policy(
                 "codex",
@@ -1027,7 +1037,7 @@ mod tests {
                 GatewayRoutingPolicy::WeightedRoundRobin,
                 &weights,
                 &active,
-                vec![provider("a"), provider("b"), provider("c")],
+                vec![provider("c"), provider("a"), provider("b")],
             )
             .await;
         let second = router
@@ -1037,7 +1047,7 @@ mod tests {
                 GatewayRoutingPolicy::WeightedRoundRobin,
                 &weights,
                 &active,
-                vec![provider("a"), provider("b"), provider("c")],
+                vec![provider("b"), provider("c"), provider("a")],
             )
             .await;
         let subset = router
@@ -1057,7 +1067,7 @@ mod tests {
                 GatewayRoutingPolicy::WeightedRoundRobin,
                 &weights,
                 &active,
-                vec![provider("a"), provider("b"), provider("c")],
+                vec![provider("c"), provider("b"), provider("a")],
             )
             .await;
 

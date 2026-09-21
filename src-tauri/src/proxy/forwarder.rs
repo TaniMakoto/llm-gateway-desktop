@@ -914,6 +914,7 @@ impl RequestForwarder {
                     provider,
                     endpoint,
                     &provider_body,
+                    &route_model,
                     &headers,
                     &extensions,
                     adapter.as_ref(),
@@ -983,6 +984,7 @@ impl RequestForwarder {
                                     provider,
                                     endpoint,
                                     &media_body,
+                                    &route_model,
                                     &headers,
                                     &extensions,
                                     adapter.as_ref(),
@@ -1100,6 +1102,7 @@ impl RequestForwarder {
                                         provider,
                                         endpoint,
                                         &provider_body,
+                                        &route_model,
                                         &headers,
                                         &extensions,
                                         adapter.as_ref(),
@@ -1232,6 +1235,7 @@ impl RequestForwarder {
                                     provider,
                                     endpoint,
                                     &provider_body,
+                                    &route_model,
                                     &headers,
                                     &extensions,
                                     adapter.as_ref(),
@@ -1493,6 +1497,7 @@ impl RequestForwarder {
         provider: &Provider,
         endpoint: &str,
         body: &Value,
+        route_model: &str,
         headers: &axum::http::HeaderMap,
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
@@ -2664,7 +2669,7 @@ impl RequestForwarder {
                     .cooldown_provider(
                         provider.gateway_source_provider_id(),
                         app_type.as_str(),
-                        body.get("model").and_then(Value::as_str).unwrap_or(""),
+                        route_model,
                         cooldown,
                     )
                     .await;
