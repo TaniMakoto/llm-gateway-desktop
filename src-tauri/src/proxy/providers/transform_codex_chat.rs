@@ -1023,6 +1023,32 @@ fn backfill_missing_assistant_reasoning(messages: &mut [Value]) {
     }
 }
 
+/// Repair a native Chat history only when the request itself proves that the
+/// upstream is using DeepSeek-style `reasoning_content` history. This avoids
+/// model/vendor-name heuristics and reuses the same backfill rule as the
+/// Responses -> Chat conversion path.
+pub(crate) fn sanitize_native_chat_reasoning_history(body: &mut Value) {
+    if reasoning_requested(body) == Some(false)
+        || !body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        return;
+    }
+
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let uses_reasoning_content = messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("assistant")
+            && message.get("reasoning_content").is_some()
+    });
+    if uses_reasoning_content {
+        backfill_missing_assistant_reasoning(messages);
+    }
+}
+
 fn responses_message_reasoning_text(item: &Value) -> Option<String> {
     responses_item_reasoning_text(item)
 }
@@ -2832,6 +2858,53 @@ mod tests {
         assert_eq!(messages[1]["reasoning_content"], "(reasoning unavailable)");
         assert!(messages[0].get("reasoning_content").is_none());
         assert!(messages[2].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn native_chat_repairs_whitespace_reasoning_history_from_request_evidence() {
+        let mut input = json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a", "reasoning_content": "R1"},
+                {"role": "user", "content": "q2"},
+                {"role": "assistant", "content": "a2", "reasoning_content": " "}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "get_date", "parameters": {"type": "object"}}
+            }],
+            "reasoning_effort": "xhigh"
+        });
+
+        sanitize_native_chat_reasoning_history(&mut input);
+
+        assert_eq!(input["messages"][1]["reasoning_content"], "R1");
+        assert_eq!(
+            input["messages"][3]["reasoning_content"],
+            "(reasoning unavailable)"
+        );
+        assert!(input["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn native_chat_does_not_invent_reasoning_history_without_request_evidence() {
+        let mut input = json!({
+            "model": "generic-model",
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "get_date", "parameters": {"type": "object"}}
+            }],
+            "reasoning_effort": "high"
+        });
+
+        sanitize_native_chat_reasoning_history(&mut input);
+
+        assert!(input["messages"][1].get("reasoning_content").is_none());
     }
 
     #[test]

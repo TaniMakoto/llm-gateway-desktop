@@ -91,7 +91,16 @@ pub(crate) fn is_capability_rejection(error: &ProxyError) -> bool {
     // but never silently weaken enum/items/required constraints in the payload.
     let relay_schema = message.contains("invalid schema for function")
         && (message.contains("null is not of type") || message.contains("not supported"));
-    (unsupported && capability) || relay_schema
+    // CPA's request-scoped error rules allow an upstream-specific 400 to
+    // continue with the next credential without penalising provider health.
+    // Some OpenAI-compatible DeepSeek relays reject a history accepted by
+    // another relay/backend when a thinking fragment is missing. This is a
+    // candidate compatibility rejection, not a globally invalid request.
+    let thinking_history = message.contains("thinking mode")
+        && (message.contains("content[].thinking")
+            || message.contains("reasoning_content"))
+        && (message.contains("must be passed back") || message.contains("must be passed"));
+    (unsupported && capability) || relay_schema || thinking_history
 }
 
 /// Port of CPA's request-fault boundary: these failures are caused by the
@@ -186,6 +195,8 @@ mod tests {
             ("Invalid schema for function 'delegate_task': null is not of type \"array\"", true),
             ("unsupported model", true),
             ("Invalid schema for function 'x': required must contain all properties", false),
+            ("The `content[].thinking` in the thinking mode must be passed back to the API.", true),
+            ("reasoning_content in the thinking mode must be passed back", true),
             ("Invalid JSON", false),
             ("unsupported tool_call_id", false),
             ("invalid schema", false),

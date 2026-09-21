@@ -1559,6 +1559,9 @@ impl RequestForwarder {
         let mut mapped_body = if native_chat { mapped_body } else { normalize_thinking_type(mapped_body) };
         if native_chat {
             super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            super::providers::transform_codex_chat::sanitize_native_chat_reasoning_history(
+                &mut mapped_body,
+            );
             if let Some(config) = provider.meta.as_ref().and_then(|meta| meta.codex_chat_reasoning.as_ref()) {
                 super::providers::transform_codex_chat::apply_native_chat_reasoning(&mut mapped_body, config);
             }

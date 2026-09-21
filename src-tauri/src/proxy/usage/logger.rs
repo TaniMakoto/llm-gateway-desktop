@@ -22,6 +22,8 @@ pub struct RequestLog {
     /// 用 model/request_model 猜——路由接管下三者可能各不相同。
     /// 错误行（未计价）为空字符串。
     pub pricing_model: String,
+    /// 客户端实际请求的思考等级；未显式设置时为 None。
+    pub reasoning_effort: Option<String>,
     pub usage: TokenUsage,
     pub cost: Option<CostBreakdown>,
     pub latency_ms: u64,
@@ -79,13 +81,13 @@ impl<'a> UsageLogger<'a> {
 
         conn.execute(
             "INSERT OR REPLACE INTO proxy_request_logs (
-                request_id, provider_id, app_type, model, request_model, pricing_model,
+                request_id, provider_id, app_type, model, request_model, pricing_model, reasoning_effort,
                 input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                 input_token_semantics,
                 input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                 latency_ms, first_token_ms, status_code, error_message, session_id,
                 provider_type, is_streaming, cost_multiplier, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             rusqlite::params![
                 log.request_id,
                 log.provider_id,
@@ -93,6 +95,7 @@ impl<'a> UsageLogger<'a> {
                 log.model,
                 log.request_model,
                 log.pricing_model,
+                log.reasoning_effort,
                 log.usage.input_tokens,
                 log.usage.output_tokens,
                 log.usage.cache_read_tokens,
@@ -145,6 +148,7 @@ impl<'a> UsageLogger<'a> {
             request_model,
             // 错误行未经过计价，留空（回填的 has_usage 闸门也不会碰全 0 行）
             pricing_model: String::new(),
+            reasoning_effort: None,
             usage: TokenUsage::default(),
             cost: None,
             latency_ms,
@@ -176,6 +180,7 @@ impl<'a> UsageLogger<'a> {
         is_streaming: bool,
         session_id: Option<String>,
         provider_type: Option<String>,
+        reasoning_effort: Option<String>,
     ) -> Result<(), AppError> {
         let request_model = model.clone();
         let log = RequestLog {
@@ -186,6 +191,7 @@ impl<'a> UsageLogger<'a> {
             request_model,
             // 错误行未经过计价，留空（回填的 has_usage 闸门也不会碰全 0 行）
             pricing_model: String::new(),
+            reasoning_effort,
             usage: TokenUsage::default(),
             cost: None,
             latency_ms,
@@ -328,6 +334,7 @@ impl<'a> UsageLogger<'a> {
         session_id: Option<String>,
         provider_type: Option<String>,
         is_streaming: bool,
+        reasoning_effort: Option<String>,
     ) -> Result<(), AppError> {
         let pricing = self.get_model_pricing(&pricing_model)?;
 
@@ -354,6 +361,7 @@ impl<'a> UsageLogger<'a> {
             model,
             request_model,
             pricing_model,
+            reasoning_effort,
             usage,
             cost,
             latency_ms,
@@ -415,19 +423,21 @@ mod tests {
             None,
             Some("claude".to_string()),
             false,
+            Some("high".to_string()),
         )?;
 
         // 验证记录已插入
         let conn = crate::database::lock_conn!(db.conn);
-        let (count, request_model): (i64, String) = conn
+        let (count, request_model, reasoning_effort): (i64, String, Option<String>) = conn
             .query_row(
-                "SELECT COUNT(*), request_model FROM proxy_request_logs WHERE request_id = 'req-123'",
+                "SELECT COUNT(*), request_model, reasoning_effort FROM proxy_request_logs WHERE request_id = 'req-123'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(request_model, "req-model");
+        assert_eq!(reasoning_effort.as_deref(), Some("high"));
         Ok(())
     }
 
