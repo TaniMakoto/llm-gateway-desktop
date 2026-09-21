@@ -11,6 +11,7 @@ import {
   CircleStop,
   Copy,
   Database,
+  ScrollText,
   Eraser,
   Eye,
   EyeOff,
@@ -38,11 +39,13 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Markdown } from "@/components/markdown";
+import { RequestLogsPage } from "@/RequestLogsPage";
 
 type ApiFormat = "openai_chat" | "openai_responses" | "anthropic";
 type RoutingPolicy =
   "priority" | "round_robin" | "weighted_round_robin" | "least_outstanding";
-type Tab = "dashboard" | "providers" | "routes" | "registry" | "settings";
+type Tab =
+  "dashboard" | "providers" | "routes" | "logs" | "registry" | "settings";
 type ProxyMode = "follow_global" | "bypass" | "custom";
 
 interface CachedModel {
@@ -954,6 +957,12 @@ function App() {
               badge={enabledAliases.length}
             />
             <NavButton
+              icon={ScrollText}
+              label="请求日志"
+              active={tab === "logs"}
+              onClick={() => setTab("logs")}
+            />
+            <NavButton
               icon={Database}
               label="模型元数据"
               active={tab === "registry"}
@@ -1087,6 +1096,8 @@ function App() {
               )}
             </section>
           )}
+
+          {tab === "logs" && <RequestLogsPage providers={config.providers} />}
 
           {tab === "routes" && (
             <section className="mx-auto max-w-5xl">

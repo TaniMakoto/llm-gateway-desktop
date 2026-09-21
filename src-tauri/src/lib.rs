@@ -490,6 +490,8 @@ pub fn run() {
             commands::test_proxy_url,
             commands::get_upstream_proxy_status,
             commands::scan_local_proxies,
+            commands::get_request_logs,
+            commands::get_request_detail,
         ]);
 
     let app = builder

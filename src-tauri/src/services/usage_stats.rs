@@ -105,7 +105,12 @@ pub struct LogFilters {
     pub app_type: Option<String>,
     pub provider_name: Option<String>,
     pub model: Option<String>,
+    /// 客户端请求的公开模型名。与 `model`（实际/计价模型）分开，供路由日志页按
+    /// 用户看到的 alias 过滤。
+    pub request_model: Option<String>,
     pub status_code: Option<u16>,
+    /// true = 2xx，false = 非 2xx。
+    pub success: Option<bool>,
     pub start_date: Option<i64>,
     pub end_date: Option<i64>,
 }
@@ -1490,9 +1495,20 @@ impl Database {
             filters.provider_name.as_deref(),
             filters.model.as_deref(),
         );
+        if let Some(ref request_model) = filters.request_model {
+            conditions.push("COALESCE(NULLIF(l.request_model, ''), l.model) = ?".to_string());
+            params.push(Box::new(request_model.clone()));
+        }
         if let Some(status) = filters.status_code {
             conditions.push("l.status_code = ?".to_string());
             params.push(Box::new(status as i64));
+        }
+        if let Some(success) = filters.success {
+            conditions.push(if success {
+                "l.status_code >= 200 AND l.status_code < 300".to_string()
+            } else {
+                "NOT (l.status_code >= 200 AND l.status_code < 300)".to_string()
+            });
         }
         if let Some(start) = filters.start_date {
             conditions.push("l.created_at >= ?".to_string());
@@ -2362,6 +2378,72 @@ mod tests {
         let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
         assert_eq!(count, 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_logs_filter_public_model_and_result_class() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let conn = lock_conn!(db.conn);
+        insert_usage_log(
+            &conn,
+            "success-request",
+            "codex",
+            "provider-success",
+            "upstream-model",
+            "proxy",
+            1_000,
+            10,
+            2,
+            0,
+            0,
+            200,
+            "0",
+        )?;
+        insert_usage_log(
+            &conn,
+            "failed-request",
+            "codex",
+            "provider-failed",
+            "upstream-model",
+            "proxy",
+            1_001,
+            0,
+            0,
+            0,
+            0,
+            400,
+            "0",
+        )?;
+        conn.execute(
+            "UPDATE proxy_request_logs SET request_model = 'public-alias'",
+            [],
+        )?;
+        drop(conn);
+
+        let successful = db.get_request_logs(
+            &LogFilters {
+                request_model: Some("public-alias".to_string()),
+                success: Some(true),
+                ..Default::default()
+            },
+            0,
+            50,
+        )?;
+        assert_eq!(successful.total, 1);
+        assert_eq!(successful.data[0].request_id, "success-request");
+
+        let failed = db.get_request_logs(
+            &LogFilters {
+                request_model: Some("public-alias".to_string()),
+                success: Some(false),
+                ..Default::default()
+            },
+            0,
+            50,
+        )?;
+        assert_eq!(failed.total, 1);
+        assert_eq!(failed.data[0].request_id, "failed-request");
         Ok(())
     }
 
