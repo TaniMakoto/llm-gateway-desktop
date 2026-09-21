@@ -890,3 +890,29 @@ async fn malformed_http_2xx_protocol_body_fails_over_before_recording_success() 
         check_response(format, false, false, &wire, &mut String::new()).unwrap();
     }
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn streaming_request_rejects_json_candidate_and_fails_over_to_sse() {
+    for format in FORMATS {
+        let json_instead_of_sse = response_json(format, false);
+        let (status, wire, seen) = routing_contract(
+            format,
+            request(format, true, "text"),
+            vec![
+                (format, json!({}), Some(json_instead_of_sse)),
+                (format, json!({}), None),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{format:?}: {wire}");
+        assert_eq!(seen[0].len(), 1);
+        assert_eq!(
+            seen[1].len(),
+            1,
+            "{format:?}: JSON cannot satisfy a streaming request"
+        );
+        check_response(format, true, false, &wire, &mut String::new()).unwrap();
+    }
+}

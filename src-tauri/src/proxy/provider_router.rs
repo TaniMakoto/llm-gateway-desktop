@@ -244,7 +244,9 @@ impl ProviderRouter {
         cooldowns
             .iter()
             .filter(|((entry_app, entry_provider, _), _)| {
-                entry_app == app_type && entry_provider == provider_id
+                let queried_source = source_provider_id_for_materialized(provider_id);
+                entry_app == app_type
+                    && (entry_provider == provider_id || entry_provider == queried_source)
             })
             .map(|(_, until)| until.duration_since(now).as_secs().max(1))
             .max()
@@ -514,17 +516,20 @@ impl ProviderRouter {
     /// 否则会导致该 Provider 长时间无法进入探测状态。
     pub async fn allow_provider_request(
         &self,
-        provider_id: &str,
+        provider: &Provider,
         app_type: &str,
         model: &str,
     ) -> AllowResult {
-        if self.is_provider_cooled_down(provider_id, app_type, model).await {
+        if self
+            .is_provider_cooled_down(provider.gateway_source_provider_id(), app_type, model)
+            .await
+        {
             return AllowResult {
                 allowed: false,
                 used_half_open_permit: false,
             };
         }
-        let circuit_key = format!("{app_type}:{provider_id}");
+        let circuit_key = format!("{app_type}:{}", provider.id);
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
         breaker.allow_request().await
     }
@@ -535,14 +540,17 @@ impl ProviderRouter {
     /// `allow_provider_request` immediately before execution.
     pub async fn provider_available_for_scheduling(
         &self,
-        provider_id: &str,
+        provider: &Provider,
         app_type: &str,
         model: &str,
     ) -> bool {
-        if self.is_provider_cooled_down(provider_id, app_type, model).await {
+        if self
+            .is_provider_cooled_down(provider.gateway_source_provider_id(), app_type, model)
+            .await
+        {
             return false;
         }
-        let circuit_key = format!("{app_type}:{provider_id}");
+        let circuit_key = format!("{app_type}:{}", provider.id);
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
         breaker.is_available().await
     }
@@ -559,7 +567,7 @@ impl ProviderRouter {
         let mut available = Vec::with_capacity(providers.len());
         for provider in providers {
             if self
-                .provider_available_for_scheduling(&provider.id, app_type, model)
+                .provider_available_for_scheduling(&provider, app_type, model)
                 .await
             {
                 available.push(provider);
@@ -716,6 +724,13 @@ impl ProviderRouter {
     }
 }
 
+fn source_provider_id_for_materialized(provider_id: &str) -> &str {
+    match provider_id.rsplit_once("::") {
+        Some((source, "chat" | "responses" | "anthropic")) => source,
+        _ => provider_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,23 +805,31 @@ mod tests {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
         let router = ProviderRouter::new(db);
+        let mut p1 =
+            Provider::with_id("p1::chat".to_string(), "P1".to_string(), json!({}), None);
+        p1.meta = Some(crate::provider::ProviderMeta {
+            gateway_source_provider_id: Some("p1".to_string()),
+            ..Default::default()
+        });
+        let p2 = Provider::with_id("p2".to_string(), "P2".to_string(), json!({}), None);
 
         router
             .cooldown_provider("p1", "claude", "model-a", Duration::from_secs(30))
             .await;
         assert!(router.is_provider_cooled_down("p1", "claude", "model-a").await);
         assert!(!router.is_provider_cooled_down("p1", "claude", "model-b").await);
-        assert!(!router.allow_provider_request("p1", "claude", "model-a").await.allowed);
-        assert!(router.allow_provider_request("p1", "claude", "model-b").await.allowed);
+        assert!(router
+            .provider_cooldown_remaining_seconds("p1::chat", "claude")
+            .await
+            .is_some());
+        assert!(!router.allow_provider_request(&p1, "claude", "model-a").await.allowed);
+        assert!(router.allow_provider_request(&p1, "claude", "model-b").await.allowed);
 
         let schedulable = router
             .schedulable_providers(
                 "claude",
                 "model-a",
-                vec![
-                    Provider::with_id("p1".to_string(), "P1".to_string(), json!({}), None),
-                    Provider::with_id("p2".to_string(), "P2".to_string(), json!({}), None),
-                ],
+                vec![p1.clone(), p2],
             )
             .await;
         assert_eq!(
@@ -819,7 +842,7 @@ mod tests {
 
         router.clear_provider_cooldown("p1", "claude").await;
         assert!(!router.is_provider_cooled_down("p1", "claude", "model-a").await);
-        assert!(router.allow_provider_request("p1", "claude", "model-a").await.allowed);
+        assert!(router.allow_provider_request(&p1, "claude", "model-a").await.allowed);
 
         router
             .cooldown_provider("p1", "claude", "", Duration::from_secs(30))
@@ -1289,7 +1312,8 @@ mod tests {
         let providers = router.select_providers("claude").await.unwrap();
         assert_eq!(providers.len(), 2);
 
-        assert!(router.allow_provider_request("b", "claude", "").await.allowed);
+        let provider_b = providers.iter().find(|provider| provider.id == "b").unwrap();
+        assert!(router.allow_provider_request(provider_b, "claude", "").await.allowed);
     }
 
     #[tokio::test]
@@ -1326,12 +1350,12 @@ mod tests {
             .unwrap();
 
         // 第一次请求：获取 HalfOpen 探测名额
-        let first = router.allow_provider_request("a", "claude", "").await;
+        let first = router.allow_provider_request(&provider_a, "claude", "").await;
         assert!(first.allowed);
         assert!(first.used_half_open_permit);
 
         // 第二次请求应被拒绝（名额已被占用）
-        let second = router.allow_provider_request("a", "claude", "").await;
+        let second = router.allow_provider_request(&provider_a, "claude", "").await;
         assert!(!second.allowed);
 
         // 使用 release_permit_neutral 释放名额（不影响健康统计）
@@ -1340,7 +1364,7 @@ mod tests {
             .await;
 
         // 第三次请求应被允许（名额已释放）
-        let third = router.allow_provider_request("a", "claude", "").await;
+        let third = router.allow_provider_request(&provider_a, "claude", "").await;
         assert!(third.allowed);
         assert!(third.used_half_open_permit);
     }

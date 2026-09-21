@@ -755,7 +755,7 @@ impl RequestForwarder {
         for provider in &ordered_providers {
             if !self
                 .router
-                .provider_available_for_scheduling(&provider.id, app_type_str, &route_model)
+                .provider_available_for_scheduling(provider, app_type_str, &route_model)
                 .await
             {
                 continue;
@@ -828,7 +828,11 @@ impl RequestForwarder {
             // Retry-After，避免形成紧密重试环。
             if self
                 .router
-                .is_provider_cooled_down(&provider.id, app_type_str, &route_model)
+                .is_provider_cooled_down(
+                    provider.gateway_source_provider_id(),
+                    app_type_str,
+                    &route_model,
+                )
                 .await
             {
                 log::debug!(
@@ -864,7 +868,7 @@ impl RequestForwarder {
             // 单候选也必须经过熔断器，否则持续故障时网关会无限敲击上游。
             let permit = self
                 .router
-                .allow_provider_request(&provider.id, app_type_str, &route_model)
+                .allow_provider_request(provider, app_type_str, &route_model)
                 .await;
             let (allowed, used_half_open_permit) =
                 (permit.allowed, permit.used_half_open_permit);
@@ -1339,7 +1343,7 @@ impl RequestForwarder {
                                 if credential_limited {
                                     self.router
                                         .cooldown_provider(
-                                            &provider.id,
+                                            provider.gateway_source_provider_id(),
                                             app_type_str,
                                             "",
                                             Duration::from_secs(30 * 60),
@@ -1354,7 +1358,7 @@ impl RequestForwarder {
                                 {
                                     self.router
                                         .cooldown_provider(
-                                            &provider.id,
+                                            provider.gateway_source_provider_id(),
                                             app_type_str,
                                             &route_model,
                                             Duration::from_secs(12 * 60 * 60),
@@ -2595,15 +2599,26 @@ impl RequestForwarder {
             let mut response = self
                 .prepare_success_response_for_failover(response, request_is_streaming)
                 .await?;
-            // Streaming requests normally return SSE. If a compatible gateway
-            // explicitly returns JSON instead, buffer and validate it inside the retry
-            // loop as well so a 2xx Anthropic error envelope can still fail over. Do
-            // not buffer unknown content types: some gateways omit the SSE header.
-            if codex_responses_to_anthropic
+            // Streaming requests must remain streams. A JSON response is still parsed
+            // here to preserve an upstream error message, but even valid non-stream JSON
+            // cannot satisfy the request and must fail over before success is recorded.
+            // Unknown content types continue through the SSE start validators because
+            // some compatible gateways omit the event-stream header.
+            if resolved_claude_api_format.as_deref() == Some("gemini_native") {
+                if !request_is_streaming {
+                    response = self.validate_gemini_success_response(response).await?;
+                } else if response.is_json() {
+                    self.validate_gemini_success_response(response).await?;
+                    return Err(streaming_json_protocol_mismatch("Gemini"));
+                }
+            } else if codex_responses_to_anthropic
                 || resolved_claude_api_format.as_deref() == Some("anthropic")
             {
-                if !request_is_streaming || response.is_json() {
+                if !request_is_streaming {
                     response = self.validate_anthropic_success_response(response).await?;
+                } else if response.is_json() {
+                    self.validate_anthropic_success_response(response).await?;
+                    return Err(streaming_json_protocol_mismatch("Anthropic"));
                 } else {
                     response = self.validate_anthropic_stream_start(response).await?;
                 }
@@ -2611,8 +2626,11 @@ impl RequestForwarder {
                 || codex_responses_to_chat
                 || resolved_claude_api_format.as_deref() == Some("openai_chat")
             {
-                if !request_is_streaming || response.is_json() {
+                if !request_is_streaming {
                     response = self.validate_chat_success_response(response).await?;
+                } else if response.is_json() {
+                    self.validate_chat_success_response(response).await?;
+                    return Err(streaming_json_protocol_mismatch("Chat"));
                 } else {
                     response = self
                         .validate_openai_stream_start(response, OpenAiResponseProtocol::Chat)
@@ -2622,11 +2640,14 @@ impl RequestForwarder {
                 || (matches!(app_type, AppType::Codex)
                     && matches!(split_endpoint_and_query(&effective_endpoint).0, "/responses" | "/v1/responses"))
             {
-                if !request_is_streaming || response.is_json() {
+                if !request_is_streaming {
                     // Claude→Responses gateways can also return a semantic failure in an
                     // HTTP 2xx Response object. Validate buffered/JSON bodies inside the
                     // retry loop so an early failure can still select another provider.
                     response = self.validate_responses_success_response(response).await?;
+                } else if response.is_json() {
+                    self.validate_responses_success_response(response).await?;
+                    return Err(streaming_json_protocol_mismatch("Responses"));
                 } else {
                     // Delay committing the downstream stream until the upstream emits
                     // either productive output or a valid non-failure terminal event.
@@ -2641,7 +2662,7 @@ impl RequestForwarder {
                 let cooldown = retry_after_duration(response.headers());
                 self.router
                     .cooldown_provider(
-                        &provider.id,
+                        provider.gateway_source_provider_id(),
                         app_type.as_str(),
                         body.get("model").and_then(Value::as_str).unwrap_or(""),
                         cooldown,
@@ -2874,6 +2895,26 @@ impl RequestForwarder {
             )));
         }
         validate_responses_response_shape(&decoded)?;
+
+        Ok(ProxyResponse::buffered(status, headers, raw))
+    }
+
+    async fn validate_gemini_success_response(
+        &self,
+        response: ProxyResponse,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let encoding = get_content_encoding(&headers);
+        let raw = response.bytes().await?;
+        let decoded = decode_upstream_body(encoding.as_deref(), &raw);
+
+        if let Some(message) = responses_error_envelope_message(&decoded) {
+            return Err(ProxyError::TransformError(format!(
+                "Gemini upstream returned a 2xx failure: {message}"
+            )));
+        }
+        validate_gemini_response_shape(&decoded)?;
 
         Ok(ProxyResponse::buffered(status, headers, raw))
     }
@@ -3563,6 +3604,34 @@ fn validate_chat_response_shape(body: &[u8]) -> Result<(), ProxyError> {
             "Chat upstream returned HTTP 2xx without a message or delta choice".to_string(),
         ))
     }
+}
+
+fn validate_gemini_response_shape(body: &[u8]) -> Result<(), ProxyError> {
+    let value: Value = serde_json::from_slice(body).map_err(|error| {
+        ProxyError::TransformError(format!("Invalid Gemini JSON response: {error}"))
+    })?;
+    let blocked = value
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(Value::as_str)
+        .is_some();
+    let has_candidate = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .is_some();
+    if blocked || has_candidate {
+        return Ok(());
+    }
+    Err(ProxyError::TransformError(
+        "No candidates in Gemini response".to_string(),
+    ))
+}
+
+fn streaming_json_protocol_mismatch(protocol: &str) -> ProxyError {
+    ProxyError::TransformError(format!(
+        "{protocol} upstream returned JSON for a streaming request"
+    ))
 }
 
 fn validate_responses_response_shape(body: &[u8]) -> Result<(), ProxyError> {
@@ -5408,6 +5477,17 @@ mod tests {
         )
         .is_ok());
         assert!(validate_anthropic_response_shape(br#"{"type":"message"}"#).is_err());
+
+        assert!(validate_gemini_response_shape(
+            br#"{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}"#
+        )
+        .is_ok());
+        assert!(validate_gemini_response_shape(
+            br#"{"promptFeedback":{"blockReason":"SAFETY"}}"#
+        )
+        .is_ok());
+        assert!(validate_gemini_response_shape(br#"{"candidates":[]}"#).is_err());
+        assert!(validate_gemini_response_shape(br#"{"status":"ok"}"#).is_err());
     }
 
     #[test]
