@@ -842,15 +842,15 @@ async fn invalid_input_stops_but_relay_schema_rejection_can_fail_over() {
 #[tokio::test]
 #[serial_test::serial]
 async fn semantic_failures_before_output_fail_over_but_committed_streams_do_not() {
-    for format in [Format::Chat, Format::Responses] {
+    for format in FORMATS {
         for stream in [false, true] {
             let payload = request(format, stream, "text");
             let mut rejection = json!({"_http_status":200,"error":{"message":"overloaded"}});
             if stream {
-                rejection["_sse"] = if matches!(format, Format::Chat) {
-                    json!("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"error\":{\"message\":\"overloaded\"}}\n\n")
-                } else {
-                    json!("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"overloaded\"}}}\n\n")
+                rejection["_sse"] = match format {
+                    Format::Chat => json!("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"error\":{\"message\":\"overloaded\"}}\n\n"),
+                    Format::Responses => json!("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"overloaded\"}}}\n\n"),
+                    Format::Anthropic => json!("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[]}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n"),
                 };
             }
             let (status, wire, seen) = routing_contract(format, payload, vec![
@@ -867,4 +867,26 @@ async fn semantic_failures_before_output_fail_over_but_committed_streams_do_not(
     ]).await;
     assert!(wire.contains("partial"));
     assert!(seen[1].is_empty(), "never replay a request after output has been committed");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn malformed_http_2xx_protocol_body_fails_over_before_recording_success() {
+    for format in FORMATS {
+        let malformed = json!({"_http_status":200,"id":"looks-successful-but-has-no-protocol-output"});
+        let (status, wire, seen) = routing_contract(
+            format,
+            request(format, false, "text"),
+            vec![
+                (format, json!({}), Some(malformed)),
+                (format, json!({}), None),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{format:?}: {wire}");
+        assert_eq!(seen[0].len(), 1);
+        assert_eq!(seen[1].len(), 1, "{format:?}: malformed 2xx must fail over");
+        check_response(format, false, false, &wire, &mut String::new()).unwrap();
+    }
 }

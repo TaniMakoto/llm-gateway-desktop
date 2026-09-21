@@ -73,8 +73,14 @@ pub struct ProviderRouter {
     /// Provider 临时冷却表（典型来源：HTTP 429 / Retry-After）。
     /// 与熔断器分离：限流/配额耗尽不等价于服务故障。
     cooldowns: Arc<RwLock<HashMap<String, Instant>>>,
-    /// Round-robin cursor keyed by app_type + public model alias.
-    route_cursors: Arc<RwLock<HashMap<String, usize>>>,
+    /// Candidate capability rejections keyed by app/provider/model/request profile.
+    /// These are deliberately narrower than provider health or rate-limit cooldowns.
+    route_rejections: Arc<RwLock<HashMap<(String, String, String, String), Instant>>>,
+    /// Last selected candidate keyed by app_type + public model alias.
+    ///
+    /// Keeping an identity instead of an array index makes round-robin stable when
+    /// a config reload adds, removes, or reorders candidates between requests.
+    route_last_picked: Arc<RwLock<HashMap<String, String>>>,
     /// Smooth weighted round-robin current scores keyed by app_type + alias.
     weighted_route_scores: Arc<RwLock<HashMap<String, HashMap<String, i64>>>>,
     /// Source-provider admission state shared across app types and protocol materializations.
@@ -88,7 +94,8 @@ impl ProviderRouter {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
             cooldowns: Arc::new(RwLock::new(HashMap::new())),
-            route_cursors: Arc::new(RwLock::new(HashMap::new())),
+            route_rejections: Arc::new(RwLock::new(HashMap::new())),
+            route_last_picked: Arc::new(RwLock::new(HashMap::new())),
             weighted_route_scores: Arc::new(RwLock::new(HashMap::new())),
             capacity_states: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -270,6 +277,74 @@ impl ProviderRouter {
         self.cooldowns.write().await.remove(&key);
     }
 
+    fn route_rejection_key(
+        provider_id: &str,
+        app_type: &str,
+        model: &str,
+        request_profile: &str,
+    ) -> (String, String, String, String) {
+        (
+            app_type.to_string(),
+            provider_id.to_string(),
+            model.to_string(),
+            request_profile.to_string(),
+        )
+    }
+
+    /// Temporarily suppress one candidate for one model/request capability shape.
+    /// A schema rejection must not cool down unrelated models or simpler requests.
+    pub async fn reject_route_candidate(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        model: &str,
+        request_profile: &str,
+        duration: Duration,
+    ) {
+        let key = Self::route_rejection_key(provider_id, app_type, model, request_profile);
+        let until = Instant::now() + duration.max(Duration::from_secs(1));
+        let mut rejections = self.route_rejections.write().await;
+        rejections
+            .entry(key)
+            .and_modify(|existing| {
+                if until > *existing {
+                    *existing = until;
+                }
+            })
+            .or_insert(until);
+    }
+
+    pub async fn is_route_candidate_rejected(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        model: &str,
+        request_profile: &str,
+    ) -> bool {
+        let key = Self::route_rejection_key(provider_id, app_type, model, request_profile);
+        let now = Instant::now();
+        let mut rejections = self.route_rejections.write().await;
+        match rejections.get(&key).copied() {
+            Some(until) if until > now => true,
+            Some(_) => {
+                rejections.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    pub async fn clear_route_candidate_rejection(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        model: &str,
+        request_profile: &str,
+    ) {
+        let key = Self::route_rejection_key(provider_id, app_type, model, request_profile);
+        self.route_rejections.write().await.remove(&key);
+    }
+
     /// Apply the configured scheduling policy to one gateway alias.
     /// Session affinity is layered later by RequestForwarder and can still
     /// promote an already-bound provider ahead of this order.
@@ -291,10 +366,17 @@ impl ProviderRouter {
             GatewayRoutingPolicy::RoundRobin => {
                 let key = format!("{app_type}:{}", alias.trim());
                 let start = {
-                    let mut cursors = self.route_cursors.write().await;
-                    let cursor = cursors.entry(key).or_insert(0);
-                    let start = *cursor % providers.len();
-                    *cursor = (*cursor + 1) % providers.len();
+                    let mut last_picked = self.route_last_picked.write().await;
+                    let start = last_picked
+                        .get(&key)
+                        .and_then(|last_id| {
+                            providers
+                                .iter()
+                                .position(|provider| &provider.id == last_id)
+                                .map(|index| (index + 1) % providers.len())
+                        })
+                        .unwrap_or(0);
+                    last_picked.insert(key, providers[start].id.clone());
                     start
                 };
                 providers.rotate_left(start);
@@ -696,6 +778,74 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_route_rejection_is_scoped_to_model_and_request_profile() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let router = ProviderRouter::new(db);
+
+        router
+            .reject_route_candidate(
+                "p1::chat",
+                "codex",
+                "agent-model",
+                "tools-and-reasoning",
+                Duration::from_secs(30),
+            )
+            .await;
+
+        assert!(
+            router
+                .is_route_candidate_rejected(
+                    "p1::chat",
+                    "codex",
+                    "agent-model",
+                    "tools-and-reasoning",
+                )
+                .await
+        );
+        assert!(
+            !router
+                .is_route_candidate_rejected(
+                    "p1::chat",
+                    "codex",
+                    "agent-model",
+                    "plain-text",
+                )
+                .await
+        );
+        assert!(
+            !router
+                .is_route_candidate_rejected(
+                    "p1::chat",
+                    "codex",
+                    "another-model",
+                    "tools-and-reasoning",
+                )
+                .await
+        );
+
+        router
+            .clear_route_candidate_rejection(
+                "p1::chat",
+                "codex",
+                "agent-model",
+                "tools-and-reasoning",
+            )
+            .await;
+        assert!(
+            !router
+                .is_route_candidate_rejected(
+                    "p1::chat",
+                    "codex",
+                    "agent-model",
+                    "tools-and-reasoning",
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_round_robin_rotates_alias_chain_and_priority_stays_stable() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
@@ -754,6 +904,58 @@ mod tests {
         assert_eq!(first[0].id, "a");
         assert_eq!(second[0].id, "b");
         assert_eq!(third[0].id, "c");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_round_robin_tracks_candidate_identity_across_reload() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let router = ProviderRouter::new(db);
+        let provider = |id: &str| {
+            Provider::with_id(id.to_string(), id.to_uppercase(), json!({}), None)
+        };
+        let weights = HashMap::new();
+        let active = HashMap::new();
+
+        let first = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "changing-chain",
+                GatewayRoutingPolicy::RoundRobin,
+                &weights,
+                &active,
+                vec![provider("a"), provider("b"), provider("c")],
+            )
+            .await;
+        assert_eq!(first[0].id, "a");
+
+        // Removing a candidate before the former numeric cursor must not skip b.
+        let after_reload = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "changing-chain",
+                GatewayRoutingPolicy::RoundRobin,
+                &weights,
+                &active,
+                vec![provider("a"), provider("b")],
+            )
+            .await;
+        assert_eq!(after_reload[0].id, "b");
+
+        // If the remembered identity disappears, start from the current first
+        // candidate rather than applying a stale index to the new vector.
+        let after_second_reload = router
+            .apply_gateway_routing_policy(
+                "codex",
+                "changing-chain",
+                GatewayRoutingPolicy::RoundRobin,
+                &weights,
+                &active,
+                vec![provider("c"), provider("a")],
+            )
+            .await;
+        assert_eq!(after_second_reload[0].id, "c");
     }
 
     #[tokio::test]

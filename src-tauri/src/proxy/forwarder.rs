@@ -42,6 +42,39 @@ use tokio::sync::RwLock;
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(30);
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+const ROUTE_CAPABILITY_REJECTION_TTL: Duration = Duration::from_secs(2 * 60);
+
+fn request_capability_profile(endpoint: &str, body: &Value) -> String {
+    let serialized = body.to_string();
+    let media = [
+        "input_image",
+        "image_url",
+        "input_audio",
+        "audio_url",
+        "document",
+    ]
+    .iter()
+    .filter(|kind| serialized.contains(**kind))
+    .copied()
+    .collect::<Vec<_>>();
+    let mut parameters = body.clone();
+    if let Some(object) = parameters.as_object_mut() {
+        for content_key in ["model", "messages", "input", "instructions", "system"] {
+            object.remove(content_key);
+        }
+    }
+    let profile = serde_json::json!({
+        "endpoint": split_endpoint_and_query(endpoint).0,
+        "parameters": parameters,
+        "media": media,
+        "has_reasoning_history": serialized.contains("reasoning_content")
+            || serialized.contains("reasoning_details"),
+        "has_tool_history": serialized.contains("tool_call_id")
+            || serialized.contains("function_call_output")
+            || serialized.contains("tool_result"),
+    });
+    short_value_hash(Some(&profile))
+}
 
 fn retry_after_duration(headers: &http::HeaderMap) -> Duration {
     let Some(raw) = headers
@@ -736,6 +769,13 @@ impl RequestForwarder {
         let mut last_error = None;
         let mut last_provider = None;
         let mut attempted_providers = 0usize;
+        let route_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let capability_profile = request_capability_profile(endpoint, &body);
+        let cache_candidate_rejections = providers.len() > 1;
 
         // 会话亲和：命中绑定的 provider 提到最前。只重排尝试顺序，
         // `providers` 本身（配置顺序）仍是首选与故障转移链的权威定义；
@@ -753,6 +793,19 @@ impl RequestForwarder {
                 .router
                 .is_provider_cooled_down(&provider.id, app_type_str)
                 .await
+            {
+                continue;
+            }
+            if cache_candidate_rejections
+                && self
+                    .router
+                    .is_route_candidate_rejected(
+                        &provider.id,
+                        app_type_str,
+                        &route_model,
+                        &capability_profile,
+                    )
+                    .await
             {
                 continue;
             }
@@ -801,11 +854,9 @@ impl RequestForwarder {
             }
         }
 
-        // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
-        let bypass_circuit_breaker = providers.len() == 1;
-
         // 依次尝试每个供应商
-        for provider in ordered_providers {
+        let ordered_provider_count = ordered_providers.len();
+        for (provider_index, provider) in ordered_providers.into_iter().enumerate() {
             // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
             // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
             let mut rectifier_retried = false;
@@ -823,8 +874,8 @@ impl RequestForwarder {
                 break;
             }
 
-            // 429 / 配额冷却与熔断器是两个维度。即使单 Provider 模式绕过熔断器，
-            // 也应尊重上游明确要求的 Retry-After，避免形成紧密重试环。
+            // 429 / 配额冷却与熔断器是两个维度。始终尊重上游明确要求的
+            // Retry-After，避免形成紧密重试环。
             if self
                 .router
                 .is_provider_cooled_down(&provider.id, app_type_str)
@@ -832,6 +883,24 @@ impl RequestForwarder {
             {
                 log::debug!(
                     "[{app_type_str}] Provider {} is temporarily rate-limit cooled down; skipping",
+                    provider.id
+                );
+                continue;
+            }
+
+            if cache_candidate_rejections
+                && self
+                    .router
+                    .is_route_candidate_rejected(
+                        &provider.id,
+                        app_type_str,
+                        &route_model,
+                        &capability_profile,
+                    )
+                    .await
+            {
+                log::debug!(
+                    "[{app_type_str}] Provider {} rejected this model/capability profile recently; skipping",
                     provider.id
                 );
                 continue;
@@ -858,17 +927,14 @@ impl RequestForwarder {
                 }
             };
 
-            // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
-            // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
-            let (allowed, used_half_open_permit) = if bypass_circuit_breaker {
-                (true, false)
-            } else {
-                let permit = self
-                    .router
-                    .allow_provider_request(&provider.id, app_type_str)
-                    .await;
-                (permit.allowed, permit.used_half_open_permit)
-            };
+            // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）。
+            // 单候选也必须经过熔断器，否则持续故障时网关会无限敲击上游。
+            let permit = self
+                .router
+                .allow_provider_request(&provider.id, app_type_str)
+                .await;
+            let (allowed, used_half_open_permit) =
+                (permit.allowed, permit.used_half_open_permit);
 
             if !allowed {
                 continue;
@@ -921,6 +987,15 @@ impl RequestForwarder {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
+                        .await;
+
+                    self.router
+                        .clear_route_candidate_rejection(
+                            &provider.id,
+                            app_type_str,
+                            &route_model,
+                            &capability_profile,
+                        )
                         .await;
 
                     self.update_success_state(
@@ -1328,6 +1403,19 @@ impl RequestForwarder {
                                         used_half_open_permit,
                                     )
                                     .await;
+                                if category == ErrorCategory::ProviderIncompatible
+                                    && provider_index + 1 < ordered_provider_count
+                                {
+                                    self.router
+                                        .reject_route_candidate(
+                                            &provider.id,
+                                            app_type_str,
+                                            &route_model,
+                                            &capability_profile,
+                                            ROUTE_CAPABILITY_REJECTION_TTL,
+                                        )
+                                        .await;
+                                }
                             } else {
                                 // 真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度。
                                 let _ = self
@@ -1356,8 +1444,8 @@ impl RequestForwarder {
                             );
                             log::warn!("[{app_type_str}] [{log_code}] {log_message}");
 
-                            // 会话亲和：这一家是真的故障了，解除它与本会话的绑定，
-                            // 免得后续请求继续被粘到坏上游上。
+                            // 会话亲和：当前候选已经发生服务故障或被证明不兼容，
+                            // 解除绑定，避免后续同类请求继续被粘回它。
                             // 上面的 NonRetryable 分支是客户端层错误，不走到这里，
                             // 所以「请求级错误不打断亲和」是自然成立的。
                             self.release_session_affinity(&provider.id).await;
@@ -2566,15 +2654,24 @@ impl RequestForwarder {
             // explicitly returns JSON instead, buffer and validate it inside the retry
             // loop as well so a 2xx Anthropic error envelope can still fail over. Do
             // not buffer unknown content types: some gateways omit the SSE header.
-            if codex_responses_to_anthropic && (!request_is_streaming || response.is_json()) {
-                response = self
-                    .validate_codex_anthropic_success_response(response)
-                    .await?;
-            } else if native_chat || codex_responses_to_chat || resolved_claude_api_format.as_deref() == Some("openai_chat") {
+            if codex_responses_to_anthropic
+                || resolved_claude_api_format.as_deref() == Some("anthropic")
+            {
                 if !request_is_streaming || response.is_json() {
-                    response = self.validate_responses_success_response(response).await?;
+                    response = self.validate_anthropic_success_response(response).await?;
                 } else {
-                    response = self.validate_openai_stream_start(response, true).await?;
+                    response = self.validate_anthropic_stream_start(response).await?;
+                }
+            } else if native_chat
+                || codex_responses_to_chat
+                || resolved_claude_api_format.as_deref() == Some("openai_chat")
+            {
+                if !request_is_streaming || response.is_json() {
+                    response = self.validate_chat_success_response(response).await?;
+                } else {
+                    response = self
+                        .validate_openai_stream_start(response, OpenAiResponseProtocol::Chat)
+                        .await?;
                 }
             } else if matches!(resolved_claude_api_format.as_deref(), Some("openai_responses"))
                 || (matches!(app_type, AppType::Codex)
@@ -2759,7 +2856,7 @@ impl RequestForwarder {
     /// Some Anthropic-compatible gateways return an Anthropic error envelope with
     /// HTTP 2xx. Validate it inside the retry loop so the request can fail over to
     /// the next provider; the response transformer runs too late for that.
-    async fn validate_codex_anthropic_success_response(
+    async fn validate_anthropic_success_response(
         &self,
         response: ProxyResponse,
     ) -> Result<ProxyResponse, ProxyError> {
@@ -2780,6 +2877,27 @@ impl RequestForwarder {
                 "Anthropic upstream returned a 2xx error envelope: {message}"
             )));
         }
+        validate_anthropic_response_shape(&decoded)?;
+
+        Ok(ProxyResponse::buffered(status, headers, raw))
+    }
+
+    async fn validate_chat_success_response(
+        &self,
+        response: ProxyResponse,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let encoding = get_content_encoding(&headers);
+        let raw = response.bytes().await?;
+        let decoded = decode_upstream_body(encoding.as_deref(), &raw);
+
+        if let Some(message) = responses_error_envelope_message(&decoded) {
+            return Err(ProxyError::TransformError(format!(
+                "Chat upstream returned a 2xx failure: {message}"
+            )));
+        }
+        validate_chat_response_shape(&decoded)?;
 
         Ok(ProxyResponse::buffered(status, headers, raw))
     }
@@ -2805,6 +2923,7 @@ impl RequestForwarder {
                 "Responses upstream returned a 2xx failure: {message}"
             )));
         }
+        validate_responses_response_shape(&decoded)?;
 
         Ok(ProxyResponse::buffered(status, headers, raw))
     }
@@ -2813,15 +2932,15 @@ impl RequestForwarder {
         &self,
         response: ProxyResponse,
     ) -> Result<ProxyResponse, ProxyError> {
-        self.validate_openai_stream_start(response, false).await
+        self.validate_openai_stream_start(response, OpenAiResponseProtocol::Responses)
+            .await
     }
 
     async fn validate_openai_stream_start(
         &self,
         response: ProxyResponse,
-        chat: bool,
+        protocol: OpenAiResponseProtocol,
     ) -> Result<ProxyResponse, ProxyError> {
-        let inspect_event = if chat { inspect_chat_start_event } else { inspect_responses_start_event };
         const MAX_PRIME_BYTES: usize = 256 * 1024;
 
         let status = response.status();
@@ -2846,13 +2965,13 @@ impl RequestForwarder {
             };
 
             let Some(chunk) = next else {
-                if let Some(outcome) = inspect_responses_json_document(&parse_buffer) {
+                if let Some(outcome) = inspect_openai_json_document(&parse_buffer, protocol) {
                     outcome?;
                     let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                     return Ok(ProxyResponse::streamed(status, headers, replay));
                 }
                 if !parse_buffer.trim().is_empty() {
-                    if let Some(outcome) = inspect_event(parse_buffer.trim()) {
+                    if let Some(outcome) = inspect_openai_start_event(parse_buffer.trim(), protocol) {
                         outcome?;
                         let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                         return Ok(ProxyResponse::streamed(status, headers, replay));
@@ -2875,14 +2994,14 @@ impl RequestForwarder {
             // Responses JSON document without a JSON content-type. Recognize that
             // shape before looking for SSE delimiters; pretty-printed JSON may itself
             // contain blank lines and must stay intact.
-            if let Some(outcome) = inspect_responses_json_document(&parse_buffer) {
+            if let Some(outcome) = inspect_openai_json_document(&parse_buffer, protocol) {
                 outcome?;
                 let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                 return Ok(ProxyResponse::streamed(status, headers, replay));
             }
 
             while let Some(block) = crate::proxy::sse::take_sse_block(&mut parse_buffer) {
-                if let Some(outcome) = inspect_event(&block) {
+                if let Some(outcome) = inspect_openai_start_event(&block, protocol) {
                     outcome?;
                     let replay =
                         futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
@@ -2893,6 +3012,84 @@ impl RequestForwarder {
             if replay_chunks.iter().map(Bytes::len).sum::<usize>() >= MAX_PRIME_BYTES {
                 log::warn!(
                     "[OpenAI] semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing buffered stream"
+                );
+                let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
+                return Ok(ProxyResponse::streamed(status, headers, replay));
+            }
+        }
+    }
+
+    async fn validate_anthropic_stream_start(
+        &self,
+        response: ProxyResponse,
+    ) -> Result<ProxyResponse, ProxyError> {
+        const MAX_PRIME_BYTES: usize = 256 * 1024;
+
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut stream = Box::pin(response.bytes_stream());
+        let mut replay_chunks: Vec<Bytes> = Vec::new();
+        let mut parse_buffer = String::new();
+        let mut utf8_remainder = Vec::new();
+
+        loop {
+            let next = if self.streaming_first_byte_timeout.is_zero() {
+                stream.next().await
+            } else {
+                tokio::time::timeout(self.streaming_first_byte_timeout, stream.next())
+                    .await
+                    .map_err(|_| {
+                        ProxyError::Timeout(format!(
+                            "Anthropic stream produced no semantic output within {}s",
+                            self.streaming_first_byte_timeout.as_secs()
+                        ))
+                    })?
+            };
+
+            let Some(chunk) = next else {
+                if let Some(outcome) = inspect_anthropic_json_document(&parse_buffer) {
+                    outcome?;
+                    let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
+                    return Ok(ProxyResponse::streamed(status, headers, replay));
+                }
+                if !parse_buffer.trim().is_empty() {
+                    if let Some(outcome) = inspect_anthropic_start_event(parse_buffer.trim()) {
+                        outcome?;
+                        let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
+                        return Ok(ProxyResponse::streamed(status, headers, replay));
+                    }
+                }
+                return Err(ProxyError::ForwardFailed(
+                    "Anthropic stream ended before producing output or a terminal event"
+                        .to_string(),
+                ));
+            };
+            let chunk = chunk.map_err(|error| {
+                ProxyError::ForwardFailed(format!(
+                    "Failed while validating Anthropic stream start: {error}"
+                ))
+            })?;
+            crate::proxy::sse::append_utf8_safe(&mut parse_buffer, &mut utf8_remainder, &chunk);
+            replay_chunks.push(chunk);
+
+            if let Some(outcome) = inspect_anthropic_json_document(&parse_buffer) {
+                outcome?;
+                let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
+                return Ok(ProxyResponse::streamed(status, headers, replay));
+            }
+
+            while let Some(block) = crate::proxy::sse::take_sse_block(&mut parse_buffer) {
+                if let Some(outcome) = inspect_anthropic_start_event(&block) {
+                    outcome?;
+                    let replay =
+                        futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
+                    return Ok(ProxyResponse::streamed(status, headers, replay));
+                }
+            }
+
+            if replay_chunks.iter().map(Bytes::len).sum::<usize>() >= MAX_PRIME_BYTES {
+                log::warn!(
+                    "[Anthropic] semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing buffered stream"
                 );
                 let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                 return Ok(ProxyResponse::streamed(status, headers, replay));
@@ -3064,29 +3261,22 @@ impl RequestForwarder {
             ProxyError::ProviderUnhealthy(_) => ErrorCategory::Retryable,
             // 上游 HTTP 错误：按状态码分桶。
             //
-            // 仅把“换哪家都会同样失败”的客户端语义错误标为 NonRetryable：
-            //   400 / 422  ← 请求体格式或语义错误（对所有上游通常相同）
-            //   406 / 414 / 415 ← Accept / URI / Content-Type 客户端构造问题
-            //
-            // 多供应商中转场景下，下列状态码经常是“这一家”的问题，应继续 failover：
-            //   405 ← 常见于某家 nginx location 未放开 POST /v1/responses，不是本地方法错
-            //   413 ← 各家 client_max_body_size / 网关限额不同，换源可能成功
-            //   501 ← 某一家未实现该协议/端点，另一家可能支持
-            //   401/403/404/429 与全部 5xx ← 换 key、配额、通道或节点后可能恢复
-            ProxyError::UpstreamError { status, body } => match *status {
+            // 400/422 中明确的请求语义错误才会终止整条链。端点、媒体类型、
+            // body 大小、模型支持等限制属于当前候选的能力边界：继续换源，但不把
+            // 健康的供应商记成故障并触发熔断。
+            ProxyError::UpstreamError { status, .. } => match *status {
                 400 | 422 if super::upstream_error::is_capability_rejection(error) => ErrorCategory::ProviderIncompatible,
-                400 | 406 | 414 | 415 | 422 => ErrorCategory::NonRetryable,
-                // 405：默认允许换源。若响应体是明确的 JSON 应用层“方法不允许”，
-                // 且完全不像边缘/反代 HTML，才视为客户端协议问题并中止 failover。
-                405 if is_application_method_not_allowed(body.as_deref()) => {
-                    ErrorCategory::NonRetryable
+                400 | 422 => ErrorCategory::NonRetryable,
+                404 | 405 | 406 | 413 | 414 | 415 | 501 => {
+                    ErrorCategory::ProviderIncompatible
                 }
                 _ => ErrorCategory::Retryable,
             },
-            // Provider 级配置/转换问题：换一个 Provider 可能就能成功
-            ProxyError::ConfigError(_) => ErrorCategory::Retryable,
-            ProxyError::TransformError(message) if message.starts_with("Chat bridge capability:") => ErrorCategory::ProviderIncompatible,
-            ProxyError::TransformError(_) => ErrorCategory::Retryable,
+            // Provider 级配置、请求桥接或响应结构不兼容：换一个候选可能成功，
+            // 但这些都不代表上游服务不健康。
+            ProxyError::ConfigError(_) | ProxyError::TransformError(_) => {
+                ErrorCategory::ProviderIncompatible
+            }
             ProxyError::AuthError(_) => ErrorCategory::Retryable,
             ProxyError::StreamIdleTimeout(_) => ErrorCategory::Retryable,
             // 无可用供应商：所有供应商都试过了，无法重试
@@ -3095,50 +3285,6 @@ impl RequestForwarder {
             _ => ErrorCategory::NonRetryable,
         }
     }
-}
-
-/// 判断 405 是否更像“应用层明确拒绝该方法”，而不是 nginx/CDN 边缘页。
-///
-/// 中转站返回的裸 nginx HTML（`<h1>405 Not Allowed</h1>`）对下一户供应商没有约束，
-/// 必须允许 failover；只有带 JSON 业务错误码/文案的 405 才倾向视为协议用错。
-fn is_application_method_not_allowed(body: Option<&str>) -> bool {
-    let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) else {
-        return false;
-    };
-
-    if looks_like_edge_gateway_body(body) {
-        return false;
-    }
-
-    let Ok(json_body) = serde_json::from_str::<Value>(body) else {
-        return false;
-    };
-
-    let message = extract_json_error_message(&json_body)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let code = json_body
-        .pointer("/error/code")
-        .or_else(|| json_body.get("code"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    message.contains("method not allowed")
-        || message.contains("method_not_allowed")
-        || code.contains("method_not_allowed")
-}
-
-fn looks_like_edge_gateway_body(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    lower.contains("<html")
-        || lower.contains("<!doctype")
-        || lower.contains("<center>")
-        || lower.contains("nginx")
-        || lower.contains("cloudflare")
-        || lower.contains("405 not allowed")
-        || lower.contains("error code: 1010")
-        || lower.contains("error code: 1003")
 }
 
 /// 从 ProxyError 中提取错误消息
@@ -3416,6 +3562,80 @@ fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
     Some(format!("{error_type}: {message}"))
 }
 
+#[derive(Debug, Clone, Copy)]
+enum OpenAiResponseProtocol {
+    Chat,
+    Responses,
+}
+
+fn decode_upstream_body(content_encoding: Option<&str>, raw: &[u8]) -> Vec<u8> {
+    match content_encoding {
+        Some(encoding) => decompress_body(encoding, raw)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| raw.to_vec()),
+        None => raw.to_vec(),
+    }
+}
+
+fn parse_upstream_json(body: &[u8], protocol: &str) -> Result<Value, ProxyError> {
+    serde_json::from_slice(body).map_err(|error| {
+        ProxyError::TransformError(format!(
+            "{protocol} upstream returned invalid JSON with HTTP 2xx: {error}"
+        ))
+    })
+}
+
+fn validate_chat_response_shape(body: &[u8]) -> Result<(), ProxyError> {
+    let value = parse_upstream_json(body, "Chat")?;
+    let choices = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .filter(|choices| !choices.is_empty())
+        .ok_or_else(|| {
+            ProxyError::TransformError(
+                "Chat upstream returned HTTP 2xx without a non-empty choices array".to_string(),
+            )
+        })?;
+    if choices.iter().any(|choice| {
+        choice.get("message").is_some_and(Value::is_object)
+            || choice.get("delta").is_some_and(Value::is_object)
+    }) {
+        Ok(())
+    } else {
+        Err(ProxyError::TransformError(
+            "Chat upstream returned HTTP 2xx without a message or delta choice".to_string(),
+        ))
+    }
+}
+
+fn validate_responses_response_shape(body: &[u8]) -> Result<(), ProxyError> {
+    let value = parse_upstream_json(body, "Responses")?;
+    if value.get("output").is_some_and(Value::is_array) {
+        Ok(())
+    } else {
+        Err(ProxyError::TransformError(
+            "Responses upstream returned HTTP 2xx without an output array".to_string(),
+        ))
+    }
+}
+
+fn validate_anthropic_response_shape(body: &[u8]) -> Result<(), ProxyError> {
+    let value = parse_upstream_json(body, "Anthropic")?;
+    if value.get("content").is_some_and(Value::is_array)
+        && value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_none_or(|value_type| value_type == "message")
+    {
+        Ok(())
+    } else {
+        Err(ProxyError::TransformError(
+            "Anthropic upstream returned HTTP 2xx without a message content array".to_string(),
+        ))
+    }
+}
+
 fn responses_error_envelope_message(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let status = value.get("status").and_then(Value::as_str);
@@ -3456,9 +3676,11 @@ fn codex_anthropic_cache_config(config: &OptimizerConfig) -> OptimizerConfig {
 }
 
 /// A streaming request may receive a whole JSON document even when the gateway
-/// omits `application/json`. `None` means either "not JSON" or "not complete yet";
-/// a parsed document is safe to commit unless it is a semantic failure envelope.
-fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError>> {
+/// omits `application/json`. `None` means either "not JSON" or "not complete yet".
+fn inspect_openai_json_document(
+    buffer: &str,
+    protocol: OpenAiResponseProtocol,
+) -> Option<Result<(), ProxyError>> {
     let trimmed = buffer.trim();
     if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
         return None;
@@ -3469,7 +3691,88 @@ fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError
             "Responses upstream returned a 2xx failure: {message}"
         ))));
     }
-    Some(Ok(()))
+    Some(match protocol {
+        OpenAiResponseProtocol::Chat => validate_chat_response_shape(trimmed.as_bytes()),
+        OpenAiResponseProtocol::Responses => {
+            validate_responses_response_shape(trimmed.as_bytes())
+        }
+    })
+}
+
+fn inspect_openai_start_event(
+    block: &str,
+    protocol: OpenAiResponseProtocol,
+) -> Option<Result<(), ProxyError>> {
+    match protocol {
+        OpenAiResponseProtocol::Chat => inspect_chat_start_event(block),
+        OpenAiResponseProtocol::Responses => inspect_responses_start_event(block),
+    }
+}
+
+fn inspect_anthropic_json_document(buffer: &str) -> Option<Result<(), ProxyError>> {
+    let trimmed = buffer.trim();
+    if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
+        return None;
+    }
+    let _: Value = serde_json::from_str(trimmed).ok()?;
+    if let Some(message) = codex_anthropic_error_envelope_message(trimmed.as_bytes()) {
+        return Some(Err(ProxyError::TransformError(format!(
+            "Anthropic upstream returned a 2xx error envelope: {message}"
+        ))));
+    }
+    Some(validate_anthropic_response_shape(trimmed.as_bytes()))
+}
+
+fn inspect_anthropic_start_event(block: &str) -> Option<Result<(), ProxyError>> {
+    let mut named_event = None;
+    let mut data_lines = Vec::new();
+    for line in block.lines() {
+        if let Some(event) = crate::proxy::sse::strip_sse_field(line, "event") {
+            named_event = Some(event.trim().to_string());
+        } else if let Some(data) = crate::proxy::sse::strip_sse_field(line, "data") {
+            data_lines.push(data);
+        }
+    }
+    if data_lines.is_empty() {
+        return None;
+    }
+    let data = data_lines.join("\n");
+    let value: Value = serde_json::from_str(&data).ok()?;
+    let event = named_event
+        .as_deref()
+        .filter(|event| !event.is_empty())
+        .or_else(|| value.get("type").and_then(Value::as_str))
+        .unwrap_or("");
+
+    if event == "error" || value.get("type").and_then(Value::as_str) == Some("error") {
+        let message = codex_anthropic_error_envelope_message(data.as_bytes())
+            .unwrap_or_else(|| "Anthropic upstream failed before output".to_string());
+        return Some(Err(ProxyError::TransformError(format!(
+            "Anthropic stream failed before output: {message}"
+        ))));
+    }
+
+    match event {
+        "message_start" | "content_block_start" | "ping" => None,
+        "content_block_delta" => {
+            let delta = value.get("delta").unwrap_or(&value);
+            let productive = delta.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+                || delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .is_some_and(|json| !json.is_empty())
+                || delta.get("thinking").and_then(Value::as_str).is_some_and(|text| !text.is_empty());
+            productive.then_some(Ok(()))
+        }
+        "content_block_stop" => None,
+        "message_delta" => value
+            .pointer("/delta/stop_reason")
+            .is_some_and(|reason| !reason.is_null())
+            .then_some(Ok(())),
+        "message_stop" => Some(Ok(())),
+        "" => None,
+        _ => Some(Ok(())),
+    }
 }
 
 /// Commit a Chat stream only on output or a terminal, never on a role-only preamble.
@@ -3557,7 +3860,19 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
                 "Responses upstream {error_type}: {message}"
             ))))
         }
-        "response.created" | "response.in_progress" | "response.queued" => None,
+        "response.created"
+        | "response.in_progress"
+        | "response.queued"
+        | "response.output_item.added"
+        | "response.content_part.added" => None,
+        "response.output_text.delta"
+        | "response.function_call_arguments.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_text.delta" => value
+            .get("delta")
+            .and_then(Value::as_str)
+            .is_some_and(|delta| !delta.is_empty())
+            .then_some(Ok(())),
         "" => None,
         // Productive output, incomplete, and completed terminals are all safe to
         // expose. Mid-stream failures after this point are surfaced by the converter
@@ -5050,23 +5365,74 @@ mod tests {
     #[test]
     fn responses_stream_start_accepts_unlabelled_whole_json() {
         assert!(matches!(
-            inspect_responses_json_document(
+            inspect_openai_json_document(
                 r#"{
                     "status": "completed",
 
                     "output": []
-                }"#
+                }"#,
+                OpenAiResponseProtocol::Responses,
             ),
             Some(Ok(()))
         ));
-        assert!(inspect_responses_json_document(r#"{"status":"completed""#).is_none());
+        assert!(inspect_openai_json_document(
+            r#"{"status":"completed""#,
+            OpenAiResponseProtocol::Responses,
+        )
+        .is_none());
 
-        let failed = inspect_responses_json_document(
+        let failed = inspect_openai_json_document(
             r#"{"status":"failed","error":{"message":"backend unavailable"}}"#,
+            OpenAiResponseProtocol::Responses,
         );
         assert!(
             matches!(failed, Some(Err(ProxyError::TransformError(message))) if message.contains("backend unavailable"))
         );
+    }
+
+    #[test]
+    fn successful_status_requires_the_selected_protocol_shape() {
+        assert!(validate_chat_response_shape(
+            br#"{"id":"chat_1","choices":[{"message":{"role":"assistant","content":"ok"}}]}"#
+        )
+        .is_ok());
+        assert!(validate_chat_response_shape(br#"{"status":"ok"}"#).is_err());
+
+        assert!(validate_responses_response_shape(
+            br#"{"id":"resp_1","status":"completed","output":[]}"#
+        )
+        .is_ok());
+        assert!(validate_responses_response_shape(br#"{"choices":[]}"#).is_err());
+
+        assert!(validate_anthropic_response_shape(
+            br#"{"type":"message","content":[]}"#
+        )
+        .is_ok());
+        assert!(validate_anthropic_response_shape(br#"{"type":"message"}"#).is_err());
+    }
+
+    #[test]
+    fn anthropic_stream_waits_through_lifecycle_and_rejects_early_error() {
+        let start = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"content\":[]}}"
+        );
+        assert!(inspect_anthropic_start_event(start).is_none());
+
+        let failed = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}"
+        );
+        assert!(matches!(
+            inspect_anthropic_start_event(failed),
+            Some(Err(ProxyError::TransformError(message))) if message.contains("busy")
+        ));
+
+        let delta = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}"
+        );
+        assert!(matches!(inspect_anthropic_start_event(delta), Some(Ok(()))));
     }
 
     #[test]
@@ -5122,86 +5488,22 @@ mod tests {
     }
 
     #[test]
-    fn nginx_html_405_is_retryable_for_multi_provider_failover() {
+    fn endpoint_and_payload_limit_errors_are_candidate_incompatible() {
         let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
         let provider = test_provider_with_type(None);
-        let error = ProxyError::UpstreamError {
-            status: 405,
-            body: Some(
-                r#"<html>
-<head><title>405 Not Allowed</title></head>
-<body>
-<center><h1>405 Not Allowed</h1></center>
-<hr><center>nginx</center>
-</body>
-</html>"#
-                    .to_string(),
-            ),
-        };
-
-        assert_eq!(
-            forwarder.categorize_proxy_error(&error, &provider),
-            ErrorCategory::Retryable,
-            "裸 nginx 405 应继续换源，而不是中止整条 failover 链"
-        );
-    }
-
-    #[test]
-    fn empty_or_edge_405_and_413_are_retryable() {
-        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
-        let provider = test_provider_with_type(None);
-
-        assert_eq!(
-            forwarder.categorize_proxy_error(
-                &ProxyError::UpstreamError {
-                    status: 405,
-                    body: None,
-                },
-                &provider,
-            ),
-            ErrorCategory::Retryable
-        );
-        assert_eq!(
-            forwarder.categorize_proxy_error(
-                &ProxyError::UpstreamError {
-                    status: 413,
-                    body: Some(
-                        "<html><head><title>413 Request Entity Too Large</title></head></html>"
-                            .to_string(),
-                    ),
-                },
-                &provider,
-            ),
-            ErrorCategory::Retryable
-        );
-        assert_eq!(
-            forwarder.categorize_proxy_error(
-                &ProxyError::UpstreamError {
-                    status: 501,
-                    body: Some(r#"{"error":{"message":"not implemented"}}"#.to_string()),
-                },
-                &provider,
-            ),
-            ErrorCategory::Retryable
-        );
-    }
-
-    #[test]
-    fn application_json_method_not_allowed_405_stays_non_retryable() {
-        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
-        let provider = test_provider_with_type(None);
-        let error = ProxyError::UpstreamError {
-            status: 405,
-            body: Some(
-                r#"{"error":{"code":"method_not_allowed","message":"Method Not Allowed"}}"#
-                    .to_string(),
-            ),
-        };
-
-        assert_eq!(
-            forwarder.categorize_proxy_error(&error, &provider),
-            ErrorCategory::NonRetryable
-        );
+        for status in [404_u16, 405, 406, 413, 414, 415, 501] {
+            assert_eq!(
+                forwarder.categorize_proxy_error(
+                    &ProxyError::UpstreamError {
+                        status,
+                        body: Some(r#"{"error":{"message":"unsupported here"}}"#.to_string()),
+                    },
+                    &provider,
+                ),
+                ErrorCategory::ProviderIncompatible,
+                "status {status} should fail over without poisoning provider health"
+            );
+        }
     }
 
     #[test]
@@ -5209,7 +5511,7 @@ mod tests {
         let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
         let provider = test_provider_with_type(None);
 
-        for status in [400_u16, 406, 414, 415, 422] {
+        for status in [400_u16, 422] {
             assert_eq!(
                 forwarder.categorize_proxy_error(
                     &ProxyError::UpstreamError {
