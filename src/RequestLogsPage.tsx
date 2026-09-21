@@ -537,6 +537,14 @@ function StatusBadge({ log }: { log: RequestLog }) {
       <div className="mt-1 whitespace-nowrap text-[10px] text-muted-foreground">
         HTTP {log.statusCode}
       </div>
+      {log.errorMessage && (
+        <div
+          className="mt-0.5 max-w-36 truncate text-[10px] text-destructive/80"
+          title={log.errorMessage}
+        >
+          {log.errorMessage}
+        </div>
+      )}
     </div>
   );
 }
