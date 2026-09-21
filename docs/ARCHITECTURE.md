@@ -27,7 +27,7 @@ React 配置 / 测试台 / 托盘 → Tauri commands → GatewayConfig / SQLite
 
 为了复用原代理，每个供应商与协议组合物化为 `unified_gateway` 分类下的内部 provider，并分别写入 `claude`、`codex` 应用域。它们不是本机 CLI 配置。
 
-`proxy/handler_context.rs` 先解析统一网关别名，再应用路由策略；有效会话绑定优先于重新分配。未知别名仍存在进入继承 provider router 的回退路径，后续应明确这是否属于产品契约，不能只依赖 `/v1/models` 列表实现路由隔离。
+`proxy/handler_context.rs` 先解析统一网关别名，再应用路由策略；有效会话绑定优先于重新分配。网关配置存在时，未知别名返回明确的请求错误，不再进入继承 provider router；仅未配置统一网关的旧应用路径保留旧行为。
 
 ## 请求与响应
 
@@ -45,11 +45,13 @@ POST /v1/messages
 
 网关公开三类客户端协议。继承目录含 Gemini、OAuth 等实现，不代表这些能力已通过当前 UI、配置和 HTTP 路由成为产品功能。
 
-`gateway_chat.rs` 将 Chat 请求转换为 Responses，再调用 Responses handler，将 JSON 或 SSE 转回 Chat。即使上游也是 Chat，也可能经历 Chat → Responses → Chat；这带来复用收益，也增加扩展字段、工具与 reasoning 的保真验证成本。
+Chat 和 Responses 入口共享 OpenAI handler，保留原始请求直到选定候选。`proxy/request_plan.rs` 在每次尝试中按候选协议决定转换：Chat → Chat 直接转发，只进行模型映射、显式兼容配置及已有私有字段过滤；跨协议才调用 `gateway_chat.rs`。成功响应按实际成功候选的协议处理，原生 Chat 的 JSON/SSE 不绕 Responses。响应协议和应用配置域分开，Chat SSE 使用自己的终态检查与 usage parser。
+
+推理接口由已知服务端域名或供应商显式 `chatReasoningProfile` 决定，模型名和展示名称不能触发厂商字段注入。原生 Chat 在 auto 下保留客户端推理参数；跨协议未知服务商采用 OpenAI effort 字段。工具 schema 默认保留；`chatSchemaRequiredDefaults` 仅为要求此字段的服务商补齐非 strict 工具缺省的 required 数组，不删除 null 或改写 enum/items。
 
 `proxy/providers/` 负责三类协议转换、工具调用、reasoning 与 SSE。`forwarder.rs` 组织发送、错误处理与故障转移；`provider_router.rs` 提供路由、供应商容量控制、排队和冷却；`session_affinity.rs` 保存有界的会话绑定。并发容量按源供应商共享，避免物化为多个协议后重复获得并发额度。
 
-已有 429 / Retry-After 冷却、熔断、会话重新绑定及取消排队计数等实现和针对性单元测试；这不等于已完成真实上游的端到端验收。
+已有 429 / Retry-After 冷却、熔断、会话重新绑定及取消排队计数。供应商明确拒绝参数/模型能力的 400/422 可换源，释放熔断器探测名额但不累计供应商健康失败；无效 JSON、工具历史错误和未识别的 400 仍终止。每家仅从原始请求构建自己的出站参数。HTTP 200 错误正文和 OpenAI SSE 在实际输出前的错误也在重试循环内识别；输出已提交后不重放请求。详见 [路由可靠性改造](ROUTING_RELIABILITY.md)。
 
 ## 桌面、数据与继承代码
 

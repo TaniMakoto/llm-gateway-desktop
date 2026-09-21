@@ -2570,10 +2570,16 @@ impl RequestForwarder {
                 response = self
                     .validate_codex_anthropic_success_response(response)
                     .await?;
-            } else if matches!(
-                resolved_claude_api_format.as_deref(),
-                Some("openai_responses")
-            ) {
+            } else if native_chat || codex_responses_to_chat || resolved_claude_api_format.as_deref() == Some("openai_chat") {
+                if !request_is_streaming || response.is_json() {
+                    response = self.validate_responses_success_response(response).await?;
+                } else {
+                    response = self.validate_openai_stream_start(response, true).await?;
+                }
+            } else if matches!(resolved_claude_api_format.as_deref(), Some("openai_responses"))
+                || (matches!(app_type, AppType::Codex)
+                    && matches!(split_endpoint_and_query(&effective_endpoint).0, "/responses" | "/v1/responses"))
+            {
                 if !request_is_streaming || response.is_json() {
                     // Claude→Responses gateways can also return a semantic failure in an
                     // HTTP 2xx Response object. Validate buffered/JSON bodies inside the
@@ -2807,6 +2813,15 @@ impl RequestForwarder {
         &self,
         response: ProxyResponse,
     ) -> Result<ProxyResponse, ProxyError> {
+        self.validate_openai_stream_start(response, false).await
+    }
+
+    async fn validate_openai_stream_start(
+        &self,
+        response: ProxyResponse,
+        chat: bool,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let inspect_event = if chat { inspect_chat_start_event } else { inspect_responses_start_event };
         const MAX_PRIME_BYTES: usize = 256 * 1024;
 
         let status = response.status();
@@ -2824,7 +2839,7 @@ impl RequestForwarder {
                     .await
                     .map_err(|_| {
                         ProxyError::Timeout(format!(
-                            "Responses stream produced no semantic output within {}s",
+                            "OpenAI stream produced no semantic output within {}s",
                             self.streaming_first_byte_timeout.as_secs()
                         ))
                     })?
@@ -2837,20 +2852,20 @@ impl RequestForwarder {
                     return Ok(ProxyResponse::streamed(status, headers, replay));
                 }
                 if !parse_buffer.trim().is_empty() {
-                    if let Some(outcome) = inspect_responses_start_event(parse_buffer.trim()) {
+                    if let Some(outcome) = inspect_event(parse_buffer.trim()) {
                         outcome?;
                         let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                         return Ok(ProxyResponse::streamed(status, headers, replay));
                     }
                 }
                 return Err(ProxyError::ForwardFailed(
-                    "Responses stream ended before producing output or a terminal event"
+                    "OpenAI stream ended before producing output or a terminal event"
                         .to_string(),
                 ));
             };
             let chunk = chunk.map_err(|error| {
                 ProxyError::ForwardFailed(format!(
-                    "Failed while validating Responses stream start: {error}"
+                    "Failed while validating OpenAI stream start: {error}"
                 ))
             })?;
             crate::proxy::sse::append_utf8_safe(&mut parse_buffer, &mut utf8_remainder, &chunk);
@@ -2867,7 +2882,7 @@ impl RequestForwarder {
             }
 
             while let Some(block) = crate::proxy::sse::take_sse_block(&mut parse_buffer) {
-                if let Some(outcome) = inspect_responses_start_event(&block) {
+                if let Some(outcome) = inspect_event(&block) {
                     outcome?;
                     let replay =
                         futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
@@ -2877,7 +2892,7 @@ impl RequestForwarder {
 
             if replay_chunks.iter().map(Bytes::len).sum::<usize>() >= MAX_PRIME_BYTES {
                 log::warn!(
-                    "[Claude/Responses] semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing buffered stream"
+                    "[OpenAI] semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing buffered stream"
                 );
                 let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                 return Ok(ProxyResponse::streamed(status, headers, replay));
@@ -3070,6 +3085,7 @@ impl RequestForwarder {
             },
             // Provider 级配置/转换问题：换一个 Provider 可能就能成功
             ProxyError::ConfigError(_) => ErrorCategory::Retryable,
+            ProxyError::TransformError(message) if message.starts_with("Chat bridge capability:") => ErrorCategory::ProviderIncompatible,
             ProxyError::TransformError(_) => ErrorCategory::Retryable,
             ProxyError::AuthError(_) => ErrorCategory::Retryable,
             ProxyError::StreamIdleTimeout(_) => ErrorCategory::Retryable,
@@ -3454,6 +3470,25 @@ fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError
         ))));
     }
     Some(Ok(()))
+}
+
+/// Commit a Chat stream only on output or a terminal, never on a role-only preamble.
+fn inspect_chat_start_event(block: &str) -> Option<Result<(), ProxyError>> {
+    let data = block.lines().filter_map(|line| crate::proxy::sse::strip_sse_field(line, "data"))
+        .collect::<Vec<_>>().join("\n");
+    if data.trim() == "[DONE]" { return Some(Ok(())); }
+    let value: Value = serde_json::from_str(&data).ok()?;
+    if let Some(message) = responses_error_envelope_message(data.as_bytes()) {
+        return Some(Err(ProxyError::ForwardFailed(format!("Chat stream failed before output: {message}"))));
+    }
+    let productive = value.get("choices").and_then(Value::as_array)?.iter().any(|choice| {
+        choice.get("finish_reason").is_some_and(|v| !v.is_null())
+            || choice.get("delta").and_then(Value::as_object).is_some_and(|delta| {
+                delta.iter().any(|(key, value)| key != "role" && !value.is_null()
+                    && value.as_str() != Some("") && !value.as_array().is_some_and(Vec::is_empty))
+            })
+    });
+    productive.then_some(Ok(()))
 }
 
 /// Inspect one complete Responses SSE block while the response is still inside

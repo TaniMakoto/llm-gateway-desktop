@@ -688,7 +688,12 @@ async fn routing_contract(
             async move {
                 captured.lock().unwrap().push(body.clone());
                 if let Some(error) = rejection {
-                    return Response::builder().status(400).header("content-type", "application/json")
+                    let status = error.get("_http_status").and_then(Value::as_u64).unwrap_or(400) as u16;
+                    if let Some(sse) = error.get("_sse").and_then(Value::as_str) {
+                        return Response::builder().status(status).header("content-type", "text/event-stream")
+                            .body(Body::from(sse.to_string())).unwrap();
+                    }
+                    return Response::builder().status(status).header("content-type", "application/json")
                         .body(Body::from(error.to_string())).unwrap();
                 }
                 if body["stream"] == true {
@@ -831,4 +836,35 @@ async fn invalid_input_stops_but_relay_schema_rejection_can_fail_over() {
     let (status, _, seen) = routing_contract(Format::Chat, payload, vec![(Format::Chat, json!({}), None)]).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(seen[0].is_empty());
+}
+
+
+#[tokio::test]
+#[serial_test::serial]
+async fn semantic_failures_before_output_fail_over_but_committed_streams_do_not() {
+    for format in [Format::Chat, Format::Responses] {
+        for stream in [false, true] {
+            let payload = request(format, stream, "text");
+            let mut rejection = json!({"_http_status":200,"error":{"message":"overloaded"}});
+            if stream {
+                rejection["_sse"] = if matches!(format, Format::Chat) {
+                    json!("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"error\":{\"message\":\"overloaded\"}}\n\n")
+                } else {
+                    json!("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"overloaded\"}}}\n\n")
+                };
+            }
+            let (status, wire, seen) = routing_contract(format, payload, vec![
+                (format, json!({}), Some(rejection)), (format, json!({}), None),
+            ]).await;
+            assert_eq!(status, StatusCode::OK, "{wire}");
+            assert_eq!(seen[1].len(), 1, "{format:?}, stream={stream}: {wire}");
+            check_response(format, stream, false, &wire, &mut String::new()).unwrap();
+        }
+    }
+    let rejection = json!({"_http_status":200,"_sse":"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"error\":{\"message\":\"late failure\"}}\n\n"});
+    let (_, wire, seen) = routing_contract(Format::Chat, agent_chat_request(true), vec![
+        (Format::Chat, json!({}), Some(rejection)), (Format::Chat, json!({}), None),
+    ]).await;
+    assert!(wire.contains("partial"));
+    assert!(seen[1].is_empty(), "never replay a request after output has been committed");
 }

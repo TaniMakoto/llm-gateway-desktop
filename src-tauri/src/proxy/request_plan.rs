@@ -19,7 +19,7 @@ impl OpenAiRequestPlan {
             Ok(Self {
                 endpoint: query.map_or_else(|| "/responses".into(), |q| format!("/responses?{q}")),
                 body: crate::gateway_chat::chat_request_to_responses(body.clone())
-                    .map_err(|error| ProxyError::TransformError(error.to_string()))?,
+                    .map_err(|error| ProxyError::TransformError(format!("Chat bridge capability: {error}")))?,
                 native_chat: false,
             })
         } else {

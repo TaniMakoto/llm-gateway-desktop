@@ -32,7 +32,7 @@ pub fn chat_request_to_responses(body: Value) -> Result<Value, ProxyError> {
 
     if object.get("n").and_then(Value::as_u64).unwrap_or(1) > 1 {
         return Err(ProxyError::InvalidRequest(
-            "统一网关暂不支持 n > 1 的 Chat 请求".to_string(),
+            "跨协议转换不支持 n > 1；请使用原生 Chat 上游".to_string(),
         ));
     }
 
