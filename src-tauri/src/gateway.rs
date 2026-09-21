@@ -1637,10 +1637,27 @@ pub(crate) async fn apply_runtime_config(state: &AppState, config: &GatewayConfi
     proxy_config.enable_logging = config.enable_logging;
     state.gateway_runtime.update_config(&proxy_config).await?;
 
+    let mut candidates_per_alias: HashMap<&str, usize> = HashMap::new();
+    for provider in config.providers.iter().filter(|provider| provider.enabled) {
+        for model in provider.models.iter().filter(|model| model.enabled) {
+            *candidates_per_alias.entry(model.alias.trim()).or_default() += 1;
+        }
+    }
+    let gateway_max_retries = candidates_per_alias
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .min(u32::MAX as usize) as u32;
+
     for app_type in ["claude", "codex"] {
         if let Ok(mut app_config) = state.db.get_proxy_config_for_app(app_type).await {
             app_config.auto_failover_enabled = true;
-            app_config.max_retries = 10;
+            // The unified gateway owns its route chain. Size the attempt budget to
+            // the largest configured alias instead of silently truncating at the
+            // legacy UI cap of 11 attempts.
+            app_config.max_retries = gateway_max_retries;
             state
                 .db
                 .update_proxy_config_for_app(app_config)

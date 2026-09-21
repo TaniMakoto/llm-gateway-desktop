@@ -542,6 +542,23 @@ impl ProviderRouter {
         breaker.allow_request().await
     }
 
+    /// Read-only admission check for scheduling/backpressure decisions.
+    /// This may advance an expired Open breaker to HalfOpen, but never consumes
+    /// the single HalfOpen probe permit; the send path still calls
+    /// `allow_provider_request` immediately before execution.
+    pub async fn provider_available_for_scheduling(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> bool {
+        if self.is_provider_cooled_down(provider_id, app_type).await {
+            return false;
+        }
+        let circuit_key = format!("{app_type}:{provider_id}");
+        let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
+        breaker.is_available().await
+    }
+
     /// 记录供应商请求结果
     pub async fn record_result(
         &self,

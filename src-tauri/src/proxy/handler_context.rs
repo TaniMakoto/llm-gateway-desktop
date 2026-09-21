@@ -23,6 +23,10 @@ pub struct StreamingTimeoutConfig {
     pub idle_timeout: u64,
 }
 
+fn scoped_session_affinity_key(app_type: &str, model: &str, session_id: &str) -> String {
+    format!("{app_type}\u{0}{model}\u{0}{session_id}")
+}
+
 /// 请求上下文
 ///
 /// 贯穿整个请求生命周期，包含：
@@ -126,9 +130,15 @@ impl RequestContext {
         // 提取 Session ID
         let session_result = extract_session_id(headers, body, app_type_str);
         let session_id = session_result.session_id.clone();
-        let existing_affinity_provider = if session_result.is_stable() {
+        // Match CPA's provider/model/session affinity scope. A raw session ID is
+        // not globally unique across API families and one conversation may switch
+        // aliases; sharing the binding would leak one route's choice into another.
+        let session_affinity_key = session_result
+            .is_stable()
+            .then(|| scoped_session_affinity_key(app_type_str, &request_model, &session_id));
+        let existing_affinity_provider = if let Some(key) = session_affinity_key.as_deref() {
             let mut store = state.session_affinity.write().await;
-            store.get(&session_id)
+            store.get(key)
         } else {
             None
         };
@@ -217,7 +227,7 @@ impl RequestContext {
             tag,
             app_type_str,
             app_type,
-            session_affinity_key: session_result.is_stable().then(|| session_id.clone()),
+            session_affinity_key,
             session_id,
             session_client_provided: session_result.client_provided,
             rectifier_config,
@@ -353,7 +363,24 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_gemini_model_from_path;
+    use super::{extract_gemini_model_from_path, scoped_session_affinity_key};
+
+    #[test]
+    fn affinity_key_isolated_by_app_and_model() {
+        let base = scoped_session_affinity_key("codex", "agent", "session-1");
+        assert_ne!(
+            base,
+            scoped_session_affinity_key("claude", "agent", "session-1")
+        );
+        assert_ne!(
+            base,
+            scoped_session_affinity_key("codex", "vision", "session-1")
+        );
+        assert_ne!(
+            base,
+            scoped_session_affinity_key("codex", "agent", "session-2")
+        );
+    }
 
     #[test]
     fn extract_model_with_action() {

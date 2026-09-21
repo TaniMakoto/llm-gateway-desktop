@@ -783,15 +783,15 @@ impl RequestForwarder {
         let affinity_preferred = self.session_affinity_preference(&providers).await;
         let mut ordered_providers = Self::order_providers(&providers, affinity_preferred.as_deref());
 
-        // Backpressure only queues when every non-cooled candidate is currently at capacity.
-        // If any provider can accept immediately, the normal failover loop below will prefer it
-        // instead of making the client wait behind a saturated higher-priority target.
+        // Backpressure only queues when every schedulable candidate is currently at capacity.
+        // Open circuits and request-profile rejections are not immediate capacity: counting one
+        // would make a saturated healthy fallback get skipped instead of queued.
         let mut queue_candidate = None;
         let mut has_immediate_capacity = false;
         for provider in &ordered_providers {
-            if self
+            if !self
                 .router
-                .is_provider_cooled_down(&provider.id, app_type_str)
+                .provider_available_for_scheduling(&provider.id, app_type_str)
                 .await
             {
                 continue;
