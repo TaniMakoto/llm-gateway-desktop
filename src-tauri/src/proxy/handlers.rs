@@ -222,6 +222,7 @@ async fn handle_messages_for_app(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.reasoning_effort = result.outbound_reasoning_effort.take();
     ctx.provider = result.provider;
     let api_format = result
         .claude_api_format
@@ -784,6 +785,7 @@ async fn handle_openai_request(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.reasoning_effort = result.outbound_reasoning_effort.take();
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -876,6 +878,7 @@ pub async fn handle_responses_compact(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.reasoning_effort = result.outbound_reasoning_effort.take();
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -1758,6 +1761,7 @@ pub async fn handle_gemini(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.reasoning_effort = result.outbound_reasoning_effort.take();
     ctx.provider = result.provider;
     let response = result.response;
 

@@ -52,7 +52,7 @@ pub struct RequestContext {
     pub current_provider_id: String,
     /// 请求中的模型名称
     pub request_model: String,
-    /// 客户端请求中明确携带的思考等级（如 low/high/xhigh）。
+    /// 最终成功候选收到的上游思考配置（协议转换和供应商适配后的真值）。
     pub reasoning_effort: Option<String>,
     /// 实际发往上游的模型名（路由接管/模型映射后的真值，forward 成功后回填）。
     ///
@@ -128,13 +128,6 @@ impl RequestContext {
             .and_then(|m| m.as_str())
             .unwrap_or("unknown")
             .to_string();
-        let reasoning_effort = body
-            .get("reasoning_effort")
-            .or_else(|| body.pointer("/reasoning/effort"))
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
 
         // 提取 Session ID
         let session_result = extract_session_id(headers, body, app_type_str);
@@ -242,7 +235,7 @@ impl RequestContext {
             providers,
             current_provider_id,
             request_model,
-            reasoning_effort,
+            reasoning_effort: None,
             outbound_model: None,
             tag,
             app_type_str,

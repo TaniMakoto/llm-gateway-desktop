@@ -428,8 +428,11 @@ export function RequestLogsPage({ providers }: { providers: LogProvider[] }) {
                       </div>
                     )}
                     {log.reasoningEffort && (
-                      <div className="mt-0.5 text-[10px] font-medium text-muted-foreground">
-                        {log.reasoningEffort}
+                      <div
+                        className="mt-0.5 text-[10px] font-medium text-muted-foreground"
+                        title="最终发往成功上游候选的实际思考配置"
+                      >
+                        上游 · {log.reasoningEffort}
                       </div>
                     )}
                   </td>
@@ -561,7 +564,7 @@ function LogDetail({ log, onClose }: { log: RequestLog; onClose: () => void }) {
     ["请求时间", new Date(log.createdAt * 1000).toLocaleString("zh-CN")],
     ["请求模型", log.requestModel || log.model],
     ["实际模型", log.model],
-    ["思考等级", log.reasoningEffort || "—"],
+    ["上游思考", log.reasoningEffort || "—"],
     ["计价模型", log.pricingModel || "—"],
     ["提供商", log.providerName ?? log.providerId],
     ["来源", SOURCE_LABELS[log.appType] ?? log.appType],

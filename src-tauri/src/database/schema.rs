@@ -1361,7 +1361,7 @@ impl Database {
         Ok(())
     }
 
-    /// v13 -> v14：保存客户端实际请求的 reasoning effort，供请求日志展示。
+    /// v13 -> v14：保存最终上游请求的 reasoning effort，供请求日志展示。
     fn migrate_v13_to_v14(conn: &Connection) -> Result<(), AppError> {
         if Self::table_exists(conn, "proxy_request_logs")? {
             Self::add_column_if_missing(

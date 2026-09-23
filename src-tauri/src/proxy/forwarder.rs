@@ -100,6 +100,8 @@ pub struct ForwardResult {
     /// usage 归因不能依赖 ctx.request_model（映射前的客户端别名）：上游响应
     /// 缺失 model 或回显别名时，接管流量会被记成 claude-* 并按其定价计费。
     pub outbound_model: Option<String>,
+    /// 最终发往成功候选的请求体中实际存在的思考等级/开关。
+    pub outbound_reasoning_effort: Option<String>,
     /// 活跃连接 RAII guard：随响应一起流转到 response_processor / handle_claude_transform，
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
@@ -921,7 +923,7 @@ impl RequestForwarder {
                 )
                 .await
             {
-                Ok((response, claude_api_format, outbound_model)) => {
+                Ok((response, claude_api_format, outbound_model, outbound_reasoning_effort)) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
@@ -940,6 +942,7 @@ impl RequestForwarder {
                         provider: provider.clone(),
                         claude_api_format,
                         outbound_model,
+                        outbound_reasoning_effort,
                         connection_guard: None,
                     });
                 }
@@ -991,7 +994,7 @@ impl RequestForwarder {
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model)) => {
+                                Ok((response, claude_api_format, outbound_model, outbound_reasoning_effort)) => {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
@@ -1015,6 +1018,7 @@ impl RequestForwarder {
                                         provider: provider.clone(),
                                         claude_api_format,
                                         outbound_model,
+                                        outbound_reasoning_effort,
                                         connection_guard: None,
                                     });
                                 }
@@ -1109,7 +1113,7 @@ impl RequestForwarder {
                                     )
                                     .await
                                 {
-                                    Ok((response, claude_api_format, outbound_model)) => {
+                                    Ok((response, claude_api_format, outbound_model, outbound_reasoning_effort)) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
                                         self.record_success_result(
                                             &provider.id,
@@ -1131,6 +1135,7 @@ impl RequestForwarder {
                                             provider: provider.clone(),
                                             claude_api_format,
                                             outbound_model,
+                                            outbound_reasoning_effort,
                                             connection_guard: None,
                                         });
                                     }
@@ -1242,7 +1247,7 @@ impl RequestForwarder {
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model)) => {
+                                Ok((response, claude_api_format, outbound_model, outbound_reasoning_effort)) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
                                     self.record_success_result(
                                         &provider.id,
@@ -1264,6 +1269,7 @@ impl RequestForwarder {
                                         provider: provider.clone(),
                                         claude_api_format,
                                         outbound_model,
+                                        outbound_reasoning_effort,
                                         connection_guard: None,
                                     });
                                 }
@@ -1487,7 +1493,7 @@ impl RequestForwarder {
 
     /// 转发单个请求（使用适配器）
     ///
-    /// 成功时返回 `(response, claude_api_format, outbound_model)`，其中
+    /// 成功时返回 `(response, claude_api_format, outbound_model, outbound_reasoning)`，其中
     /// `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
     #[allow(clippy::too_many_arguments)]
     async fn forward(
@@ -1501,7 +1507,10 @@ impl RequestForwarder {
         headers: &axum::http::HeaderMap,
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
-    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+    ) -> Result<
+        (ProxyResponse, Option<String>, Option<String>, Option<String>),
+        ProxyError,
+    > {
         // Each attempt starts from the immutable ingress payload. Only cross-protocol
         // candidates enter the bridge; native Chat keeps tools, history and extensions.
         let plan = if matches!(app_type, AppType::Codex) {
@@ -1942,6 +1951,7 @@ impl RequestForwarder {
         {
             outbound_model = Some(m.to_string());
         }
+        let outbound_reasoning_effort = extract_outbound_reasoning(&filtered_body);
         let request_is_streaming =
             is_streaming_request(&effective_endpoint, &filtered_body, headers);
         // 请求体录制（诊断）：发出前记录最终请求体（已完成协议转换/模型映射/私有字段过滤）。
@@ -2663,7 +2673,12 @@ impl RequestForwarder {
                     response = self.validate_responses_stream_start(response).await?;
                 }
             }
-            Ok((response, resolved_claude_api_format, outbound_model))
+            Ok((
+                response,
+                resolved_claude_api_format,
+                outbound_model,
+                outbound_reasoning_effort,
+            ))
         } else {
             let status_code = status.as_u16();
             if status_code == 429 {
@@ -3565,6 +3580,40 @@ fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
         .map(str::to_string)
         .unwrap_or_else(|| error.to_string());
     Some(format!("{error_type}: {message}"))
+}
+
+/// Read the reasoning control from the final body that is about to be sent to
+/// the selected upstream. The order prefers a concrete effort/level over a
+/// boolean or enabled/disabled thinking switch.
+fn extract_outbound_reasoning(body: &Value) -> Option<String> {
+    for pointer in [
+        "/reasoning_effort",
+        "/reasoning/effort",
+        "/output_config/effort",
+        "/generationConfig/thinkingConfig/thinkingLevel",
+        "/generation_config/thinking_config/thinking_level",
+    ] {
+        if let Some(value) = body
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+
+    if let Some(value) = body
+        .pointer("/thinking/type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value.to_string());
+    }
+    body.get("enable_thinking")
+        .and_then(Value::as_bool)
+        .map(|enabled| if enabled { "enabled" } else { "disabled" }.to_string())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6135,5 +6184,32 @@ mod tests {
         });
         let body = body_with_image("any-model");
         assert!(fwd.media_retry_should_trigger("Claude", false, &body, &image_unsupported_error()));
+    }
+
+    #[test]
+    fn extracts_reasoning_from_final_upstream_body() {
+        assert_eq!(
+            extract_outbound_reasoning(&json!({
+                "reasoning_effort": "max",
+                "reasoning": {"effort": "low"}
+            }))
+            .as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            extract_outbound_reasoning(&json!({"reasoning": {"effort": "high"}}))
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            extract_outbound_reasoning(&json!({"thinking": {"type": "enabled"}}))
+                .as_deref(),
+            Some("enabled")
+        );
+        assert_eq!(
+            extract_outbound_reasoning(&json!({"enable_thinking": false})).as_deref(),
+            Some("disabled")
+        );
+        assert_eq!(extract_outbound_reasoning(&json!({"model": "plain"})), None);
     }
 }
