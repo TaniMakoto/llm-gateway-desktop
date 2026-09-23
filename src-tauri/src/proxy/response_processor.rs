@@ -191,6 +191,7 @@ pub async fn handle_streaming(
     let logged_stream = create_logged_passthrough_stream(
         stream,
         PassthroughDiagnostics {
+            trace: Some(ctx.trace.clone()),
             tag: ctx.tag,
             protocol: parser_config.stream_protocol,
             provider_id: ctx.provider.id.clone(),
@@ -500,6 +501,7 @@ fn create_usage_collector(
     let model_extractor = parser_config.model_extractor;
     let session_id = ctx.session_id.clone();
     let reasoning_effort = ctx.reasoning_effort.clone();
+    let trace = ctx.trace.clone();
 
     Some(SseUsageCollector::new(
         start_time,
@@ -515,6 +517,7 @@ fn create_usage_collector(
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
                 let reasoning_effort = reasoning_effort.clone();
+                let trace = trace.clone();
 
                 tokio::spawn(async move {
                     log_usage_internal(
@@ -531,6 +534,7 @@ fn create_usage_collector(
                         status_code,
                         Some(session_id),
                         reasoning_effort,
+                        trace,
                     )
                     .await;
                 });
@@ -543,6 +547,7 @@ fn create_usage_collector(
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
                 let reasoning_effort = reasoning_effort.clone();
+                let trace = trace.clone();
 
                 tokio::spawn(async move {
                     log_usage_internal(
@@ -559,6 +564,7 @@ fn create_usage_collector(
                         status_code,
                         Some(session_id),
                         reasoning_effort,
+                        trace,
                     )
                     .await;
                 });
@@ -598,6 +604,7 @@ fn spawn_log_usage(
     let latency_ms = ctx.latency_ms();
     let session_id = ctx.session_id.clone();
     let reasoning_effort = ctx.reasoning_effort.clone();
+    let trace = ctx.trace.clone();
 
     tokio::spawn(async move {
         log_usage_internal(
@@ -614,6 +621,7 @@ fn spawn_log_usage(
             status_code,
             Some(session_id),
             reasoning_effort,
+            trace,
         )
         .await;
     });
@@ -648,10 +656,11 @@ async fn log_usage_internal(
     status_code: u16,
     session_id: Option<String>,
     reasoning_effort: Option<String>,
+    trace: super::request_trace::RequestTrace,
 ) {
     use super::usage::logger::UsageLogger;
 
-    let logger = UsageLogger::new(&state.db);
+    let logger = UsageLogger::new(&state.db).with_trace(trace);
     let (multiplier, pricing_model_source) =
         logger.resolve_pricing_config(provider_id, app_type).await;
     let pricing_model = if pricing_model_source == PRICING_SOURCE_REQUEST {
@@ -694,6 +703,7 @@ async fn log_usage_internal(
 
 /// 透传流的诊断上下文。**只用于上游异常结束时的 ERROR 日志**，不参与任何转发决策。
 pub(crate) struct PassthroughDiagnostics {
+    pub trace: Option<super::request_trace::RequestTrace>,
     /// 日志前缀，沿用既有 `[{tag}]` 格式（如 "Claude"、"Codex"）
     pub tag: &'static str,
     /// 客户端侧 SSE 协议（决定"正常结束标记"的形态）
@@ -727,6 +737,7 @@ pub fn create_logged_passthrough_stream(
     async_stream::stream! {
         let _conn_guard = connection_guard;
         let PassthroughDiagnostics {
+            trace,
             tag,
             protocol,
             provider_id,
@@ -776,6 +787,7 @@ pub fn create_logged_passthrough_stream(
                             // 超时
                             let timeout_type = if is_first_chunk { "首字节" } else { "静默期" };
                             log::error!("[{tag}] 流式响应{}超时 ({}秒)", timeout_type, duration.as_secs());
+                            if let Some(trace) = &trace { trace.interrupt_stream(format!("上游流式响应{timeout_type}超时（{}秒）", duration.as_secs())); }
                             yield Err(std::io::Error::other(format!("流式响应{timeout_type}超时")));
                             break;
                         }
@@ -848,6 +860,7 @@ pub fn create_logged_passthrough_stream(
                         terminal.state(),
                         stream_start.elapsed().as_millis()
                     );
+                    if let Some(trace) = &trace { trace.interrupt_stream(e.to_string()); }
                     yield Err(std::io::Error::other(e.to_string()));
                     break;
                 }
@@ -1103,6 +1116,7 @@ mod tests {
             200,
             None,
             None,
+            Default::default(),
         )
         .await;
 
@@ -1174,6 +1188,7 @@ mod tests {
             200,
             None,
             None,
+            Default::default(),
         )
         .await;
 
@@ -1255,6 +1270,7 @@ mod tests {
             200,
             None,
             None,
+            Default::default(),
         )
         .await;
 
@@ -1284,6 +1300,7 @@ mod tests {
     #[tokio::test]
     async fn passthrough_stream_diagnostics_do_not_alter_the_byte_stream() {
         let diagnostics = || PassthroughDiagnostics {
+            trace: None,
             tag: "Test",
             protocol: ClientSseProtocol::Anthropic,
             provider_id: "provider-test".to_string(),

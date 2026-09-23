@@ -221,6 +221,7 @@ impl Drop for ActiveConnectionGuard {
 }
 
 pub struct RequestForwarder {
+    trace: super::request_trace::RequestTrace,
     /// 共享的 ProviderRouter（持有熔断器状态）
     router: Arc<ProviderRouter>,
     status: Arc<RwLock<ProxyStatus>>,
@@ -264,6 +265,12 @@ pub struct RequestForwarder {
 }
 
 impl RequestForwarder {
+    pub fn with_trace(mut self, trace: super::request_trace::RequestTrace) -> Self {
+        trace.set_runtime_status(self.status.clone());
+        self.trace = trace;
+        self
+    }
+
     /// 成功目标是否是本次模型路由的备用项。
     ///
     /// 统计必须以当前请求收到的有序 provider 链为准，不能与遗留设置中的
@@ -452,6 +459,7 @@ impl RequestForwarder {
         // saturating_add 防止 u32::MAX + 1 溢出。
         let max_attempts = (max_retries as usize).saturating_add(1);
         Self {
+            trace: Default::default(),
             router,
             status,
             current_providers,
@@ -549,7 +557,7 @@ impl RequestForwarder {
             status.current_provider = Some(provider.name.clone());
             status.current_provider_id = Some(provider.id.clone());
             status.current_provider_app_type = Some(app_type.to_string());
-            if route_used_fallback {
+            if route_used_fallback && self.trace.mark_fallback() {
                 status.failover_count += 1;
             }
             if status.total_requests > 0 {
@@ -790,6 +798,7 @@ impl RequestForwarder {
                         }
                     }
                     Err(CapacityAcquireError::QueueFull) => {
+                        self.trace.skip(provider, "等待队列已满");
                         return Err(ForwardError {
                             error: ProxyError::GatewayOverloaded(format!(
                                 "Provider {} 的等待队列已满",
@@ -800,6 +809,7 @@ impl RequestForwarder {
                         });
                     }
                     Err(CapacityAcquireError::Timeout) => {
+                        self.trace.skip(provider, "等待并发名额超时");
                         return Err(ForwardError {
                             error: ProxyError::GatewayOverloaded(format!(
                                 "等待 Provider {} 并发名额超时",
@@ -830,7 +840,8 @@ impl RequestForwarder {
                     attempted_providers,
                     self.max_attempts
                 );
-                break;
+                self.trace.skip(provider, "达到最大尝试次数");
+                continue;
             }
 
             // 429 / 配额冷却与熔断器是两个维度。始终尊重上游明确要求的
@@ -848,6 +859,7 @@ impl RequestForwarder {
                     "[{app_type_str}] Provider {} is temporarily rate-limit cooled down; skipping",
                     provider.id
                 );
+                self.trace.skip(provider, "供应商处于限流、配额或兼容性冷却期");
                 continue;
             }
 
@@ -865,6 +877,7 @@ impl RequestForwarder {
                             "[{app_type_str}] Provider {} reached max concurrency; trying next target",
                             provider.id
                         );
+                        self.trace.skip(provider, "并发名额已满");
                         continue;
                     }
                     Err(CapacityAcquireError::QueueFull | CapacityAcquireError::Timeout) => {
@@ -883,6 +896,7 @@ impl RequestForwarder {
                 (permit.allowed, permit.used_half_open_permit);
 
             if !allowed {
+                self.trace.skip(provider, "熔断器未放行");
                 continue;
             }
 
@@ -902,6 +916,12 @@ impl RequestForwarder {
                     body.clone()
                 };
 
+            let used_fallback = Self::route_used_fallback(
+                &providers, &provider.id, affinity_preferred.as_deref(),
+            ) || self.trace.snapshot().attempts.iter().any(|a| a.provider_id != provider.id);
+            if used_fallback && self.trace.mark_fallback() {
+                self.status.write().await.failover_count += 1;
+            }
             attempted_providers += 1;
 
             // 将该客户端请求绑定到实际正在尝试的 Provider。若后续发生故障转移，
@@ -1532,6 +1552,47 @@ impl RequestForwarder {
     /// `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
     #[allow(clippy::too_many_arguments)]
     async fn forward(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        body: &Value,
+        route_model: &str,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+        outbound_reasoning_effort: &mut Option<String>,
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        let started = std::time::Instant::now();
+        self.trace.reset_http_status();
+        let result = self.forward_inner(
+            app_type, method, provider, endpoint, body, route_model, headers,
+            extensions, adapter, outbound_reasoning_effort,
+        ).await;
+        let (status_code, error) = match &result {
+            Ok((r, _, _)) => (Some(r.status().as_u16()), None),
+            Err(e) => (
+                self.trace.http_status().or_else(|| match e {
+                    ProxyError::UpstreamError { status, .. } => Some(*status),
+                    _ => None,
+                }),
+                Some(e.to_string()),
+            ),
+        };
+        let index = self.trace.attempt(super::request_trace::Attempt {
+            provider_id: provider.id.clone(), provider_name: provider.name.clone(),
+            outcome: if result.is_ok() { "pending" } else { "failed" }.into(),
+            status_code, error, duration_ms: started.elapsed().as_millis() as u64,
+            sent_reasoning: outbound_reasoning_effort.clone(), ..Default::default()
+        });
+        if result.is_err() {
+            self.status.write().await.upstream_failed_attempts += 1;
+        }
+        result.map(|(response, format, model)| (self.trace.observe(response, index, started), format, model))
+    }
+
+    async fn forward_inner(
         &self,
         app_type: &AppType,
         method: &http::Method,
@@ -2631,6 +2692,7 @@ impl RequestForwarder {
 
         // 检查响应状态
         let status = response.status();
+        self.trace.set_http_status(status.as_u16());
 
         if status.is_success() {
             // 响应体录制：命中录制范围时，在成功出口把响应包装成 tee 流，
@@ -3614,34 +3676,7 @@ fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
 /// the selected upstream. The order prefers a concrete effort/level over a
 /// boolean or enabled/disabled thinking switch.
 fn extract_outbound_reasoning(body: &Value) -> Option<String> {
-    for pointer in [
-        "/reasoning_effort",
-        "/reasoning/effort",
-        "/output_config/effort",
-        "/generationConfig/thinkingConfig/thinkingLevel",
-        "/generation_config/thinking_config/thinking_level",
-    ] {
-        if let Some(value) = body
-            .pointer(pointer)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return Some(value.to_string());
-        }
-    }
-
-    if let Some(value) = body
-        .pointer("/thinking/type")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(value.to_string());
-    }
-    body.get("enable_thinking")
-        .and_then(Value::as_bool)
-        .map(|enabled| if enabled { "enabled" } else { "disabled" }.to_string())
+    super::request_trace::reasoning(body)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4571,6 +4606,7 @@ mod tests {
         let db = Arc::new(Database::memory().expect("memory db"));
 
         RequestForwarder {
+            trace: Default::default(),
             router: Arc::new(ProviderRouter::new(db.clone())),
             status: Arc::new(RwLock::new(ProxyStatus::default())),
             current_providers: Arc::new(RwLock::new(HashMap::new())),

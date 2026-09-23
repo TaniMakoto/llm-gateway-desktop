@@ -303,6 +303,7 @@ struct ClaudeUsageLog {
     status_code: u16,
     is_streaming: bool,
     reasoning_effort: Option<String>,
+    trace: super::request_trace::RequestTrace,
 }
 
 fn prepare_claude_usage_log(
@@ -337,6 +338,7 @@ fn prepare_claude_usage_log(
         status_code,
         is_streaming,
         reasoning_effort: ctx.reasoning_effort.clone(),
+        trace: ctx.trace.clone(),
     })
 }
 
@@ -355,6 +357,7 @@ async fn write_claude_usage_log(state: &ProxyState, log: ClaudeUsageLog) {
         log.status_code,
         Some(log.session_id),
         log.reasoning_effort,
+        log.trace,
     )
     .await;
 }
@@ -448,6 +451,7 @@ async fn handle_claude_transform(
             let start_time = ctx.start_time;
             let session_id = ctx.session_id.clone();
             let reasoning_effort = ctx.reasoning_effort.clone();
+            let trace = ctx.trace.clone();
             // 用 ctx 的 app_type：Claude Desktop 网关也走此转换路径，硬编码
             // "claude" 会把 claude-desktop 的行错记到 claude 名下
             let app_type_str = ctx.app_type_str;
@@ -469,6 +473,7 @@ async fn handle_claude_transform(
                         let request_model = request_model.clone();
                         let outbound_model = fallback_model.clone();
                         let reasoning_effort = reasoning_effort.clone();
+                        let trace = trace.clone();
 
                         tokio::spawn(async move {
                             log_usage(
@@ -485,6 +490,7 @@ async fn handle_claude_transform(
                                 status_code,
                                 Some(session_id),
                                 reasoning_effort,
+                                trace,
                             )
                             .await;
                         });
@@ -503,6 +509,7 @@ async fn handle_claude_transform(
         let logged_stream = create_logged_passthrough_stream(
             sse_stream,
             PassthroughDiagnostics {
+                trace: Some(ctx.trace.clone()),
                 tag: "Claude/OpenRouter",
                 protocol: ClientSseProtocol::Anthropic,
                 provider_id: ctx.provider.id.clone(),
@@ -954,6 +961,7 @@ async fn handle_codex_chat_to_responses_transform(
             let start_time = ctx.start_time;
             let session_id = ctx.session_id.clone();
             let reasoning_effort = ctx.reasoning_effort.clone();
+            let trace = ctx.trace.clone();
 
             Some(SseUsageCollector::new(
                 start_time,
@@ -983,6 +991,7 @@ async fn handle_codex_chat_to_responses_transform(
                     let outbound_model = fallback_model.clone();
                     let session_id = session_id.clone();
                     let reasoning_effort = reasoning_effort.clone();
+                    let trace = trace.clone();
 
                     tokio::spawn(async move {
                         log_usage(
@@ -999,6 +1008,7 @@ async fn handle_codex_chat_to_responses_transform(
                             status.as_u16(),
                             Some(session_id),
                             reasoning_effort,
+                            trace,
                         )
                         .await;
                     });
@@ -1011,6 +1021,7 @@ async fn handle_codex_chat_to_responses_transform(
         let logged_stream = create_logged_passthrough_stream(
             sse_stream,
             PassthroughDiagnostics {
+                trace: Some(ctx.trace.clone()),
                 tag: ctx.tag,
                 protocol: ClientSseProtocol::Responses,
                 provider_id: ctx.provider.id.clone(),
@@ -1109,6 +1120,7 @@ async fn handle_codex_chat_to_responses_transform(
             let session_id = ctx.session_id.clone();
             let latency_ms = ctx.latency_ms();
             let reasoning_effort = ctx.reasoning_effort.clone();
+            let trace = ctx.trace.clone();
             async move {
                 log_usage(
                     &state,
@@ -1124,6 +1136,7 @@ async fn handle_codex_chat_to_responses_transform(
                     status.as_u16(),
                     Some(session_id),
                     reasoning_effort,
+                    trace,
                 )
                 .await;
             }
@@ -1275,6 +1288,7 @@ async fn handle_codex_anthropic_to_responses_transform(
             let session_id = ctx.session_id.clone();
             let latency_ms = ctx.latency_ms();
             let reasoning_effort = ctx.reasoning_effort.clone();
+            let trace = ctx.trace.clone();
             async move {
                 log_usage(
                     &state,
@@ -1290,6 +1304,7 @@ async fn handle_codex_anthropic_to_responses_transform(
                     status.as_u16(),
                     Some(session_id),
                     reasoning_effort,
+                    trace,
                 )
                 .await;
             }
@@ -1341,6 +1356,7 @@ fn build_codex_anthropic_sse_response(
         let start_time = ctx.start_time;
         let session_id = ctx.session_id.clone();
         let reasoning_effort = ctx.reasoning_effort.clone();
+        let trace = ctx.trace.clone();
 
         Some(SseUsageCollector::new(
             start_time,
@@ -1364,6 +1380,7 @@ fn build_codex_anthropic_sse_response(
                 let outbound_model = fallback_model.clone();
                 let session_id = session_id.clone();
                 let reasoning_effort = reasoning_effort.clone();
+                let trace = trace.clone();
 
                 tokio::spawn(async move {
                     log_usage(
@@ -1380,6 +1397,7 @@ fn build_codex_anthropic_sse_response(
                         status.as_u16(),
                         Some(session_id),
                         reasoning_effort,
+                        trace,
                     )
                     .await;
                 });
@@ -1392,6 +1410,7 @@ fn build_codex_anthropic_sse_response(
     let logged_stream = create_logged_passthrough_stream(
         sse_stream,
         PassthroughDiagnostics {
+            trace: Some(ctx.trace.clone()),
             tag: ctx.tag,
             protocol: ClientSseProtocol::Responses,
             provider_id: ctx.provider.id.clone(),
@@ -2338,7 +2357,7 @@ fn log_forward_error(
 ) {
     use super::usage::logger::UsageLogger;
 
-    let logger = UsageLogger::new(&state.db);
+    let logger = UsageLogger::new(&state.db).with_trace(ctx.trace.clone());
     let status_code = map_proxy_error_to_status(error);
     let error_message = get_error_message(error);
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -2379,6 +2398,7 @@ async fn log_usage(
     status_code: u16,
     session_id: Option<String>,
     reasoning_effort: Option<String>,
+    trace: super::request_trace::RequestTrace,
 ) {
     use super::usage::logger::UsageLogger;
 
@@ -2386,7 +2406,7 @@ async fn log_usage(
         return;
     }
 
-    let logger = UsageLogger::new(&state.db);
+    let logger = UsageLogger::new(&state.db).with_trace(trace);
 
     let (multiplier, pricing_model_source) =
         logger.resolve_pricing_config(provider_id, app_type).await;

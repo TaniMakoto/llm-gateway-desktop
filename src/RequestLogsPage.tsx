@@ -22,6 +22,26 @@ interface LogProvider {
   }>;
 }
 
+interface RoutingAttempt {
+  providerId: string;
+  providerName: string;
+  outcome: string;
+  statusCode?: number;
+  durationMs: number;
+  error?: string;
+  skipReason?: string;
+  sentReasoning?: string;
+  returnedReasoning?: string;
+}
+interface RequestEvidence {
+  clientReasoning?: string;
+  sentReasoning?: string;
+  returnedReasoning?: string;
+  returnedReasoningNote?: string;
+  outcome: string;
+  fallback: boolean;
+  attempts: RoutingAttempt[];
+}
 interface RequestLog {
   requestId: string;
   providerId: string;
@@ -30,6 +50,7 @@ interface RequestLog {
   model: string;
   requestModel?: string;
   reasoningEffort?: string;
+  evidence?: RequestEvidence;
   costMultiplier: string;
   inputTokens: number;
   outputTokens: number;
@@ -59,7 +80,13 @@ interface PaginatedLogs {
 }
 
 type TimeRange = "1h" | "24h" | "7d" | "30d" | "all";
-type ResultFilter = "all" | "success" | "failed";
+type ResultFilter =
+  | "all"
+  | "success"
+  | "failed"
+  | "direct_success"
+  | "fallback_success"
+  | "stream_interrupted";
 
 const TIME_RANGES: Array<{
   value: TimeRange;
@@ -105,7 +132,31 @@ function formatTime(timestamp: number): string {
 }
 
 function isSuccess(log: RequestLog): boolean {
-  return log.statusCode >= 200 && log.statusCode < 300;
+  return log.evidence
+    ? ["direct_success", "fallback_success"].includes(log.evidence.outcome)
+    : log.statusCode >= 200 && log.statusCode < 300;
+}
+
+function resultLabel(log: RequestLog): string {
+  if (!log.evidence)
+    return isSuccess(log) ? "成功（历史记录）" : "失败（历史记录）";
+  return (
+    (
+      {
+        direct_success: "直接成功",
+        fallback_success: "切换后成功",
+        failed: "失败",
+        stream_interrupted: "流式中断",
+        pending: "处理中",
+      } as Record<string, string>
+    )[log.evidence.outcome] ?? "未知"
+  );
+}
+function finalError(log: RequestLog): string | undefined {
+  return (
+    log.evidence?.attempts.filter((a) => a.outcome !== "skipped").at(-1)
+      ?.error ?? log.errorMessage
+  );
 }
 
 function cacheBase(log: RequestLog): number {
@@ -197,7 +248,15 @@ export function RequestLogsPage({ providers }: { providers: LogProvider[] }) {
             appType: source || null,
             providerName: provider || null,
             requestModel: model || null,
-            success: result === "all" ? null : result === "success",
+            success:
+              result === "success" ? true : result === "failed" ? false : null,
+            outcome: [
+              "direct_success",
+              "fallback_success",
+              "stream_interrupted",
+            ].includes(result)
+              ? result
+              : null,
             startDate: range?.seconds ? endDate - range.seconds : null,
             endDate: range?.seconds ? endDate : null,
           },
@@ -244,7 +303,7 @@ export function RequestLogsPage({ providers }: { providers: LogProvider[] }) {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">请求日志</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            查看每次路由的模型、供应商、Token、缓存利用率、延迟和请求结果。
+            查看请求结果与每次上游尝试；HTTP 状态码与响应是否完整分开记录。
           </p>
         </div>
         <button
@@ -327,7 +386,10 @@ export function RequestLogsPage({ providers }: { providers: LogProvider[] }) {
         >
           <option value="all">全部结果</option>
           <option value="success">成功</option>
-          <option value="failed">失败</option>
+          <option value="failed">失败 / 中断</option>
+          <option value="direct_success">直接成功</option>
+          <option value="fallback_success">切换后成功</option>
+          <option value="stream_interrupted">流式中断</option>
         </Filter>
       </div>
 
@@ -430,9 +492,10 @@ export function RequestLogsPage({ providers }: { providers: LogProvider[] }) {
                     {log.reasoningEffort && (
                       <div
                         className="mt-0.5 text-[10px] font-medium text-muted-foreground"
-                        title="最终一次实际发往上游的思考配置"
+                        title="协议转换及参数覆盖后实际发送的配置；不代表上游确认执行"
                       >
-                        上游 · {log.reasoningEffort}
+                        发送 ·{" "}
+                        {log.evidence?.sentReasoning ?? log.reasoningEffort}
                       </div>
                     )}
                   </td>
@@ -541,17 +604,17 @@ function StatusBadge({ log }: { log: RequestLog }) {
         ) : (
           <XCircle className="h-3 w-3" />
         )}
-        {success ? "成功" : "失败"}
+        {resultLabel(log)}
       </span>
       <div className="mt-1 whitespace-nowrap text-[10px] text-muted-foreground">
-        HTTP {log.statusCode}
+        {log.statusCode ? `HTTP ${log.statusCode}` : "未收到 HTTP 响应"}
       </div>
-      {log.errorMessage && (
+      {finalError(log) && (
         <div
           className="mt-0.5 max-w-36 truncate text-[10px] text-destructive/80"
-          title={log.errorMessage}
+          title={finalError(log)}
         >
-          {log.errorMessage}
+          {finalError(log)}
         </div>
       )}
     </div>
@@ -564,7 +627,27 @@ function LogDetail({ log, onClose }: { log: RequestLog; onClose: () => void }) {
     ["请求时间", new Date(log.createdAt * 1000).toLocaleString("zh-CN")],
     ["请求模型", log.requestModel || log.model],
     ["实际模型", log.model],
-    ["上游思考", log.reasoningEffort || "—"],
+    [
+      "客户端思考配置",
+      log.evidence
+        ? log.evidence.clientReasoning || "未设置"
+        : "历史记录未采集",
+    ],
+    [
+      "实际发送配置",
+      log.evidence
+        ? log.evidence.sentReasoning || "未设置 / 未发送"
+        : log.reasoningEffort || "历史记录未采集",
+    ],
+    [
+      "上游返回配置",
+      log.evidence
+        ? log.evidence.returnedReasoning ||
+          log.evidence.returnedReasoningNote ||
+          "未返回"
+        : "历史记录未采集",
+    ],
+    ["请求结果", resultLabel(log)],
     ["计价模型", log.pricingModel || "—"],
     ["提供商", log.providerName ?? log.providerId],
     ["来源", SOURCE_LABELS[log.appType] ?? log.appType],
@@ -576,7 +659,7 @@ function LogDetail({ log, onClose }: { log: RequestLog; onClose: () => void }) {
     ["总成本", `$${log.totalCostUsd}`],
     ["首字延迟", formatDuration(log.firstTokenMs)],
     ["总耗时", formatDuration(log.durationMs ?? log.latencyMs)],
-    ["状态", `HTTP ${log.statusCode}`],
+    ["HTTP 状态", log.statusCode ? `HTTP ${log.statusCode}` : "未收到响应"],
   ];
   return (
     <div
@@ -609,13 +692,64 @@ function LogDetail({ log, onClose }: { log: RequestLog; onClose: () => void }) {
             </div>
           ))}
         </div>
-        {log.errorMessage && (
+        <div className="mt-6">
+          <h3 className="text-sm font-semibold">上游尝试明细</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            发送值取自出站请求；返回值仅取自原始上游响应，不推断实际执行强度。
+          </p>
+          {!log.evidence && (
+            <p className="mt-3 text-xs text-muted-foreground">
+              历史记录未采集尝试链，无法还原切换过程。
+            </p>
+          )}
+          {log.evidence?.attempts.map((attempt, index) => (
+            <div key={index} className="mt-3 rounded-xl border p-3 text-xs">
+              <div className="flex items-center justify-between gap-2 font-semibold">
+                <span>
+                  {index + 1}. {attempt.providerName || attempt.providerId}
+                </span>
+                <span>
+                  {(
+                    {
+                      success: "成功",
+                      failed: "失败",
+                      stream_interrupted: "流式中断",
+                      skipped: "跳过",
+                      pending: "处理中",
+                    } as Record<string, string>
+                  )[attempt.outcome] ?? attempt.outcome}
+                </span>
+              </div>
+              <div className="mt-2 text-muted-foreground">
+                {attempt.statusCode
+                  ? `HTTP ${attempt.statusCode}`
+                  : "未收到 HTTP 响应"}{" "}
+                · {formatDuration(attempt.durationMs)}
+              </div>
+              {attempt.outcome !== "skipped" && (
+                <div className="mt-2">
+                  发送：{attempt.sentReasoning || "未设置"} · 返回：
+                  {attempt.returnedReasoning || "未返回"}
+                </div>
+              )}
+              {attempt.skipReason && (
+                <p className="mt-2">跳过原因：{attempt.skipReason}</p>
+              )}
+              {attempt.error && (
+                <p className="mt-2 whitespace-pre-wrap break-words text-destructive">
+                  {attempt.error}
+                </p>
+              )}
+            </div>
+          ))}
+        </div>
+        {finalError(log) && (
           <div className="mt-4 rounded-xl border border-destructive/25 bg-destructive/5 p-4">
             <div className="text-xs font-semibold text-destructive">
               错误信息
             </div>
             <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-5">
-              {log.errorMessage}
+              {finalError(log)}
             </p>
           </div>
         )}

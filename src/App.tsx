@@ -151,6 +151,7 @@ interface ProxyStatus {
   current_provider?: string | null;
   last_error?: string | null;
   failover_count: number;
+  upstream_failed_attempts: number;
   active_providers?: ActiveProvider[];
 }
 
@@ -3932,8 +3933,8 @@ function Dashboard({
         <StatCard
           icon={RefreshCw}
           label="上游路由"
-          value={`${status?.failover_count ?? 0} 次切换`}
-          detail={routingStatus.detail}
+          value={`${status?.failover_count ?? 0} 次回退`}
+          detail={`上游失败尝试 ${status?.upstream_failed_attempts ?? 0} 次 · ${routingStatus.detail}`}
           detailTitle={routingStatus.title}
         />
         <StatCard

@@ -42,12 +42,15 @@ pub struct RequestLog {
 /// 使用量记录器
 pub struct UsageLogger<'a> {
     db: &'a Database,
+    trace: Option<super::super::request_trace::RequestTrace>,
 }
 
 impl<'a> UsageLogger<'a> {
     pub fn new(db: &'a Database) -> Self {
-        Self { db }
+        Self { db, trace: None }
     }
+
+    pub fn with_trace(mut self, trace: super::super::request_trace::RequestTrace) -> Self { self.trace = Some(trace); self }
 
     /// 记录成功的请求
     pub fn log_request(&self, log: &RequestLog) -> Result<(), AppError> {
@@ -89,7 +92,7 @@ impl<'a> UsageLogger<'a> {
                 provider_type, is_streaming, cost_multiplier, created_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             rusqlite::params![
-                log.request_id,
+                self.trace.as_ref().map(|t| t.id()).unwrap_or(&log.request_id),
                 log.provider_id,
                 log.app_type,
                 log.model,

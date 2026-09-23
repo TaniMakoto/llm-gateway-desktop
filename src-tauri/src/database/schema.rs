@@ -22,6 +22,9 @@ impl Database {
 
     /// 在指定连接上创建表（供迁移和测试使用）
     pub(crate) fn create_tables_on_conn(conn: &Connection) -> Result<(), AppError> {
+        conn.execute("CREATE TABLE IF NOT EXISTS request_observations (
+            request_id TEXT PRIMARY KEY, evidence TEXT NOT NULL, outcome TEXT NOT NULL
+        )", []).map_err(|e| AppError::Database(e.to_string()))?;
         // 1. Providers 表
         conn.execute(
             "CREATE TABLE IF NOT EXISTS providers (
@@ -200,6 +203,7 @@ impl Database {
             data_source TEXT NOT NULL DEFAULT 'proxy'
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
+        conn.execute("CREATE TRIGGER IF NOT EXISTS delete_request_observation AFTER DELETE ON proxy_request_logs BEGIN DELETE FROM request_observations WHERE request_id = OLD.request_id; END", []).map_err(|e| AppError::Database(e.to_string()))?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON proxy_request_logs(provider_id, app_type)", [])
             .map_err(|e| AppError::Database(e.to_string()))?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON proxy_request_logs(created_at)", [])
@@ -485,6 +489,13 @@ impl Database {
                         log::info!("迁移数据库从 v12 到 v13（记录输入 token 缓存语义）");
                         Self::migrate_v12_to_v13(conn)?;
                         Self::set_user_version(conn, 13)?;
+                    }
+                    14 => {
+                        conn.execute("CREATE TABLE IF NOT EXISTS request_observations (
+                            request_id TEXT PRIMARY KEY, evidence TEXT NOT NULL, outcome TEXT NOT NULL
+                        )", []).map_err(|e| AppError::Database(e.to_string()))?;
+                        conn.execute("CREATE TRIGGER IF NOT EXISTS delete_request_observation AFTER DELETE ON proxy_request_logs BEGIN DELETE FROM request_observations WHERE request_id = OLD.request_id; END", []).map_err(|e| AppError::Database(e.to_string()))?;
+                        Self::set_user_version(conn, 15)?;
                     }
                     13 => {
                         log::info!("迁移数据库从 v13 到 v14（记录请求思考等级）");

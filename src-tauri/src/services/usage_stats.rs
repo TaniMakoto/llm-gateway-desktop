@@ -109,8 +109,9 @@ pub struct LogFilters {
     /// 用户看到的 alias 过滤。
     pub request_model: Option<String>,
     pub status_code: Option<u16>,
-    /// true = 2xx，false = 非 2xx。
+    /// Uses observed completion; legacy rows fall back to HTTP status.
     pub success: Option<bool>,
+    pub outcome: Option<String>,
     pub start_date: Option<i64>,
     pub end_date: Option<i64>,
 }
@@ -139,6 +140,7 @@ pub struct RequestLogDetail {
     pub request_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    pub evidence: Option<crate::proxy::request_trace::Evidence>,
     pub cost_multiplier: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -166,9 +168,9 @@ pub struct RequestLogDetail {
     pub pricing_model: Option<String>,
 }
 
-/// 把 27 列的查询结果映射为 `RequestLogDetail`。
+/// 把 28 列的查询结果映射为 `RequestLogDetail`。
 ///
-/// 调用方的 SELECT **必须**按以下顺序返回 27 列：
+/// 调用方的 SELECT **必须**按以下顺序返回 28 列：
 /// `request_id, provider_id, provider_name, app_type, model, request_model,
 ///  cost_multiplier, input_tokens, output_tokens, cache_read_tokens,
 ///  cache_creation_tokens, input_cost_usd, output_cost_usd, cache_read_cost_usd,
@@ -208,6 +210,7 @@ fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
         pricing_model: row.get(24)?,
         input_token_semantics: row.get::<_, i64>(25)?,
         reasoning_effort: row.get(26)?,
+        evidence: row.get::<_, Option<String>>(27)?.and_then(|v| serde_json::from_str(&v).ok()),
     })
 }
 
@@ -616,7 +619,7 @@ impl Database {
                     COALESCE(SUM(l.output_tokens), 0) as total_output_tokens,
                     COALESCE(SUM(l.cache_creation_tokens), 0) as total_cache_creation_tokens,
                     COALESCE(SUM(l.cache_read_tokens), 0) as total_cache_read_tokens,
-                    COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count
+                    COALESCE(SUM(CASE WHEN COALESCE((SELECT o.outcome IN ('direct_success', 'fallback_success') FROM request_observations o WHERE o.request_id = l.request_id), l.status_code >= 200 AND l.status_code < 300) THEN 1 ELSE 0 END), 0) as success_count
                  FROM proxy_request_logs l {detail_join} {where_clause}) d,
                 (SELECT
                     COALESCE(SUM(r.request_count), 0) as total_requests,
@@ -762,7 +765,7 @@ impl Database {
                     COALESCE(SUM(l.output_tokens), 0) as output_t,
                     COALESCE(SUM(l.cache_creation_tokens), 0) as cache_create_t,
                     COALESCE(SUM(l.cache_read_tokens), 0) as cache_read_t,
-                    COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count
+                    COALESCE(SUM(CASE WHEN COALESCE((SELECT o.outcome IN ('direct_success', 'fallback_success') FROM request_observations o WHERE o.request_id = l.request_id), l.status_code >= 200 AND l.status_code < 300) THEN 1 ELSE 0 END), 0) as success_count
                 FROM proxy_request_logs l {detail_join} {detail_where}
                 GROUP BY l.app_type
                 UNION ALL
@@ -1266,7 +1269,7 @@ impl Database {
                     COUNT(*) as request_count,
                     COALESCE(SUM({fresh_input_detail} + l.output_tokens), 0) as total_tokens,
                     COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0) as total_cost,
-                    COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count,
+                    COALESCE(SUM(CASE WHEN COALESCE((SELECT o.outcome IN ('direct_success', 'fallback_success') FROM request_observations o WHERE o.request_id = l.request_id), l.status_code >= 200 AND l.status_code < 300) THEN 1 ELSE 0 END), 0) as success_count,
                     COALESCE(SUM(l.latency_ms), 0) as latency_sum
                 FROM proxy_request_logs l
                 LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
@@ -1506,11 +1509,15 @@ impl Database {
             conditions.push("l.status_code = ?".to_string());
             params.push(Box::new(status as i64));
         }
+        if let Some(outcome) = &filters.outcome {
+            conditions.push("(SELECT o.outcome FROM request_observations o WHERE o.request_id = l.request_id) = ?".to_string());
+            params.push(Box::new(outcome.clone()));
+        }
         if let Some(success) = filters.success {
             conditions.push(if success {
-                "l.status_code >= 200 AND l.status_code < 300".to_string()
+                "COALESCE((SELECT o.outcome IN ('direct_success', 'fallback_success') FROM request_observations o WHERE o.request_id = l.request_id), l.status_code >= 200 AND l.status_code < 300)".to_string()
             } else {
-                "NOT (l.status_code >= 200 AND l.status_code < 300)".to_string()
+                "NOT COALESCE((SELECT o.outcome IN ('direct_success', 'fallback_success') FROM request_observations o WHERE o.request_id = l.request_id), l.status_code >= 200 AND l.status_code < 300)".to_string()
             });
         }
         if let Some(start) = filters.start_date {
@@ -1552,7 +1559,8 @@ impl Database {
                     l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
                     l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
                     l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
-                    l.input_token_semantics, l.reasoning_effort
+                    l.input_token_semantics, l.reasoning_effort,
+                    (SELECT evidence FROM request_observations o WHERE o.request_id = l.request_id)
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              {where_clause}
@@ -1596,7 +1604,8 @@ impl Database {
                     input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                     is_streaming, latency_ms, first_token_ms, duration_ms,
                     status_code, error_message, created_at, l.data_source, l.pricing_model,
-                    l.input_token_semantics, l.reasoning_effort
+                    l.input_token_semantics, l.reasoning_effort,
+                    (SELECT evidence FROM request_observations o WHERE o.request_id = l.request_id)
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              WHERE l.request_id = ?"
@@ -1752,7 +1761,7 @@ impl Database {
                         input_cost_usd, output_cost_usd, cache_read_cost_usd,
                         cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
                         first_token_ms, duration_ms, status_code, error_message, created_at,
-                        data_source, pricing_model, input_token_semantics, reasoning_effort
+                        data_source, pricing_model, input_token_semantics, reasoning_effort, NULL AS evidence
              FROM proxy_request_logs
              WHERE CAST(total_cost_usd AS REAL) <= 0
                AND (input_tokens > 0 OR output_tokens > 0

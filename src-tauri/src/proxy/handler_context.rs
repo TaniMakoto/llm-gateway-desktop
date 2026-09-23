@@ -54,6 +54,7 @@ pub struct RequestContext {
     pub request_model: String,
     /// 最终成功候选或最后失败尝试收到的上游思考配置（适配后的真值）。
     pub reasoning_effort: Option<String>,
+    pub trace: super::request_trace::RequestTrace,
     /// 实际发往上游的模型名（路由接管/模型映射后的真值，forward 成功后回填）。
     ///
     /// usage 归因的兜底顺序：上游响应回显 → outbound_model → request_model。
@@ -236,6 +237,8 @@ impl RequestContext {
             current_provider_id,
             request_model,
             reasoning_effort: None,
+            trace: super::request_trace::RequestTrace::new(
+                super::response_processor::usage_logging_enabled(state).then(|| state.db.clone()), app_type_str, body),
             outbound_model: None,
             tag,
             app_type_str,
@@ -317,7 +320,7 @@ impl RequestContext {
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
-        )
+        ).with_trace(self.trace.clone())
     }
 
     /// 获取 Provider 列表（用于故障转移）
