@@ -26,3 +26,24 @@ The inline `gateway::protocol_tests` suite starts the real gateway and local moc
 ## Commit scope
 
 Keep pull requests focused. Avoid combining broad formatting changes with protocol behavior changes, because the translation code is difficult to review safely.
+
+## Delivery workflow
+
+When authorized to push and compile, complete the necessary local checks, push the
+changes, and dispatch the appropriate GitHub build workflow. Report the commit,
+workflow link, and actual validation results immediately, then end the task.
+**Do not wait for or poll GitHub build/test completion**, unless the user explicitly
+asks for the result. Distinguish checks that passed locally from tests delegated
+to CI and builds that have only been triggered.
+
+## Upstream failover
+
+Before response output is committed, HTTP errors from one upstream (including
+400, 401, 403, 413, and 422) remain eligible for the next available configured
+candidate. Independent providers may implement the same public model differently.
+Only return the final failure once eligible candidates are exhausted. A local
+invalid request or local authentication failure can still stop immediately;
+an already-started response stream must not be spliced with another provider.
+
+When reviewing logs, distinguish an individual upstream rejection from the final
+request outcome. `FWD-001` records candidate rotation; `FWD-002` records exhaustion.

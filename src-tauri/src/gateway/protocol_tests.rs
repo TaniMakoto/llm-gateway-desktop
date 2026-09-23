@@ -819,10 +819,10 @@ async fn schema_compatibility_is_opt_in_and_preserves_nested_constraints() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn invalid_input_stops_but_relay_schema_rejection_can_fail_over() {
+async fn local_invalid_input_stops_but_upstream_rejections_fail_over() {
     for (message, succeeds) in [
         ("Invalid schema for function 'delegate_task': null is not of type array", true),
-        ("Invalid JSON", false), ("tool_call_id does not match", false),
+        ("Invalid JSON", true), ("tool_call_id does not match", true),
     ] {
         let (status, wire, seen) = routing_contract(Format::Chat, agent_chat_request(false), vec![
             (Format::Chat, json!({}), Some(json!({"error":{"message":message}}))),
@@ -836,6 +836,47 @@ async fn invalid_input_stops_but_relay_schema_rejection_can_fail_over() {
     let (status, _, seen) = routing_contract(Format::Chat, payload, vec![(Format::Chat, json!({}), None)]).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(seen[0].is_empty());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn upstream_http_rejections_try_next_source_and_exhaust_all_candidates() {
+    for code in [400, 401, 403, 409, 413, 422, 429, 500, 503] {
+        for stream in [false, true] {
+            let error = json!({"_http_status":code,"error":{"message":"source rejected request"}});
+            let (status, wire, seen) = routing_contract(Format::Chat, agent_chat_request(stream), vec![
+                (Format::Chat, json!({}), Some(error.clone())),
+                (Format::Chat, json!({}), None),
+            ]).await;
+            assert_eq!(status, StatusCode::OK, "HTTP {code}: {wire}");
+            assert_eq!(seen.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
+
+            let (status, _, seen) = routing_contract(Format::Chat, agent_chat_request(stream), vec![
+                (Format::Chat, json!({}), Some(error.clone())),
+                (Format::Chat, json!({}), Some(error)),
+            ]).await;
+            assert!(!status.is_success(), "all candidates rejected HTTP {code}");
+            assert_eq!(seen.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn thinking_rectification_failure_does_not_stop_candidate_rotation() {
+    for message in ["signature: Field required", "thinking.budget_tokens must be at least 1024"] {
+        for stream in [false, true] {
+            let mut payload = request(Format::Anthropic, stream, "text");
+            payload["thinking"] = json!({"type":"adaptive"});
+            let (status, wire, seen) = routing_contract(Format::Anthropic, payload, vec![
+                (Format::Anthropic, json!({}), Some(json!({"error":{"message":message}}))),
+                (Format::Anthropic, json!({}), None),
+            ]).await;
+            assert_eq!(status, StatusCode::OK, "{message}: {wire}");
+            assert!(!seen[0].is_empty());
+            assert_eq!(seen[1].len(), 1);
+        }
+    }
 }
 
 
