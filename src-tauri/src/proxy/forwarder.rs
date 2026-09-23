@@ -110,6 +110,8 @@ pub struct ForwardResult {
 pub struct ForwardError {
     pub error: ProxyError,
     pub provider: Option<Provider>,
+    /// 最终一次实际发出的上游请求中的思考配置。
+    pub outbound_reasoning_effort: Option<String>,
 }
 
 /// 活跃连接 RAII guard
@@ -652,6 +654,7 @@ impl RequestForwarder {
         Some(ForwardError {
             error: retry_err,
             provider: Some(provider.clone()),
+            outbound_reasoning_effort: None,
         })
     }
 
@@ -732,11 +735,13 @@ impl RequestForwarder {
             return Err(ForwardError {
                 error: ProxyError::NoAvailableProvider,
                 provider: None,
+                outbound_reasoning_effort: None,
             });
         }
 
         let mut last_error = None;
         let mut last_provider = None;
+        let mut last_outbound_reasoning_effort = None;
         let mut attempted_providers = 0usize;
         let route_model = body
             .get("model")
@@ -791,6 +796,7 @@ impl RequestForwarder {
                                 provider.name
                             )),
                             provider: Some((*provider).clone()),
+                            outbound_reasoning_effort: None,
                         });
                     }
                     Err(CapacityAcquireError::Timeout) => {
@@ -800,6 +806,7 @@ impl RequestForwarder {
                                 provider.name
                             )),
                             provider: Some((*provider).clone()),
+                            outbound_reasoning_effort: None,
                         });
                     }
                     Err(CapacityAcquireError::Full) => unreachable!("wait acquisition never returns Full"),
@@ -909,6 +916,7 @@ impl RequestForwarder {
                 .await;
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
+            let mut attempt_reasoning_effort = None;
             match self
                 .forward(
                     app_type,
@@ -920,10 +928,11 @@ impl RequestForwarder {
                     &headers,
                     &extensions,
                     adapter.as_ref(),
+                    &mut attempt_reasoning_effort,
                 )
                 .await
             {
-                Ok((response, claude_api_format, outbound_model, outbound_reasoning_effort)) => {
+                Ok((response, claude_api_format, outbound_model)) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
@@ -942,11 +951,12 @@ impl RequestForwarder {
                         provider: provider.clone(),
                         claude_api_format,
                         outbound_model,
-                        outbound_reasoning_effort,
+                        outbound_reasoning_effort: attempt_reasoning_effort,
                         connection_guard: None,
                     });
                 }
                 Err(e) => {
+                    last_outbound_reasoning_effort = attempt_reasoning_effort.clone();
                     // 检测是否需要触发整流器（仅 Claude/ClaudeAuth 供应商）
                     let provider_type = ProviderType::from_app_type_and_config(app_type, provider);
                     let is_anthropic_provider = matches!(
@@ -980,6 +990,7 @@ impl RequestForwarder {
                                 super::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
                             );
 
+                            attempt_reasoning_effort = None;
                             match self
                                 .forward(
                                     app_type,
@@ -991,10 +1002,11 @@ impl RequestForwarder {
                                     &headers,
                                     &extensions,
                                     adapter.as_ref(),
+                                    &mut attempt_reasoning_effort,
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model, outbound_reasoning_effort)) => {
+                                Ok((response, claude_api_format, outbound_model)) => {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
@@ -1018,15 +1030,17 @@ impl RequestForwarder {
                                         provider: provider.clone(),
                                         claude_api_format,
                                         outbound_model,
-                                        outbound_reasoning_effort,
+                                        outbound_reasoning_effort: attempt_reasoning_effort,
                                         connection_guard: None,
                                     });
                                 }
                                 Err(retry_err) => {
+                                    last_outbound_reasoning_effort =
+                                        attempt_reasoning_effort.clone();
                                     log::warn!(
                                         "[{app_type_str}] [Media] Unsupported-image retry still failed: {retry_err}"
                                     );
-                                    if let Some(err) = self
+                                    if let Some(mut err) = self
                                         .handle_rectifier_retry_failure(
                                             retry_err,
                                             provider,
@@ -1038,6 +1052,8 @@ impl RequestForwarder {
                                         )
                                         .await
                                     {
+                                        err.outbound_reasoning_effort =
+                                            attempt_reasoning_effort.clone();
                                         return Err(err);
                                     }
                                     continue;
@@ -1074,6 +1090,7 @@ impl RequestForwarder {
                                 return Err(ForwardError {
                                     error: e,
                                     provider: Some(provider.clone()),
+                                    outbound_reasoning_effort: attempt_reasoning_effort.clone(),
                                 });
                             }
 
@@ -1099,6 +1116,7 @@ impl RequestForwarder {
                                 let _ = std::mem::replace(&mut rectifier_retried, true);
 
                                 // 使用同一供应商重试（不计入熔断器）
+                                attempt_reasoning_effort = None;
                                 match self
                                     .forward(
                                         app_type,
@@ -1110,10 +1128,11 @@ impl RequestForwarder {
                                         &headers,
                                         &extensions,
                                         adapter.as_ref(),
+                                        &mut attempt_reasoning_effort,
                                     )
                                     .await
                                 {
-                                    Ok((response, claude_api_format, outbound_model, outbound_reasoning_effort)) => {
+                                    Ok((response, claude_api_format, outbound_model)) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
                                         self.record_success_result(
                                             &provider.id,
@@ -1135,15 +1154,17 @@ impl RequestForwarder {
                                             provider: provider.clone(),
                                             claude_api_format,
                                             outbound_model,
-                                            outbound_reasoning_effort,
+                                            outbound_reasoning_effort: attempt_reasoning_effort,
                                             connection_guard: None,
                                         });
                                     }
                                     Err(retry_err) => {
+                                        last_outbound_reasoning_effort =
+                                            attempt_reasoning_effort.clone();
                                         log::warn!(
                                             "[{app_type_str}] [RECT-003] 整流重试仍失败: {retry_err}"
                                         );
-                                        if let Some(err) = self
+                                        if let Some(mut err) = self
                                             .handle_rectifier_retry_failure(
                                                 retry_err,
                                                 provider,
@@ -1155,6 +1176,8 @@ impl RequestForwarder {
                                             )
                                             .await
                                         {
+                                            err.outbound_reasoning_effort =
+                                                attempt_reasoning_effort.clone();
                                             return Err(err);
                                         }
                                         continue;
@@ -1194,6 +1217,7 @@ impl RequestForwarder {
                                 return Err(ForwardError {
                                     error: e,
                                     provider: Some(provider.clone()),
+                                    outbound_reasoning_effort: attempt_reasoning_effort.clone(),
                                 });
                             }
 
@@ -1220,6 +1244,7 @@ impl RequestForwarder {
                                 return Err(ForwardError {
                                     error: e,
                                     provider: Some(provider.clone()),
+                                    outbound_reasoning_effort: attempt_reasoning_effort.clone(),
                                 });
                             }
 
@@ -1233,6 +1258,7 @@ impl RequestForwarder {
                             let _ = std::mem::replace(&mut budget_rectifier_retried, true);
 
                             // 使用同一供应商重试（不计入熔断器）
+                            attempt_reasoning_effort = None;
                             match self
                                 .forward(
                                     app_type,
@@ -1244,10 +1270,11 @@ impl RequestForwarder {
                                     &headers,
                                     &extensions,
                                     adapter.as_ref(),
+                                    &mut attempt_reasoning_effort,
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model, outbound_reasoning_effort)) => {
+                                Ok((response, claude_api_format, outbound_model)) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
                                     self.record_success_result(
                                         &provider.id,
@@ -1269,15 +1296,17 @@ impl RequestForwarder {
                                         provider: provider.clone(),
                                         claude_api_format,
                                         outbound_model,
-                                        outbound_reasoning_effort,
+                                        outbound_reasoning_effort: attempt_reasoning_effort,
                                         connection_guard: None,
                                     });
                                 }
                                 Err(retry_err) => {
+                                    last_outbound_reasoning_effort =
+                                        attempt_reasoning_effort.clone();
                                     log::warn!(
                                         "[{app_type_str}] [RECT-012] budget 整流重试仍失败: {retry_err}"
                                     );
-                                    if let Some(err) = self
+                                    if let Some(mut err) = self
                                         .handle_rectifier_retry_failure(
                                             retry_err,
                                             provider,
@@ -1289,6 +1318,8 @@ impl RequestForwarder {
                                         )
                                         .await
                                     {
+                                        err.outbound_reasoning_effort =
+                                            attempt_reasoning_effort.clone();
                                         return Err(err);
                                     }
                                     continue;
@@ -1316,6 +1347,7 @@ impl RequestForwarder {
                         return Err(ForwardError {
                             error: e,
                             provider: Some(provider.clone()),
+                            outbound_reasoning_effort: attempt_reasoning_effort.clone(),
                         });
                     }
 
@@ -1444,6 +1476,7 @@ impl RequestForwarder {
                             return Err(ForwardError {
                                 error: e,
                                 provider: Some(provider.clone()),
+                                outbound_reasoning_effort: attempt_reasoning_effort.clone(),
                             });
                         }
                     }
@@ -1465,6 +1498,7 @@ impl RequestForwarder {
             return Err(ForwardError {
                 error: ProxyError::NoAvailableProvider,
                 provider: None,
+                outbound_reasoning_effort: None,
             });
         }
 
@@ -1488,12 +1522,13 @@ impl RequestForwarder {
         Err(ForwardError {
             error: last_error.unwrap_or(ProxyError::MaxRetriesExceeded),
             provider: last_provider,
+            outbound_reasoning_effort: last_outbound_reasoning_effort,
         })
     }
 
     /// 转发单个请求（使用适配器）
     ///
-    /// 成功时返回 `(response, claude_api_format, outbound_model, outbound_reasoning)`，其中
+    /// 成功时返回 `(response, claude_api_format, outbound_model)`，其中
     /// `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
     #[allow(clippy::too_many_arguments)]
     async fn forward(
@@ -1507,10 +1542,8 @@ impl RequestForwarder {
         headers: &axum::http::HeaderMap,
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
-    ) -> Result<
-        (ProxyResponse, Option<String>, Option<String>, Option<String>),
-        ProxyError,
-    > {
+        outbound_reasoning_effort: &mut Option<String>,
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         // Each attempt starts from the immutable ingress payload. Only cross-protocol
         // candidates enter the bridge; native Chat keeps tools, history and extensions.
         let plan = if matches!(app_type, AppType::Codex) {
@@ -1951,7 +1984,7 @@ impl RequestForwarder {
         {
             outbound_model = Some(m.to_string());
         }
-        let outbound_reasoning_effort = extract_outbound_reasoning(&filtered_body);
+        *outbound_reasoning_effort = extract_outbound_reasoning(&filtered_body);
         let request_is_streaming =
             is_streaming_request(&effective_endpoint, &filtered_body, headers);
         // 请求体录制（诊断）：发出前记录最终请求体（已完成协议转换/模型映射/私有字段过滤）。
@@ -2673,12 +2706,7 @@ impl RequestForwarder {
                     response = self.validate_responses_stream_start(response).await?;
                 }
             }
-            Ok((
-                response,
-                resolved_claude_api_format,
-                outbound_model,
-                outbound_reasoning_effort,
-            ))
+            Ok((response, resolved_claude_api_format, outbound_model))
         } else {
             let status_code = status.as_u16();
             if status_code == 429 {

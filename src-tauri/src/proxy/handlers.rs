@@ -215,6 +215,7 @@ async fn handle_messages_for_app(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
+            ctx.reasoning_effort = err.outbound_reasoning_effort.take();
             log_forward_error(&state, &ctx, is_stream, &err.error);
             return Err(err.error);
         }
@@ -778,6 +779,7 @@ async fn handle_openai_request(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
+            ctx.reasoning_effort = err.outbound_reasoning_effort.take();
             log_forward_error(&state, &ctx, is_stream, &err.error);
             return build_codex_proxy_error_response(&ctx, &endpoint, &err.error);
         }
@@ -871,6 +873,7 @@ pub async fn handle_responses_compact(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
+            ctx.reasoning_effort = err.outbound_reasoning_effort.take();
             log_forward_error(&state, &ctx, is_stream, &err.error);
             return build_codex_proxy_error_response(&ctx, &endpoint, &err.error);
         }
@@ -1754,6 +1757,7 @@ pub async fn handle_gemini(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
+            ctx.reasoning_effort = err.outbound_reasoning_effort.take();
             log_forward_error(&state, &ctx, is_stream, &err.error);
             return Err(err.error);
         }

@@ -430,7 +430,7 @@ export function RequestLogsPage({ providers }: { providers: LogProvider[] }) {
                     {log.reasoningEffort && (
                       <div
                         className="mt-0.5 text-[10px] font-medium text-muted-foreground"
-                        title="最终发往成功上游候选的实际思考配置"
+                        title="最终一次实际发往上游的思考配置"
                       >
                         上游 · {log.reasoningEffort}
                       </div>

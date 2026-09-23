@@ -52,7 +52,7 @@ pub struct RequestContext {
     pub current_provider_id: String,
     /// 请求中的模型名称
     pub request_model: String,
-    /// 最终成功候选收到的上游思考配置（协议转换和供应商适配后的真值）。
+    /// 最终成功候选或最后失败尝试收到的上游思考配置（适配后的真值）。
     pub reasoning_effort: Option<String>,
     /// 实际发往上游的模型名（路由接管/模型映射后的真值，forward 成功后回填）。
     ///

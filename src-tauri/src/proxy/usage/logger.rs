@@ -22,7 +22,7 @@ pub struct RequestLog {
     /// 用 model/request_model 猜——路由接管下三者可能各不相同。
     /// 错误行（未计价）为空字符串。
     pub pricing_model: String,
-    /// 最终成功候选实际收到的上游思考配置；未显式设置时为 None。
+    /// 最终成功候选或最后失败尝试实际收到的上游思考配置。
     pub reasoning_effort: Option<String>,
     pub usage: TokenUsage,
     pub cost: Option<CostBreakdown>,
