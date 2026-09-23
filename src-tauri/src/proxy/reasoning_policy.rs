@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn native_chat_and_responses_reject_unsupported_xhigh_without_mutation() {
+    fn native_chat_and_responses_map_unsupported_xhigh_to_highest() {
         let p = provider("custom", &["low", "medium", "high"], "auto");
         for (format, original) in [
             (
@@ -216,12 +216,26 @@ mod tests {
             ),
         ] {
             let mut body = original.clone();
-            assert!(matches!(
-                apply(&mut body, &original, &p, format, format, false),
-                Err(ProxyError::InvalidRequest(_))
-            ));
-            assert_eq!(body, original);
+            let note = apply(&mut body, &original, &p, format, format, false).unwrap();
+            assert_eq!(level(&body).as_deref(), Some("high"));
+            assert_eq!(level(&original).as_deref(), Some("xhigh"));
+            assert!(note.contains("最高支持等级"));
+            if format == "openai_responses" {
+                assert_eq!(body["reasoning"]["summary"], "auto");
+            }
         }
+    }
+
+    #[test]
+    fn unsupported_levels_use_highest_independent_of_list_order() {
+        let levels = vec!["high".into(), "low".into(), "max".into(), "medium".into()];
+        assert_eq!(map_level("xhigh", &levels).as_deref(), Some("max"));
+        assert_eq!(map_level("minimal", &levels).as_deref(), Some("max"));
+        assert_eq!(map_level("low", &levels).as_deref(), Some("low"));
+        assert_eq!(
+            map_level("xhigh", &["medium".into(), "low".into()]).as_deref(),
+            Some("medium")
+        );
     }
 
     #[test]
@@ -272,15 +286,16 @@ mod tests {
         let original = json!({"reasoning":{"effort":"low"}});
         let mut body = json!({"model":"custom", "reasoning":{"effort":"xhigh","summary":"auto"}});
         let p = provider("custom", &["low", "high"], "force");
-        assert!(apply(
+        apply(
             &mut body,
             &original,
             &p,
             "openai_responses",
             "openai_responses",
-            true
+            true,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
         let p = provider("custom", &["low", "high"], "disabled");
         apply(
             &mut body,
@@ -319,22 +334,12 @@ fn map_level(requested: &str, levels: &[String]) -> Option<String> {
     if levels.iter().any(|s| s == requested) {
         return Some(requested.into());
     }
-    let candidates: &[&str] = match requested {
-        "xhigh" => &["max", "high"],
-        "max" => &["xhigh", "high"],
-        _ => &[],
-    };
-    if let Some(found) = candidates.iter().find(|s| levels.iter().any(|l| l == **s)) {
-        return Some((*found).into());
-    }
-    let order = ["minimal", "low", "medium", "high", "xhigh", "max"];
-    let index = order.iter().position(|s| *s == requested)?;
+    let order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
     order
         .iter()
-        .enumerate()
-        .filter(|(_, s)| levels.iter().any(|l| l == **s))
-        .min_by_key(|(i, _)| (i.abs_diff(index), *i))
-        .map(|(_, s)| (*s).into())
+        .rev()
+        .find(|s| levels.iter().any(|l| l == **s))
+        .map(|s| (*s).into())
 }
 
 /// Original ingress remains immutable for every fallback. Explicit body overrides
@@ -469,20 +474,7 @@ pub(crate) fn apply(
     {
         if let Some(requested) = requested {
             let supported = cap.levels.iter().any(|s| s == &requested);
-            let mapped = if supported {
-                Some(requested.clone())
-            } else if cross || requested_budget.is_some() || adaptive {
-                map_level(
-                    if requested == "auto" {
-                        "medium"
-                    } else {
-                        &requested
-                    },
-                    &cap.levels,
-                )
-            } else {
-                None
-            };
+            let mapped = map_level(&requested, &cap.levels);
             let Some(mapped) = mapped else {
                 return Err(ProxyError::InvalidRequest(format!(
                     "模型 {model} 不支持思考等级 {requested}；支持：{}（{}）",
@@ -499,7 +491,7 @@ pub(crate) fn apply(
                 if supported {
                     "（声明支持）"
                 } else {
-                    "（跨协议/预算映射）"
+                    "（请求等级不受支持，映射到最高支持等级）"
                 }
             ));
         }
