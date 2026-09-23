@@ -2316,6 +2316,46 @@ impl ProxyService {
         Ok(())
     }
 
+    /// 获取运行中 Provider 的内存熔断器统计；代理未运行或尚未创建 breaker 时返回 None。
+    pub async fn get_circuit_breaker_stats(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Option<crate::proxy::CircuitBreakerStats> {
+        let server = self.server.read().await;
+        match server.as_ref() {
+            Some(server) => server.get_circuit_breaker_stats(provider_id, app_type).await,
+            None => None,
+        }
+    }
+
+    pub async fn get_provider_capacity_snapshot(
+        &self,
+        source_provider_id: &str,
+    ) -> (u32, u32, u32) {
+        let server = self.server.read().await;
+        match server.as_ref() {
+            Some(server) => server.get_provider_capacity_snapshot(source_provider_id),
+            None => (0, 0, 0),
+        }
+    }
+
+    pub async fn get_provider_cooldown_remaining_seconds(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Option<u64> {
+        let server = self.server.read().await;
+        match server.as_ref() {
+            Some(server) => {
+                server
+                    .get_provider_cooldown_remaining_seconds(provider_id, app_type)
+                    .await
+            }
+            None => None,
+        }
+    }
+
     // ==================== Live 配置读写辅助方法 ====================
 
     /// 接管 Codex 时，本地客户端必须继续以 Responses wire API 访问代理。

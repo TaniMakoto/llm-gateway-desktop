@@ -1,4 +1,134 @@
+use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistryFile {
+    #[serde(default)]
+    models: Vec<RegistryEntry>,
+    #[serde(default)]
+    text_only_models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistryEntry {
+    ids: Vec<String>,
+    context_length: Option<u64>,
+    max_output_tokens: Option<u64>,
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
+    reasoning_levels: Vec<String>,
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    protocol_reasoning_levels: HashMap<String, Vec<String>>,
+}
+
+fn registry_file() -> &'static RegistryFile {
+    static REGISTRY: OnceLock<RegistryFile> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        serde_json::from_str(include_str!("resources/model_capabilities.json"))
+            .expect("bundled model_capabilities.json must be valid")
+    })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RegistryModelCapabilities {
+    pub context_length: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub input_modalities: Vec<String>,
+    pub reasoning_levels: Vec<String>,
+    pub default_reasoning_level: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RegistryCatalogModel {
+    pub canonical_model: String,
+    pub ids: Vec<String>,
+    pub capabilities: RegistryModelCapabilities,
+}
+
+pub(crate) fn registry_catalog_models(api_format: Option<&str>) -> Vec<RegistryCatalogModel> {
+    registry_file()
+        .models
+        .iter()
+        .filter_map(|entry| {
+            let canonical_model = entry.ids.first()?.clone();
+            let reasoning_levels = api_format
+                .and_then(|format| entry.protocol_reasoning_levels.get(format))
+                .cloned()
+                .unwrap_or_else(|| entry.reasoning_levels.clone());
+            Some(RegistryCatalogModel {
+                canonical_model,
+                ids: entry.ids.clone(),
+                capabilities: RegistryModelCapabilities {
+                    context_length: entry.context_length,
+                    max_output_tokens: entry.max_output_tokens,
+                    input_modalities: entry.input_modalities.clone(),
+                    reasoning_levels,
+                    default_reasoning_level: entry.default_reasoning_level.clone(),
+                },
+            })
+        })
+        .collect()
+}
+
+/// Conservative built-in capability fallback used only when upstream/user
+/// metadata leaves a field unknown. Keep this registry evidence-backed and
+/// exact: unknown models must stay unknown rather than inheriting family guesses.
+pub(crate) fn registry_model_capabilities(
+    model: &str,
+    api_format: Option<&str>,
+) -> Option<RegistryModelCapabilities> {
+    let normalized = normalize_model_id(model);
+    let tail = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    let base_tail = strip_known_reasoning_suffix(tail);
+
+    if let Some(entry) = registry_file()
+        .models
+        .iter()
+        .find(|entry| entry.ids.iter().any(|id| id == base_tail))
+    {
+        let reasoning_levels = api_format
+            .and_then(|format| entry.protocol_reasoning_levels.get(format))
+            .cloned()
+            .unwrap_or_else(|| entry.reasoning_levels.clone());
+        return Some(RegistryModelCapabilities {
+            context_length: entry.context_length,
+            max_output_tokens: entry.max_output_tokens,
+            input_modalities: entry.input_modalities.clone(),
+            reasoning_levels,
+            default_reasoning_level: entry.default_reasoning_level.clone(),
+        });
+    }
+
+    if is_confirmed_text_only_model(base_tail) {
+        return Some(RegistryModelCapabilities {
+            input_modalities: vec!["text".to_string()],
+            ..Default::default()
+        });
+    }
+
+    None
+}
+
+fn strip_known_reasoning_suffix(model: &str) -> &str {
+    for suffix in ["-minimal", "-low", "-medium", "-high", "-xhigh", "-max"] {
+        if let Some(stripped) = model.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    model
+}
+
+pub(crate) fn canonical_model_key(model: &str) -> String {
+    let normalized = normalize_model_id(model);
+    let tail = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    strip_known_reasoning_suffix(tail).to_string()
+}
 
 /// Image-input capability shared by Codex catalog generation and proxy request
 /// rectification.
@@ -15,7 +145,7 @@ pub(crate) enum ImageInputCapability {
 }
 
 /// Resolve image-input capability from an explicit declaration first, then the
-/// confirmed text-only model registry when the caller enables registry lookup.
+/// central canonical capability registry when the caller enables registry lookup.
 pub(crate) fn resolve_image_input_capability(
     model: &str,
     declared_support: Option<bool>,
@@ -24,9 +154,19 @@ pub(crate) fn resolve_image_input_capability(
     match declared_support {
         Some(true) => ImageInputCapability::Supported,
         Some(false) => ImageInputCapability::Unsupported,
-        None if use_confirmed_registry && is_confirmed_text_only_model(model) => {
-            ImageInputCapability::Unsupported
-        }
+        None if use_confirmed_registry => registry_model_capabilities(model, None)
+            .map(|capabilities| {
+                if capabilities
+                    .input_modalities
+                    .iter()
+                    .any(|value| value == "image")
+                {
+                    ImageInputCapability::Supported
+                } else {
+                    ImageInputCapability::Unsupported
+                }
+            })
+            .unwrap_or(ImageInputCapability::Unknown),
         None => ImageInputCapability::Unknown,
     }
 }
@@ -68,40 +208,10 @@ pub(crate) fn image_input_capability_from_modalities(
 pub(crate) fn is_confirmed_text_only_model(model: &str) -> bool {
     let normalized = normalize_model_id(model);
     let tail = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-
-    const CONFIRMED_TAILS: &[&str] = &[
-        "ark-code-latest",
-        "deepseek-chat",
-        "deepseek-reasoner",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-        "glm-5.1",
-        // Exact rather than prefix matching: GLM visual models use a `v`
-        // suffix (for example glm-5.2v), which must remain image-capable.
-        "glm-5.2",
-        "kat-coder",
-        "kat-coder-pro",
-        "kat-coder-pro v1",
-        "kat-coder-pro v2",
-        "kat-coder-pro-v1",
-        "kat-coder-pro-v2",
-        "ling-2.5-1t",
-        "longcat-2.0",
-        "longcat-flash-chat",
-        "minimax-m2.7",
-        "minimax-m2.7-highspeed",
-        "mimo-v2.5-pro",
-        "qwen3-coder-480b",
-        "qwen3-coder-480b-a35b-instruct",
-        "qwen3-coder-flash",
-        "qwen3-coder-next",
-        "qwen3-coder-plus",
-        "step-3.5-flash",
-        "step-3.5-flash-2603",
-        "us.deepseek.r1-v1",
-    ];
-
-    CONFIRMED_TAILS.contains(&tail)
+    registry_file()
+        .text_only_models
+        .iter()
+        .any(|candidate| candidate == tail)
 }
 
 fn declared_model_image_support(settings: &Value, model: &str) -> Option<bool> {
@@ -203,12 +313,77 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn gpt_and_unknown_models_remain_unknown_without_declarations() {
-        for model in ["gpt-5.4", "gpt-5.5", "gpt-5.6-sol", "custom-alias"] {
+    fn gateway_registry_uses_bundled_gpt55_catalog_and_text_only_registry() {
+        let gpt = registry_model_capabilities("openai/gpt-5.5-high", None).unwrap();
+        assert_eq!(gpt.context_length, Some(272_000));
+        assert_eq!(gpt.input_modalities, vec!["text", "image"]);
+        assert_eq!(
+            gpt.reasoning_levels,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+
+        let deepseek = registry_model_capabilities("deepseek-v4-pro", Some("openai_chat")).unwrap();
+        assert_eq!(deepseek.input_modalities, vec!["text"]);
+        assert_eq!(
+            registry_model_capabilities("deepseek-v4-pro-high", Some("openai_chat"))
+                .unwrap()
+                .input_modalities,
+            vec!["text"]
+        );
+        assert_eq!(deepseek.reasoning_levels, vec!["low", "high", "max"]);
+        assert_eq!(deepseek.context_length, Some(1_048_576));
+        assert_eq!(deepseek.max_output_tokens, Some(384_000));
+
+        let deepseek_responses =
+            registry_model_capabilities("deepseek-v4-pro", Some("openai_responses")).unwrap();
+        assert_eq!(
+            deepseek_responses.reasoning_levels,
+            vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+
+        let gpt56 = registry_model_capabilities("gpt-5.6-sol", Some("openai_responses")).unwrap();
+        assert_eq!(gpt56.context_length, Some(1_050_000));
+        assert_eq!(gpt56.max_output_tokens, Some(128_000));
+        assert_eq!(gpt56.input_modalities, vec!["text", "image"]);
+        assert_eq!(gpt56.default_reasoning_level.as_deref(), Some("medium"));
+        assert_eq!(deepseek.default_reasoning_level.as_deref(), Some("high"));
+        assert_eq!(canonical_model_key("openai/gpt-5.6-sol-high"), "gpt-5.6-sol");
+
+        let astra = registry_model_capabilities("gpt-6-astra", Some("openai_responses")).unwrap();
+        assert_eq!(astra.context_length, Some(1_050_000));
+        assert_eq!(astra.reasoning_levels, vec!["low", "medium", "high", "xhigh", "max"]);
+
+        let gemini = registry_model_capabilities("gemini-3.8-flash", None).unwrap();
+        assert_eq!(gemini.max_output_tokens, Some(65_536));
+        assert_eq!(gemini.default_reasoning_level.as_deref(), Some("medium"));
+        assert!(gemini.input_modalities.contains(&"pdf".to_string()));
+
+        let opus = registry_model_capabilities("claude-opus-5", Some("anthropic")).unwrap();
+        assert_eq!(opus.context_length, Some(1_000_000));
+        assert_eq!(opus.max_output_tokens, Some(128_000));
+        assert_eq!(opus.default_reasoning_level.as_deref(), Some("high"));
+
+        assert!(registry_model_capabilities("future-model-vision", None).is_none());
+    }
+
+    #[test]
+    fn canonical_registry_drives_image_capability_when_known() {
+        for model in ["gpt-5.5", "gpt-5.6-sol", "gemini-3.8-flash", "claude-opus-5"] {
+            assert_eq!(
+                resolve_image_input_capability(model, None, true),
+                ImageInputCapability::Supported,
+                "{model} should inherit image support from the canonical registry"
+            );
+        }
+        assert_eq!(
+            resolve_image_input_capability("deepseek-v4-pro", None, true),
+            ImageInputCapability::Unsupported
+        );
+        for model in ["gpt-5.4", "custom-alias"] {
             assert_eq!(
                 resolve_image_input_capability(model, None, true),
                 ImageInputCapability::Unknown,
-                "{model} must fail open"
+                "{model} must remain unknown"
             );
         }
     }

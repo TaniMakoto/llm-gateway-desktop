@@ -4,6 +4,7 @@
 //! 参考: anthropic-proxy-rs
 
 use crate::proxy::{error::ProxyError, json_canonical::canonical_json_string};
+use crate::proxy::providers::next_client_tool_use_id;
 use serde_json::{json, Value};
 
 const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
@@ -54,18 +55,88 @@ pub fn is_openai_o_series(model: &str) -> bool {
         && model.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit())
 }
 
-/// Detect OpenAI models that support reasoning_effort.
+/// Detect models that support an OpenAI-style reasoning effort control.
 ///
-/// Supported families:
-/// - o-series: o1, o3, o4-mini, etc.
-/// - GPT-5+: gpt-5, gpt-5.1, gpt-5.4, gpt-5-codex, etc.
+/// Prefer the central capability registry. The legacy OpenAI family heuristic
+/// remains only as a compatibility fallback for models not yet present there.
 pub fn supports_reasoning_effort(model: &str) -> bool {
+    if let Some(capabilities) =
+        crate::model_capabilities::registry_model_capabilities(model, None)
+    {
+        if !capabilities.reasoning_levels.is_empty() {
+            return true;
+        }
+    }
     is_openai_o_series(model)
         || model
             .to_lowercase()
             .strip_prefix("gpt-")
             .and_then(|rest| rest.chars().next())
             .is_some_and(|c| c.is_ascii_digit() && c >= '5')
+}
+
+fn fallback_reasoning_levels(model: &str) -> Vec<String> {
+    if supports_reasoning_effort(model) {
+        vec![
+            "minimal".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+            "xhigh".to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+pub(crate) fn reasoning_levels_for_model(model: &str, api_format: &str) -> Vec<String> {
+    crate::model_capabilities::registry_model_capabilities(model, Some(api_format))
+        .map(|capabilities| capabilities.reasoning_levels)
+        .filter(|levels| !levels.is_empty())
+        .unwrap_or_else(|| fallback_reasoning_levels(model))
+}
+
+/// Map a normalized client request effort to the closest level the upstream
+/// model actually advertises. This intentionally keeps provider/model metadata
+/// authoritative instead of assuming OpenAI's `xhigh` spelling everywhere.
+pub(crate) fn map_reasoning_effort_to_levels(
+    requested: &str,
+    supported_levels: &[String],
+) -> Option<String> {
+    let levels: Vec<String> = supported_levels
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if levels.is_empty() {
+        return None;
+    }
+    let has = |candidate: &str| levels.iter().any(|level| level == candidate);
+    let pick = |candidates: &[&str]| {
+        candidates
+            .iter()
+            .find(|candidate| has(candidate))
+            .map(|candidate| (*candidate).to_string())
+    };
+
+    match requested.trim().to_ascii_lowercase().as_str() {
+        "max" | "xhigh" => pick(&["xhigh", "max", "high"]),
+        "high" => pick(&["high", "xhigh", "max", "medium"]),
+        "medium" => pick(&["medium", "high", "low"]),
+        "low" => pick(&["low", "minimal", "medium"]),
+        "minimal" => pick(&["minimal", "low"]),
+        "none" => has("none").then(|| "none".to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn reasoning_effort_for_model(
+    model: &str,
+    api_format: &str,
+    requested: &str,
+) -> Option<String> {
+    let levels = reasoning_levels_for_model(model, api_format);
+    map_reasoning_effort_to_levels(requested, &levels)
 }
 
 /// Resolve the appropriate OpenAI `reasoning_effort` from an Anthropic request body.
@@ -194,8 +265,8 @@ pub fn anthropic_to_openai_with_reasoning_content(
     }
 
     // Map Anthropic thinking → OpenAI reasoning_effort
-    if supports_reasoning_effort(model) {
-        if let Some(effort) = resolve_reasoning_effort(&body) {
+    if let Some(requested) = resolve_reasoning_effort(&body) {
+        if let Some(effort) = reasoning_effort_for_model(model, "openai_chat", requested) {
             result["reasoning_effort"] = json!(effort);
         }
     }
@@ -591,7 +662,9 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
             has_tool_use = true;
         }
         for tc in tool_calls {
-            let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            // tool id 由网关发号，保证会话内唯一（上游不保证唯一，见
+            // next_client_tool_use_id 的注释）。
+            let id = next_client_tool_use_id();
             let empty_obj = json!({});
             let func = tc.get("function").unwrap_or(&empty_obj);
             let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -1206,10 +1279,69 @@ mod tests {
 
         let result = openai_to_anthropic(input).unwrap();
         assert_eq!(result["content"][0]["type"], "tool_use");
-        assert_eq!(result["content"][0]["id"], "call_123");
+        // tool id 由网关发号（`call_N`），不再透传上游的 call_123 — 见
+        // next_client_tool_use_id 的会话内唯一说明。不硬编码具体序号，
+        // 以免与其它测试的全局发号顺序耦合。
+        let tool_id = result["content"][0]["id"].as_str().unwrap();
+        assert!(
+            tool_id.starts_with("call_") && tool_id != "call_123",
+            "网关发号的 id 形如 call_N，实际 {tool_id}"
+        );
         assert_eq!(result["content"][0]["name"], "get_weather");
         assert_eq!(result["content"][0]["input"]["location"], "Tokyo");
         assert_eq!(result["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_tool_id_unique_across_responses() {
+        // 回归：上游每条响应都返回同一个 id（如中转的 {工具名}:{序号}，序号每轮从 0
+        // 重来）时必须由网关发号，保证会话内唯一，否则客户端会把历史 tool_use 整段丢弃
+        //（表现成 [Tool use interrupted] / (no content)）。
+        for _ in 0..2 {
+            let input = json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "Grep:0",
+                        "type": "function",
+                        "function": {"name": "Grep", "arguments": "{\"pattern\":\"x\"}"}
+                    }]},
+                    "finish_reason": "tool_calls"
+                }]
+            });
+            let result = openai_to_anthropic(input.clone()).unwrap();
+            let id = result["content"][0]["id"].as_str().unwrap();
+            // 每次调用都应拿到一个全新的、非上游的 id。
+            assert!(id.starts_with("call_"));
+            assert_ne!(id, "Grep:0");
+            assert_eq!(result["content"][0]["name"], "Grep");
+        }
+        // 两个 id 互不相同（全局发号）。
+        let a: String = openai_to_anthropic(chat_tool_calls_input())
+            .unwrap()["content"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let b: String = openai_to_anthropic(chat_tool_calls_input())
+            .unwrap()["content"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(a, b);
+    }
+
+    fn chat_tool_calls_input() -> Value {
+        json!({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "Grep:0",
+                    "type": "function",
+                    "function": {"name": "Grep", "arguments": "{}"}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        })
     }
 
     #[test]
@@ -1244,7 +1376,12 @@ mod tests {
         );
         assert_eq!(anthropic_response["content"][1]["type"], "text");
         assert_eq!(anthropic_response["content"][2]["type"], "tool_use");
-        assert_eq!(anthropic_response["content"][2]["id"], "call_date");
+        // tool id 现在由网关发号（唯一性要求），不再透传上游的 call_date。
+        let tool_id = anthropic_response["content"][2]["id"].as_str().unwrap();
+        assert!(
+            tool_id.starts_with("call_") && tool_id != "call_date",
+            "网关发号的 id 形如 call_N，实际 {tool_id}"
+        );
 
         let follow_up_request = json!({
             "model": "deepseek-v4-flash",
@@ -1261,7 +1398,8 @@ mod tests {
             msg["reasoning_content"],
             "Need the current date before calling weather."
         );
-        assert_eq!(msg["tool_calls"][0]["id"], "call_date");
+        // 回程保留的是网关发号的 id，而不是上游原始的 call_date。
+        assert_eq!(msg["tool_calls"][0]["id"], tool_id);
         assert_eq!(msg["tool_calls"][0]["function"]["name"], "get_date");
     }
 
@@ -1566,8 +1704,29 @@ mod tests {
         assert!(supports_reasoning_effort("gpt-5"));
         assert!(supports_reasoning_effort("gpt-5.4"));
         assert!(supports_reasoning_effort("gpt-5-codex"));
+        assert!(supports_reasoning_effort("deepseek-v4-flash"));
         assert!(!supports_reasoning_effort("gpt-4o"));
         assert!(!supports_reasoning_effort("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn registry_reasoning_levels_translate_protocol_specific_max() {
+        assert_eq!(
+            reasoning_effort_for_model("deepseek-v4-flash", "openai_chat", "xhigh"),
+            Some("max".to_string())
+        );
+        assert_eq!(
+            reasoning_effort_for_model(
+                "deepseek-v4-flash",
+                "openai_responses",
+                "xhigh"
+            ),
+            Some("xhigh".to_string())
+        );
+        assert_eq!(
+            reasoning_effort_for_model("deepseek-v4-flash", "openai_chat", "medium"),
+            Some("high".to_string())
+        );
     }
 
     // ── resolve_reasoning_effort unit tests ──

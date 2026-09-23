@@ -22,6 +22,9 @@ impl Database {
 
     /// 在指定连接上创建表（供迁移和测试使用）
     pub(crate) fn create_tables_on_conn(conn: &Connection) -> Result<(), AppError> {
+        conn.execute("CREATE TABLE IF NOT EXISTS request_observations (
+            request_id TEXT PRIMARY KEY, evidence TEXT NOT NULL, outcome TEXT NOT NULL
+        )", []).map_err(|e| AppError::Database(e.to_string()))?;
         // 1. Providers 表
         conn.execute(
             "CREATE TABLE IF NOT EXISTS providers (
@@ -187,6 +190,7 @@ impl Database {
             request_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, app_type TEXT NOT NULL, model TEXT NOT NULL,
             request_model TEXT,
             pricing_model TEXT,
+            reasoning_effort TEXT,
             input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
             input_token_semantics INTEGER NOT NULL DEFAULT 0,
@@ -199,6 +203,7 @@ impl Database {
             data_source TEXT NOT NULL DEFAULT 'proxy'
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
+        conn.execute("CREATE TRIGGER IF NOT EXISTS delete_request_observation AFTER DELETE ON proxy_request_logs BEGIN DELETE FROM request_observations WHERE request_id = OLD.request_id; END", []).map_err(|e| AppError::Database(e.to_string()))?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON proxy_request_logs(provider_id, app_type)", [])
             .map_err(|e| AppError::Database(e.to_string()))?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON proxy_request_logs(created_at)", [])
@@ -485,6 +490,18 @@ impl Database {
                         Self::migrate_v12_to_v13(conn)?;
                         Self::set_user_version(conn, 13)?;
                     }
+                    14 => {
+                        conn.execute("CREATE TABLE IF NOT EXISTS request_observations (
+                            request_id TEXT PRIMARY KEY, evidence TEXT NOT NULL, outcome TEXT NOT NULL
+                        )", []).map_err(|e| AppError::Database(e.to_string()))?;
+                        conn.execute("CREATE TRIGGER IF NOT EXISTS delete_request_observation AFTER DELETE ON proxy_request_logs BEGIN DELETE FROM request_observations WHERE request_id = OLD.request_id; END", []).map_err(|e| AppError::Database(e.to_string()))?;
+                        Self::set_user_version(conn, 15)?;
+                    }
+                    13 => {
+                        log::info!("迁移数据库从 v13 到 v14（记录请求思考等级）");
+                        Self::migrate_v13_to_v14(conn)?;
+                        Self::set_user_version(conn, 14)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -655,6 +672,7 @@ impl Database {
         conn.execute("CREATE TABLE IF NOT EXISTS proxy_request_logs (
             request_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, app_type TEXT NOT NULL, model TEXT NOT NULL,
             request_model TEXT,
+            reasoning_effort TEXT,
             input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
             input_token_semantics INTEGER NOT NULL DEFAULT 0,
@@ -1349,6 +1367,19 @@ impl Database {
                 "usage_daily_rollups",
                 "input_token_semantics",
                 "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// v13 -> v14：保存最终一次实际上游请求的 reasoning effort，供日志展示。
+    fn migrate_v13_to_v14(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "proxy_request_logs")? {
+            Self::add_column_if_missing(
+                conn,
+                "proxy_request_logs",
+                "reasoning_effort",
+                "TEXT",
             )?;
         }
         Ok(())
@@ -2766,7 +2797,7 @@ mod tests {
 
         Database::apply_schema_migrations_on_conn(&conn)?;
 
-        assert_eq!(Database::get_user_version(&conn)?, 13);
+        assert_eq!(Database::get_user_version(&conn)?, 14);
         assert!(Database::has_column(
             &conn,
             "proxy_request_logs",
@@ -2785,6 +2816,26 @@ mod tests {
         )?;
         assert_eq!(log_default, 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v13_to_v14_adds_reasoning_effort() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute(
+            "CREATE TABLE proxy_request_logs (request_id TEXT PRIMARY KEY)",
+            [],
+        )?;
+        Database::set_user_version(&conn, 13)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, 14);
+        assert!(Database::has_column(
+            &conn,
+            "proxy_request_logs",
+            "reasoning_effort"
+        )?);
         Ok(())
     }
 }

@@ -108,7 +108,13 @@ struct PromptTokensDetails {
 #[derive(Debug, Clone)]
 struct ToolBlockState {
     anthropic_index: u32,
+    /// 上游给的 tool_call.id。只用于判断"能否开始这个块"，不下发给客户端。
     id: String,
+    /// 下发给客户端的 tool_use.id，由网关发号保证会话内唯一。
+    ///
+    /// 不能直接透传 `id`：上游不保证它唯一（见
+    /// [`super::next_client_tool_use_id`]），重复 id 会让客户端把工具调用整段丢弃。
+    client_id: String,
     name: String,
     started: bool,
     pending_args: String,
@@ -409,6 +415,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                                 ToolBlockState {
                                                                     anthropic_index: index,
                                                                     id: String::new(),
+                                                                    client_id: String::new(),
                                                                     name: String::new(),
                                                                     started: false,
                                                                     pending_args: String::new(),
@@ -437,6 +444,9 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                                 && !state.name.is_empty();
                                                         if should_start {
                                                             state.started = true;
+                                                            // 发号只在块真正开始时做一次，避免后续 delta 改写已下发的 id。
+                                                            state.client_id =
+                                                                super::next_client_tool_use_id();
                                                         }
                                                         let pending_after_start = if should_start
                                                             && !state.pending_args.is_empty()
@@ -476,7 +486,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                         };
                                                         (
                                                             state.anthropic_index,
-                                                            state.id.clone(),
+                                                            state.client_id.clone(),
                                                             state.name.clone(),
                                                             should_start,
                                                             pending_after_start,
@@ -563,7 +573,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                             // Late start for blocks that accumulated args before id/name arrived.
                                             let mut late_tool_starts: Vec<(u32, String, String, String)> =
                                                 Vec::new();
-                                            for (tool_idx, state) in tool_blocks_by_index.iter_mut() {
+                                            for (_, state) in tool_blocks_by_index.iter_mut() {
                                                 if state.started {
                                                     continue;
                                                 }
@@ -573,11 +583,13 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                 if !has_payload {
                                                     continue;
                                                 }
-                                                let fallback_id = if state.id.is_empty() {
-                                                    format!("tool_call_{tool_idx}")
-                                                } else {
-                                                    state.id.clone()
-                                                };
+                                                // 迟到的块在流收尾时才补发 content_block_start，
+                                                // 同样由网关发号（上游 id 不保证唯一）。
+                                                if state.client_id.is_empty() {
+                                                    state.client_id =
+                                                        super::next_client_tool_use_id();
+                                                }
+                                                let fallback_id = state.client_id.clone();
                                                 let fallback_name = if state.name.is_empty() {
                                                     "unknown_tool".to_string()
                                                 } else {
@@ -867,11 +879,16 @@ mod tests {
             }
         }
 
-        assert_eq!(tool_index_by_call.len(), 2);
-        assert_ne!(
-            tool_index_by_call.get("call_0"),
-            tool_index_by_call.get("call_1")
-        );
+        // tool id 由网关发号（call_N），不透传上游 id — 两个下发的 id 必须都改写过
+        // 且互不相同，路由本身仍按 anthropic index 正确分离。
+        let ids: Vec<&String> = tool_index_by_call.keys().collect();
+        assert_eq!(ids.len(), 2);
+        for id in &ids {
+            assert!(id.starts_with("call_"), "网关发号的 id 形如 call_N，实际 {id}");
+            assert_ne!(id.as_str(), "call_0");
+            assert_ne!(id.as_str(), "call_1");
+        }
+        assert_ne!(ids[0], ids[1]);
 
         let deltas: Vec<(u64, String)> = events
             .iter()
@@ -900,13 +917,87 @@ mod tests {
             .find_map(|(index, payload)| (payload == "{\"a\":1}").then_some(*index))
             .unwrap();
 
-        assert_eq!(second_idx, *tool_index_by_call.get("call_1").unwrap());
-        assert_eq!(first_idx, *tool_index_by_call.get("call_0").unwrap());
+        // 参数路由按 anthropic index 校验（id 已由网关改写，不再按上游 id 反查）。
+        let start_index_by_name = |name: &str| {
+            events
+                .iter()
+                .filter(|event| {
+                    event.get("type").and_then(|v| v.as_str()) == Some("content_block_start")
+                        && event.pointer("/content_block/name").and_then(|v| v.as_str())
+                            == Some(name)
+                })
+                .find_map(|event| event.get("index").and_then(|v| v.as_u64()))
+                .unwrap()
+        };
+        assert_eq!(first_idx, start_index_by_name("first_tool"));
+        assert_eq!(second_idx, start_index_by_name("second_tool"));
 
         assert!(events.iter().any(|event| {
             event.get("type").and_then(|v| v.as_str()) == Some("message_delta")
                 && event.pointer("/delta/stop_reason").and_then(|v| v.as_str()) == Some("tool_use")
         }));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_tool_ids_unique_across_responses() {
+        // 回归（会话级）：上游每次都返回同一个 tool_call id（如中转的
+        // "Grep:0"，序号每条响应都从 0 重来）。透传时客户端会认为第二个
+        // tool_use 与历史重复而整段丢弃（表现为 [Tool use interrupted]），
+        // 所以网关必须给每条响应的 tool_use 发新的 id。
+        let upstream_input = |id: &str| {
+            // 唯一动态片段是 id：塞 `{ID}` 占位符再替换，避免 format!/concat! 嵌套的花括号转义。
+            concat!(
+                "data: {\"id\":\"chatcmpl_k\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"{ID}\",\"type\":\"function\",\"function\":{\"name\":\"Grep\",\"arguments\":\"{\\\"pattern\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+                "data: {\"id\":\"chatcmpl_k\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .replace("{ID}", id)
+        };
+
+        let collect_emitted_id = |id: &'static str| {
+            let input = upstream_input(id);
+            async move {
+                let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(
+                    input.as_bytes().to_vec(),
+                ))]);
+                let converted = create_anthropic_sse_stream(upstream);
+                let chunks: Vec<_> = converted.collect().await;
+                let merged = chunks
+                    .into_iter()
+                    .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+                    .collect::<String>();
+                merged
+                    .split("\n\n")
+                    .filter_map(|block| {
+                        let data = block
+                            .lines()
+                            .find_map(|line| strip_sse_field(line, "data"))?;
+                        serde_json::from_str::<Value>(data).ok()
+                    })
+                    .filter(|event| {
+                        event_type(event) == Some("content_block_start")
+                            && event.pointer("/content_block/type").and_then(Value::as_str)
+                                == Some("tool_use")
+                    })
+                    .find_map(|event| {
+                        event
+                            .pointer("/content_block/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .expect("tool_use content_block_start 必须带 id")
+            }
+        };
+
+        let first = collect_emitted_id("Grep:0").await;
+        let second = collect_emitted_id("Grep:0").await;
+
+        assert_ne!(first, second, "同一上游 id 在两次响应里必须映射到不同 id");
+        assert_ne!(first, "Grep:0");
+        assert!(
+            first.starts_with("call_"),
+            "网关发号的 id 形如 call_N，实际 {first}"
+        );
     }
 
     #[tokio::test]
@@ -950,12 +1041,14 @@ mod tests {
             })
             .collect();
         assert_eq!(starts.len(), 1);
-        assert_eq!(
-            starts[0]
-                .pointer("/content_block/id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "call_0"
+        let emitted_id = starts[0]
+            .pointer("/content_block/id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // id 由网关发号，不再透传上游的 call_0。
+        assert!(
+            emitted_id.starts_with("call_") && emitted_id != "call_0",
+            "网关发号的 id 形如 call_N，实际 {emitted_id}"
         );
         assert_eq!(
             starts[0]

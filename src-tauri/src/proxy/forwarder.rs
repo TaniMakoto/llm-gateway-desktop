@@ -10,11 +10,12 @@ use super::{
     failover_switch::FailoverSwitchManager,
     json_canonical::{canonicalize_value, short_value_hash},
     log_codes::fwd as log_fwd,
-    provider_router::ProviderRouter,
+    provider_router::{CapacityAcquireError, ProviderCapacityPermit, ProviderRouter},
     providers::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
         AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
     },
+    session_affinity::SessionAffinityStore,
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
         normalize_thinking_type, rectify_anthropic_request, should_rectify_thinking_signature,
@@ -34,10 +35,45 @@ use futures::StreamExt;
 use http::Extensions;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::Manager;
 use tokio::sync::RwLock;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
+const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(30);
+const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn retry_after_duration(headers: &http::HeaderMap) -> Duration {
+    let Some(raw) = headers
+        .get(http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return DEFAULT_RATE_LIMIT_COOLDOWN;
+    };
+
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Duration::from_secs(seconds.max(1)).min(MAX_RATE_LIMIT_COOLDOWN);
+    }
+
+    let parsed_date = chrono::DateTime::parse_from_rfc2822(raw)
+        .map(|date| date.with_timezone(&chrono::Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%a, %d %b %Y %H:%M:%S GMT")
+                .ok()
+                .map(|date| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(date, chrono::Utc))
+        });
+    if let Some(date) = parsed_date {
+        let seconds = (date - chrono::Utc::now())
+            .num_seconds()
+            .max(1) as u64;
+        return Duration::from_secs(seconds).min(MAX_RATE_LIMIT_COOLDOWN);
+    }
+
+    DEFAULT_RATE_LIMIT_COOLDOWN
+}
 
 fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
     let authorization = headers
@@ -64,6 +100,8 @@ pub struct ForwardResult {
     /// usage 归因不能依赖 ctx.request_model（映射前的客户端别名）：上游响应
     /// 缺失 model 或回显别名时，接管流量会被记成 claude-* 并按其定价计费。
     pub outbound_model: Option<String>,
+    /// 最终发往成功候选的请求体中实际存在的思考等级/开关。
+    pub outbound_reasoning_effort: Option<String>,
     /// 活跃连接 RAII guard：随响应一起流转到 response_processor / handle_claude_transform，
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
@@ -72,6 +110,8 @@ pub struct ForwardResult {
 pub struct ForwardError {
     pub error: ProxyError,
     pub provider: Option<Provider>,
+    /// 最终一次实际发出的上游请求中的思考配置。
+    pub outbound_reasoning_effort: Option<String>,
 }
 
 /// 活跃连接 RAII guard
@@ -89,6 +129,7 @@ pub(crate) struct ActiveConnectionGuard {
     active_provider_counts:
         Arc<RwLock<std::collections::HashMap<(String, String), (usize, String)>>>,
     active_provider: Option<(String, String)>,
+    capacity_permit: Option<ProviderCapacityPermit>,
 }
 
 impl ActiveConnectionGuard {
@@ -106,6 +147,7 @@ impl ActiveConnectionGuard {
             status,
             active_provider_counts,
             active_provider: None,
+            capacity_permit: None,
         }
     }
 
@@ -118,6 +160,7 @@ impl ActiveConnectionGuard {
         app_type: &str,
         provider_id: &str,
         provider_name: &str,
+        capacity_permit: Option<ProviderCapacityPermit>,
     ) {
         let next = (app_type.to_string(), provider_id.to_string());
         if self.active_provider.as_ref() == Some(&next) {
@@ -143,6 +186,7 @@ impl ActiveConnectionGuard {
         entry.0 = entry.0.saturating_add(1);
         entry.1 = provider_name.to_string();
         self.active_provider = Some(next);
+        self.capacity_permit = capacity_permit;
     }
 }
 
@@ -177,6 +221,7 @@ impl Drop for ActiveConnectionGuard {
 }
 
 pub struct RequestForwarder {
+    trace: super::request_trace::RequestTrace,
     /// 共享的 ProviderRouter（持有熔断器状态）
     router: Arc<ProviderRouter>,
     status: Arc<RwLock<ProxyStatus>>,
@@ -195,6 +240,12 @@ pub struct RequestForwarder {
     session_id: String,
     /// Session ID 是否由客户端提供；生成值不能作为上游缓存身份。
     session_client_provided: bool,
+    /// 会话亲和的键；`None` 表示这个会话没有稳定标识，不做任何绑定
+    ///
+    /// 见 [`RequestForwarder::order_providers`]。
+    session_affinity_key: Option<String>,
+    /// 共享的会话 → provider 绑定表
+    session_affinity: Arc<RwLock<SessionAffinityStore>>,
     /// 整流器配置
     rectifier_config: RectifierConfig,
     /// 优化器配置
@@ -214,16 +265,124 @@ pub struct RequestForwarder {
 }
 
 impl RequestForwarder {
+    pub fn with_trace(mut self, trace: super::request_trace::RequestTrace) -> Self {
+        trace.set_runtime_status(self.status.clone());
+        self.trace = trace;
+        self
+    }
+
     /// 成功目标是否是本次模型路由的备用项。
     ///
     /// 统计必须以当前请求收到的有序 provider 链为准，不能与遗留设置中的
     /// `current_provider_id` 比较：统一网关的内部 provider ID 带协议后缀，遗留
     /// 当前 ID 往往为空或属于另一套配置，会导致首选供应商的每次成功都被误计为故障转移。
-    fn route_used_fallback(providers: &[Provider], successful_provider_id: &str) -> bool {
+    ///
+    /// `affinity_provider_id` 是本次会话亲和命中的 provider：它排在配置顺序的第一位之外
+    /// 却并非「首选失败」，所以不算故障转移。[`Self::order_providers`] 把它提到最前，
+    /// 这一步必须同步排除，否则亲和每次命中都会在 UI 上记一次故障转移。
+    fn route_used_fallback(
+        providers: &[Provider],
+        successful_provider_id: &str,
+        affinity_provider_id: Option<&str>,
+    ) -> bool {
+        if affinity_provider_id == Some(successful_provider_id) {
+            return false;
+        }
+
         providers
             .first()
             .map(|primary| primary.id.as_str() != successful_provider_id)
             .unwrap_or(false)
+    }
+
+    /// 查询本次请求的会话亲和偏好：命中绑定则返回被绑定的 provider id
+    ///
+    /// 两种情况下返回 `None`（等价于「没有偏好，走配置顺序」）：
+    /// 这个会话没有稳定标识，或绑定指向的 provider 已不在本次路由链里
+    /// （配置改动 / 被禁用）——后者会顺手解绑，免得绑定一直挂着。
+    async fn session_affinity_preference(&self, providers: &[Provider]) -> Option<String> {
+        let key = self.session_affinity_key.clone()?;
+
+        // `SessionAffinityStore::get` 只读不续期：查询本身不延长绑定寿命。
+        // 寿命只由真正成功的请求（`bind`）延长，
+        // 否则一个陈旧客户端反复发起失败请求也能让绑定一直活着。
+        let preferred = {
+            let mut store = self.session_affinity.write().await;
+            store.get(&key)
+        };
+
+        let preferred = preferred?;
+
+        if !providers.iter().any(|p| p.id == preferred) {
+            let mut store = self.session_affinity.write().await;
+            store.compare_and_delete(&key, &preferred);
+            return None;
+        }
+
+        Some(preferred)
+    }
+
+    /// 把命中亲和的 provider 提到最前；只改**尝试顺序**，不改配置顺序
+    ///
+    /// `providers` 本身仍是「首选 + 故障转移链」的权威定义，亲和只是叠在上面的偏好层。
+    /// 未命中或偏好不在链上时原样返回。
+    fn order_providers<'a>(
+        providers: &'a [Provider],
+        preferred: Option<&str>,
+    ) -> Vec<&'a Provider> {
+        let preferred = match preferred {
+            Some(preferred) => preferred,
+            None => return providers.iter().collect(),
+        };
+
+        let mut promoted = None;
+        let mut rest = Vec::with_capacity(providers.len());
+        for provider in providers {
+            if promoted.is_none() && provider.id == preferred {
+                promoted = Some(provider);
+            } else {
+                rest.push(provider);
+            }
+        }
+
+        match promoted {
+            Some(provider) => {
+                let mut result = Vec::with_capacity(rest.len() + 1);
+                result.push(provider);
+                result.extend(rest);
+                result
+            }
+            None => rest,
+        }
+    }
+
+    /// 成功转发后：把这个会话绑定到实际服务它的 provider
+    ///
+    /// `bind` 同时承担「首次建立」和「续期」两种职责——只续期的话，
+    /// 一个从未绑定过的会话永远无法开始亲和。并发请求下后者覆盖前者是可接受的：
+    /// 它们都成功了，指向哪一家都能提升缓存命中。
+    async fn bind_session_affinity(&self, provider_id: &str) {
+        let key = match self.session_affinity_key.clone() {
+            Some(key) => key,
+            None => return,
+        };
+
+        let mut store = self.session_affinity.write().await;
+        store.bind(&key, provider_id);
+    }
+
+    /// provider 真的故障时：解除它与本会话的绑定
+    ///
+    /// 只在「provider 自身故障」的路径上调用。请求级错误（客户端输入导致的 400 等）
+    /// 换 provider 也一样被拒，走到那里不会解绑——与熔断器的中性处理保持一致。
+    async fn release_session_affinity(&self, provider_id: &str) {
+        let key = match self.session_affinity_key.clone() {
+            Some(key) => key,
+            None => return,
+        };
+
+        let mut store = self.session_affinity.write().await;
+        store.compare_and_delete(&key, provider_id);
     }
 
     /// 预防式 media 降级：发送前对 text-only 模型把图片块替换为标记。
@@ -287,6 +446,8 @@ impl RequestForwarder {
         current_provider_id_at_start: String,
         session_id: String,
         session_client_provided: bool,
+        session_affinity_key: Option<String>,
+        session_affinity: Arc<RwLock<SessionAffinityStore>>,
         streaming_first_byte_timeout: u64,
         _streaming_idle_timeout: u64,
         rectifier_config: RectifierConfig,
@@ -298,6 +459,7 @@ impl RequestForwarder {
         // saturating_add 防止 u32::MAX + 1 溢出。
         let max_attempts = (max_retries as usize).saturating_add(1);
         Self {
+            trace: Default::default(),
             router,
             status,
             current_providers,
@@ -309,6 +471,8 @@ impl RequestForwarder {
             current_provider_id_at_start,
             session_id,
             session_client_provided,
+            session_affinity_key,
+            session_affinity,
             rectifier_config,
             optimizer_config,
             copilot_optimizer_config,
@@ -358,11 +522,15 @@ impl RequestForwarder {
     ///
     /// `failover_count` 只在成功目标不是本次有序路由链的首选项时增加；
     /// 遗留当前供应商 ID 仅用于决定是否同步 UI/托盘。
+    ///
+    /// `affinity_provider_id` 是本次会话亲和命中的 provider（没有则为 `None`）：
+    /// 它会排在链首之外，但那不是「首选失败」，所以不计入 `failover_count`。
     async fn update_success_state(
         &self,
         provider: &Provider,
         providers: &[Provider],
         app_type: &str,
+        affinity_provider_id: Option<&str>,
     ) {
         {
             let mut current_providers = self.current_providers.write().await;
@@ -372,9 +540,16 @@ impl RequestForwarder {
             );
         }
 
-        let route_used_fallback = Self::route_used_fallback(providers, &provider.id);
+        let route_used_fallback =
+            Self::route_used_fallback(providers, &provider.id, affinity_provider_id);
         let should_sync_current =
             self.current_provider_id_at_start.as_str() != provider.id.as_str();
+
+        // 会话亲和：把这个会话绑定到实际服务它的 provider，并顺带续期。
+        // 失败路径（Retryable 分支）已经解除了坏上游的绑定，所以这里绑定的一定是
+        // 「这次成功的那一家」；并发场景下后者覆盖前者，两家都健康时指向谁都提升缓存命中。
+        self.bind_session_affinity(&provider.id).await;
+
         {
             let mut status = self.status.write().await;
             status.success_requests += 1;
@@ -382,7 +557,7 @@ impl RequestForwarder {
             status.current_provider = Some(provider.name.clone());
             status.current_provider_id = Some(provider.id.clone());
             status.current_provider_app_type = Some(app_type.to_string());
-            if route_used_fallback {
+            if route_used_fallback && self.trace.mark_fallback() {
                 status.failover_count += 1;
             }
             if status.total_requests > 0 {
@@ -391,7 +566,9 @@ impl RequestForwarder {
             }
         }
 
-        if should_sync_current {
+        // Gateway providers are request-local routing targets, never CLI live
+        // configuration selections. Do not invoke the inherited takeover service.
+        if should_sync_current && provider.category.as_deref() != Some("unified_gateway") {
             let failover_manager = self.failover_manager.clone();
             let app_handle = self.app_handle.clone();
             let provider_id = provider.id.clone();
@@ -428,24 +605,35 @@ impl RequestForwarder {
         last_provider: &mut Option<Provider>,
     ) -> Option<ForwardError> {
         // Provider 错误：本家上游/网络确实出问题，下一家 provider 可能可用 → 继续故障转移。
-        // 客户端错误：整流后请求仍违法，下一家也修不好 → 直接返回。
-        let is_provider_error = match &retry_err {
-            ProxyError::Timeout(_) | ProxyError::ForwardFailed(_) => true,
-            ProxyError::UpstreamError { status, .. } => *status >= 500,
-            _ => false,
-        };
+        // 仅本地确认的请求/认证错误终止；上游 HTTP 拒绝继续候选列表。
+        let rate_limited = matches!(
+            &retry_err,
+            ProxyError::UpstreamError { status: 429, .. }
+        );
+        let category = self.categorize_proxy_error(&retry_err, provider);
+        let is_provider_error = matches!(category, ErrorCategory::Retryable | ErrorCategory::ProviderIncompatible);
 
         if is_provider_error {
-            let _ = self
-                .router
-                .record_result(
-                    &provider.id,
-                    app_type_str,
-                    used_half_open_permit,
-                    false,
-                    Some(retry_err.to_string()),
-                )
-                .await;
+            if rate_limited || category == ErrorCategory::ProviderIncompatible {
+                self.router
+                    .release_permit_neutral(
+                        &provider.id,
+                        app_type_str,
+                        used_half_open_permit,
+                    )
+                    .await;
+            } else {
+                let _ = self
+                    .router
+                    .record_result(
+                        &provider.id,
+                        app_type_str,
+                        used_half_open_permit,
+                        false,
+                        Some(retry_err.to_string()),
+                    )
+                    .await;
+            }
             {
                 let mut status = self.status.write().await;
                 status.last_error = Some(format!(
@@ -453,6 +641,7 @@ impl RequestForwarder {
                     provider.name, retry_err
                 ));
             }
+            self.release_session_affinity(&provider.id).await;
             *last_error = Some(retry_err);
             *last_provider = Some(provider.clone());
             return None;
@@ -471,6 +660,7 @@ impl RequestForwarder {
         Some(ForwardError {
             error: retry_err,
             provider: Some(provider.clone()),
+            outbound_reasoning_effort: None,
         })
     }
 
@@ -551,18 +741,89 @@ impl RequestForwarder {
             return Err(ForwardError {
                 error: ProxyError::NoAvailableProvider,
                 provider: None,
+                outbound_reasoning_effort: None,
             });
         }
 
         let mut last_error = None;
         let mut last_provider = None;
+        let mut last_outbound_reasoning_effort = None;
         let mut attempted_providers = 0usize;
+        let route_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // 会话亲和：命中绑定的 provider 提到最前。只重排尝试顺序，
+        // `providers` 本身（配置顺序）仍是首选与故障转移链的权威定义；
+        // affinity_preferred 同时传给成功路径，避免把亲和命中记成一次故障转移。
+        let affinity_preferred = self.session_affinity_preference(&providers).await;
+        let mut ordered_providers = Self::order_providers(&providers, affinity_preferred.as_deref());
 
-        // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
-        let bypass_circuit_breaker = providers.len() == 1;
+        // Backpressure only queues when every schedulable candidate is currently at capacity.
+        // Open circuits are not immediate capacity: counting one
+        // would make a saturated healthy fallback get skipped instead of queued.
+        let mut queue_candidate = None;
+        let mut has_immediate_capacity = false;
+        for provider in &ordered_providers {
+            if !self
+                .router
+                .provider_available_for_scheduling(provider, app_type_str, &route_model)
+                .await
+            {
+                continue;
+            }
+            if self.router.provider_capacity_available(provider) {
+                has_immediate_capacity = true;
+                break;
+            }
+            if queue_candidate.is_none() && provider.gateway_max_concurrent_requests() > 0 {
+                queue_candidate = Some(*provider);
+            }
+        }
+
+        let mut reserved_capacity: Option<(String, Option<ProviderCapacityPermit>)> = None;
+        if !has_immediate_capacity {
+            if let Some(provider) = queue_candidate {
+                match self.router.wait_acquire_provider_capacity(provider).await {
+                    Ok(permit) => {
+                        reserved_capacity = Some((provider.id.clone(), permit));
+                        if let Some(index) = ordered_providers
+                            .iter()
+                            .position(|candidate| candidate.id == provider.id)
+                        {
+                            ordered_providers.rotate_left(index);
+                        }
+                    }
+                    Err(CapacityAcquireError::QueueFull) => {
+                        self.trace.skip(provider, "等待队列已满");
+                        return Err(ForwardError {
+                            error: ProxyError::GatewayOverloaded(format!(
+                                "Provider {} 的等待队列已满",
+                                provider.name
+                            )),
+                            provider: Some((*provider).clone()),
+                            outbound_reasoning_effort: None,
+                        });
+                    }
+                    Err(CapacityAcquireError::Timeout) => {
+                        self.trace.skip(provider, "等待并发名额超时");
+                        return Err(ForwardError {
+                            error: ProxyError::GatewayOverloaded(format!(
+                                "等待 Provider {} 并发名额超时",
+                                provider.name
+                            )),
+                            provider: Some((*provider).clone()),
+                            outbound_reasoning_effort: None,
+                        });
+                    }
+                    Err(CapacityAcquireError::Full) => unreachable!("wait acquisition never returns Full"),
+                }
+            }
+        }
 
         // 依次尝试每个供应商
-        for provider in providers.iter() {
+        'candidates: for provider in ordered_providers {
             // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
             // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
             let mut rectifier_retried = false;
@@ -577,22 +838,63 @@ impl RequestForwarder {
                     attempted_providers,
                     self.max_attempts
                 );
-                break;
+                self.trace.skip(provider, "达到最大尝试次数");
+                continue;
             }
 
-            // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
-            // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
-            let (allowed, used_half_open_permit) = if bypass_circuit_breaker {
-                (true, false)
+            // 429 / 配额冷却与熔断器是两个维度。始终尊重上游明确要求的
+            // Retry-After，避免形成紧密重试环。
+            if self
+                .router
+                .is_provider_cooled_down(
+                    provider.gateway_source_provider_id(),
+                    app_type_str,
+                    &route_model,
+                )
+                .await
+            {
+                log::debug!(
+                    "[{app_type_str}] Provider {} is temporarily rate-limit cooled down; skipping",
+                    provider.id
+                );
+                self.trace.skip(provider, "供应商处于限流、配额或兼容性冷却期");
+                continue;
+            }
+
+
+            let capacity_permit = if reserved_capacity
+                .as_ref()
+                .is_some_and(|(provider_id, _)| provider_id == &provider.id)
+            {
+                reserved_capacity.take().and_then(|(_, permit)| permit)
             } else {
-                let permit = self
-                    .router
-                    .allow_provider_request(&provider.id, app_type_str)
-                    .await;
-                (permit.allowed, permit.used_half_open_permit)
+                match self.router.try_acquire_provider_capacity(provider) {
+                    Ok(permit) => permit,
+                    Err(CapacityAcquireError::Full) => {
+                        log::debug!(
+                            "[{app_type_str}] Provider {} reached max concurrency; trying next target",
+                            provider.id
+                        );
+                        self.trace.skip(provider, "并发名额已满");
+                        continue;
+                    }
+                    Err(CapacityAcquireError::QueueFull | CapacityAcquireError::Timeout) => {
+                        unreachable!("non-blocking capacity acquisition only returns Full")
+                    }
+                }
             };
 
+            // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）。
+            // 单候选也必须经过熔断器，否则持续故障时网关会无限敲击上游。
+            let permit = self
+                .router
+                .allow_provider_request(provider, app_type_str, &route_model)
+                .await;
+            let (allowed, used_half_open_permit) =
+                (permit.allowed, permit.used_half_open_permit);
+
             if !allowed {
+                self.trace.skip(provider, "熔断器未放行");
                 continue;
             }
 
@@ -612,15 +914,27 @@ impl RequestForwarder {
                     body.clone()
                 };
 
+            let used_fallback = Self::route_used_fallback(
+                &providers, &provider.id, affinity_preferred.as_deref(),
+            ) || self.trace.snapshot().attempts.iter().any(|a| a.provider_id != provider.id);
+            if used_fallback && self.trace.mark_fallback() {
+                self.status.write().await.failover_count += 1;
+            }
             attempted_providers += 1;
 
             // 将该客户端请求绑定到实际正在尝试的 Provider。若后续发生故障转移，
             // guard 会把计数迁移到下一家；成功后计数持续到响应流真正结束。
             connection_guard
-                .switch_provider(app_type_str, &provider.id, &provider.name)
+                .switch_provider(
+                    app_type_str,
+                    &provider.id,
+                    &provider.name,
+                    capacity_permit,
+                )
                 .await;
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
+            let mut attempt_reasoning_effort = None;
             match self
                 .forward(
                     app_type,
@@ -628,9 +942,11 @@ impl RequestForwarder {
                     provider,
                     endpoint,
                     &provider_body,
+                    &route_model,
                     &headers,
                     &extensions,
                     adapter.as_ref(),
+                    &mut attempt_reasoning_effort,
                 )
                 .await
             {
@@ -640,182 +956,78 @@ impl RequestForwarder {
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
                         .await;
 
-                    self.update_success_state(provider, &providers, app_type_str)
-                        .await;
+                    self.update_success_state(
+                        provider,
+                        &providers,
+                        app_type_str,
+                        affinity_preferred.as_deref(),
+                    )
+                    .await;
 
                     return Ok(ForwardResult {
                         response,
                         provider: provider.clone(),
                         claude_api_format,
                         outbound_model,
+                        outbound_reasoning_effort: attempt_reasoning_effort,
                         connection_guard: None,
                     });
                 }
                 Err(e) => {
+                    last_outbound_reasoning_effort = attempt_reasoning_effort.clone();
                     // 检测是否需要触发整流器（仅 Claude/ClaudeAuth 供应商）
                     let provider_type = ProviderType::from_app_type_and_config(app_type, provider);
                     let is_anthropic_provider = matches!(
                         provider_type,
                         ProviderType::Claude | ProviderType::ClaudeAuth
                     );
-                    let mut signature_rectifier_non_retryable_client_error = false;
+                    'rectifiers: {
 
-                    if self.media_retry_should_trigger(
-                        adapter.name(),
-                        media_rectifier_retried,
-                        &provider_body,
-                        &e,
-                    ) {
-                        let mut media_body = provider_body.clone();
-                        let replaced_images =
-                            super::media_sanitizer::replace_image_blocks_with_marker(
-                                &mut media_body,
-                            );
-
-                        if replaced_images > 0 {
-                            let _ = std::mem::replace(&mut media_rectifier_retried, true);
-                            let model = media_body
-                                .get("model")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            log::info!(
-                                "[{app_type_str}] [Media] Upstream rejected image input; retrying provider={} model={} with {replaced_images} image block(s) replaced by {}",
-                                provider.id,
-                                model,
-                                super::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
-                            );
-
-                            match self
-                                .forward(
-                                    app_type,
-                                    &method,
-                                    provider,
-                                    endpoint,
-                                    &media_body,
-                                    &headers,
-                                    &extensions,
-                                    adapter.as_ref(),
-                                )
-                                .await
-                            {
-                                Ok((response, claude_api_format, outbound_model)) => {
-                                    log::info!(
-                                        "[{app_type_str}] [Media] Unsupported-image retry succeeded"
-                                    );
-                                    self.record_success_result(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
-
-                                    self.update_success_state(
-                                        provider,
-                                        &providers,
-                                        app_type_str,
-                                    )
-                                    .await;
-
-                                    return Ok(ForwardResult {
-                                        response,
-                                        provider: provider.clone(),
-                                        claude_api_format,
-                                        outbound_model,
-                                        connection_guard: None,
-                                    });
-                                }
-                                Err(retry_err) => {
-                                    log::warn!(
-                                        "[{app_type_str}] [Media] Unsupported-image retry still failed: {retry_err}"
-                                    );
-                                    if let Some(err) = self
-                                        .handle_rectifier_retry_failure(
-                                            retry_err,
-                                            provider,
-                                            app_type_str,
-                                            used_half_open_permit,
-                                            "media 降级",
-                                            &mut last_error,
-                                            &mut last_provider,
-                                        )
-                                        .await
-                                    {
-                                        return Err(err);
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-
-                    if is_anthropic_provider {
-                        let error_message = extract_error_message(&e);
-                        if should_rectify_thinking_signature(
-                            error_message.as_deref(),
-                            &self.rectifier_config,
+                        if self.media_retry_should_trigger(
+                            adapter.name(),
+                            media_rectifier_retried,
+                            &provider_body,
+                            &e,
                         ) {
-                            // 已经重试过：直接返回错误（不可重试客户端错误）
-                            if rectifier_retried {
-                                log::warn!("[{app_type_str}] [RECT-005] 整流器已触发过，不再重试");
-                                // 释放 HalfOpen permit（不记录熔断器，这是客户端兼容性问题）
-                                self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
-                                let mut status = self.status.write().await;
-                                status.failed_requests += 1;
-                                status.last_error = Some(e.to_string());
-                                if status.total_requests > 0 {
-                                    status.success_rate = (status.success_requests as f32
-                                        / status.total_requests as f32)
-                                        * 100.0;
-                                }
-                                return Err(ForwardError {
-                                    error: e,
-                                    provider: Some(provider.clone()),
-                                });
-                            }
-
-                            // 首次触发：整流请求体
-                            let rectified = rectify_anthropic_request(&mut provider_body);
-
-                            // 整流未生效：继续尝试 budget 整流路径，避免误判后短路
-                            if !rectified.applied {
-                                log::warn!(
-                                    "[{app_type_str}] [RECT-006] thinking 签名整流器触发但无可整流内容，继续检查 budget；若 budget 也未命中则按客户端错误返回"
+                            let mut media_body = provider_body.clone();
+                            let replaced_images =
+                                super::media_sanitizer::replace_image_blocks_with_marker(
+                                    &mut media_body,
                                 );
-                                signature_rectifier_non_retryable_client_error = true;
-                            } else {
+
+                            if replaced_images > 0 {
+                                let _ = std::mem::replace(&mut media_rectifier_retried, true);
+                                let model = media_body
+                                    .get("model")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
                                 log::info!(
-                                    "[{}] [RECT-001] thinking 签名整流器触发, 移除 {} thinking blocks, {} redacted_thinking blocks, {} signature fields",
-                                    app_type_str,
-                                    rectified.removed_thinking_blocks,
-                                    rectified.removed_redacted_thinking_blocks,
-                                    rectified.removed_signature_fields
+                                    "[{app_type_str}] [Media] Upstream rejected image input; retrying provider={} model={} with {replaced_images} image block(s) replaced by {}",
+                                    provider.id,
+                                    model,
+                                    super::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
                                 );
 
-                                // 标记已重试（当前逻辑下重试后必定 return，保留标记以备将来扩展）
-                                let _ = std::mem::replace(&mut rectifier_retried, true);
-
-                                // 使用同一供应商重试（不计入熔断器）
+                                attempt_reasoning_effort = None;
                                 match self
                                     .forward(
                                         app_type,
                                         &method,
                                         provider,
                                         endpoint,
-                                        &provider_body,
+                                        &media_body,
+                                        &route_model,
                                         &headers,
                                         &extensions,
                                         adapter.as_ref(),
+                                        &mut attempt_reasoning_effort,
                                     )
                                     .await
                                 {
                                     Ok((response, claude_api_format, outbound_model)) => {
-                                        log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
+                                        log::info!(
+                                            "[{app_type_str}] [Media] Unsupported-image retry succeeded"
+                                        );
                                         self.record_success_result(
                                             &provider.id,
                                             app_type_str,
@@ -827,6 +1039,7 @@ impl RequestForwarder {
                                             provider,
                                             &providers,
                                             app_type_str,
+                                            affinity_preferred.as_deref(),
                                         )
                                         .await;
 
@@ -835,204 +1048,307 @@ impl RequestForwarder {
                                             provider: provider.clone(),
                                             claude_api_format,
                                             outbound_model,
+                                            outbound_reasoning_effort: attempt_reasoning_effort,
                                             connection_guard: None,
                                         });
                                     }
                                     Err(retry_err) => {
+                                        last_outbound_reasoning_effort =
+                                            attempt_reasoning_effort.clone();
                                         log::warn!(
-                                            "[{app_type_str}] [RECT-003] 整流重试仍失败: {retry_err}"
+                                            "[{app_type_str}] [Media] Unsupported-image retry still failed: {retry_err}"
                                         );
-                                        if let Some(err) = self
+                                        if let Some(mut err) = self
                                             .handle_rectifier_retry_failure(
                                                 retry_err,
                                                 provider,
                                                 app_type_str,
                                                 used_half_open_permit,
-                                                "整流",
+                                                "media 降级",
                                                 &mut last_error,
                                                 &mut last_provider,
                                             )
                                             .await
                                         {
+                                            err.outbound_reasoning_effort =
+                                                attempt_reasoning_effort.clone();
                                             return Err(err);
                                         }
-                                        continue;
+                                        continue 'candidates;
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // 检测是否需要触发 budget 整流器（仅 Claude/ClaudeAuth 供应商）
-                    if is_anthropic_provider {
-                        let error_message = extract_error_message(&e);
-                        if should_rectify_thinking_budget(
-                            error_message.as_deref(),
-                            &self.rectifier_config,
-                        ) {
-                            // 已经重试过：直接返回错误（不可重试客户端错误）
-                            if budget_rectifier_retried {
-                                log::warn!(
-                                    "[{app_type_str}] [RECT-013] budget 整流器已触发过，不再重试"
-                                );
-                                self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
-                                let mut status = self.status.write().await;
-                                status.failed_requests += 1;
-                                status.last_error = Some(e.to_string());
-                                if status.total_requests > 0 {
-                                    status.success_rate = (status.success_requests as f32
-                                        / status.total_requests as f32)
-                                        * 100.0;
+                        if is_anthropic_provider {
+                            let error_message = extract_error_message(&e);
+                            if should_rectify_thinking_signature(
+                                error_message.as_deref(),
+                                &self.rectifier_config,
+                            ) {
+                                // 本请求已尝试过整流：继续下一个候选，不终止故障转移
+                                if rectifier_retried {
+                                    break 'rectifiers;
                                 }
-                                return Err(ForwardError {
-                                    error: e,
-                                    provider: Some(provider.clone()),
-                                });
-                            }
 
-                            let budget_rectified = rectify_thinking_budget(&mut provider_body);
-                            if !budget_rectified.applied {
-                                log::warn!(
-                                    "[{app_type_str}] [RECT-014] budget 整流器触发但无可整流内容，不做无意义重试"
-                                );
-                                self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
-                                let mut status = self.status.write().await;
-                                status.failed_requests += 1;
-                                status.last_error = Some(e.to_string());
-                                if status.total_requests > 0 {
-                                    status.success_rate = (status.success_requests as f32
-                                        / status.total_requests as f32)
-                                        * 100.0;
-                                }
-                                return Err(ForwardError {
-                                    error: e,
-                                    provider: Some(provider.clone()),
-                                });
-                            }
+                                // 首次触发：整流请求体
+                                let rectified = rectify_anthropic_request(&mut provider_body);
 
-                            log::info!(
-                                "[{}] [RECT-010] thinking budget 整流器触发, before={:?}, after={:?}",
-                                app_type_str,
-                                budget_rectified.before,
-                                budget_rectified.after
-                            );
-
-                            let _ = std::mem::replace(&mut budget_rectifier_retried, true);
-
-                            // 使用同一供应商重试（不计入熔断器）
-                            match self
-                                .forward(
-                                    app_type,
-                                    &method,
-                                    provider,
-                                    endpoint,
-                                    &provider_body,
-                                    &headers,
-                                    &extensions,
-                                    adapter.as_ref(),
-                                )
-                                .await
-                            {
-                                Ok((response, claude_api_format, outbound_model)) => {
-                                    log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
-                                    self.record_success_result(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
-
-                                    self.update_success_state(
-                                        provider,
-                                        &providers,
-                                        app_type_str,
-                                    )
-                                    .await;
-
-                                    return Ok(ForwardResult {
-                                        response,
-                                        provider: provider.clone(),
-                                        claude_api_format,
-                                        outbound_model,
-                                        connection_guard: None,
-                                    });
-                                }
-                                Err(retry_err) => {
+                                // 整流未生效：继续尝试 budget 整流路径，避免误判后短路
+                                if !rectified.applied {
                                     log::warn!(
-                                        "[{app_type_str}] [RECT-012] budget 整流重试仍失败: {retry_err}"
+                                        "[{app_type_str}] [RECT-006] thinking 签名整流器触发但无可整流内容，继续检查 budget；若 budget 也未命中则继续其他上游"
                                     );
-                                    if let Some(err) = self
-                                        .handle_rectifier_retry_failure(
-                                            retry_err,
+
+                                } else {
+                                    log::info!(
+                                        "[{}] [RECT-001] thinking 签名整流器触发, 移除 {} thinking blocks, {} redacted_thinking blocks, {} signature fields",
+                                        app_type_str,
+                                        rectified.removed_thinking_blocks,
+                                        rectified.removed_redacted_thinking_blocks,
+                                        rectified.removed_signature_fields
+                                    );
+
+                                    // 标记已重试（当前逻辑下重试后必定 return，保留标记以备将来扩展）
+                                    let _ = std::mem::replace(&mut rectifier_retried, true);
+
+                                    // 使用同一供应商重试（不计入熔断器）
+                                    attempt_reasoning_effort = None;
+                                    match self
+                                        .forward(
+                                            app_type,
+                                            &method,
                                             provider,
-                                            app_type_str,
-                                            used_half_open_permit,
-                                            "budget 整流",
-                                            &mut last_error,
-                                            &mut last_provider,
+                                            endpoint,
+                                            &provider_body,
+                                            &route_model,
+                                            &headers,
+                                            &extensions,
+                                            adapter.as_ref(),
+                                            &mut attempt_reasoning_effort,
                                         )
                                         .await
                                     {
-                                        return Err(err);
+                                        Ok((response, claude_api_format, outbound_model)) => {
+                                            log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
+                                            self.record_success_result(
+                                                &provider.id,
+                                                app_type_str,
+                                                used_half_open_permit,
+                                            )
+                                            .await;
+
+                                            self.update_success_state(
+                                                provider,
+                                                &providers,
+                                                app_type_str,
+                                                affinity_preferred.as_deref(),
+                                            )
+                                            .await;
+
+                                            return Ok(ForwardResult {
+                                                response,
+                                                provider: provider.clone(),
+                                                claude_api_format,
+                                                outbound_model,
+                                                outbound_reasoning_effort: attempt_reasoning_effort,
+                                                connection_guard: None,
+                                            });
+                                        }
+                                        Err(retry_err) => {
+                                            last_outbound_reasoning_effort =
+                                                attempt_reasoning_effort.clone();
+                                            log::warn!(
+                                                "[{app_type_str}] [RECT-003] 整流重试仍失败: {retry_err}"
+                                            );
+                                            if let Some(mut err) = self
+                                                .handle_rectifier_retry_failure(
+                                                    retry_err,
+                                                    provider,
+                                                    app_type_str,
+                                                    used_half_open_permit,
+                                                    "整流",
+                                                    &mut last_error,
+                                                    &mut last_provider,
+                                                )
+                                                .await
+                                            {
+                                                err.outbound_reasoning_effort =
+                                                    attempt_reasoning_effort.clone();
+                                                return Err(err);
+                                            }
+                                            continue 'candidates;
+                                        }
                                     }
-                                    continue;
                                 }
                             }
                         }
-                    }
 
-                    if signature_rectifier_non_retryable_client_error {
-                        self.router
-                            .release_permit_neutral(
-                                &provider.id,
-                                app_type_str,
-                                used_half_open_permit,
-                            )
-                            .await;
-                        let mut status = self.status.write().await;
-                        status.failed_requests += 1;
-                        status.last_error = Some(e.to_string());
-                        if status.total_requests > 0 {
-                            status.success_rate = (status.success_requests as f32
-                                / status.total_requests as f32)
-                                * 100.0;
+                        // 检测是否需要触发 budget 整流器（仅 Claude/ClaudeAuth 供应商）
+                        if is_anthropic_provider {
+                            let error_message = extract_error_message(&e);
+                            if should_rectify_thinking_budget(
+                                error_message.as_deref(),
+                                &self.rectifier_config,
+                            ) {
+                                // 本请求已尝试过整流：继续下一个候选，不终止故障转移
+                                if budget_rectifier_retried {
+                                    break 'rectifiers;
+                                }
+
+                                let budget_rectified = rectify_thinking_budget(&mut provider_body);
+                                if !budget_rectified.applied {
+                                    break 'rectifiers;
+                                }
+
+                                log::info!(
+                                    "[{}] [RECT-010] thinking budget 整流器触发, before={:?}, after={:?}",
+                                    app_type_str,
+                                    budget_rectified.before,
+                                    budget_rectified.after
+                                );
+
+                                let _ = std::mem::replace(&mut budget_rectifier_retried, true);
+
+                                // 使用同一供应商重试（不计入熔断器）
+                                attempt_reasoning_effort = None;
+                                match self
+                                    .forward(
+                                        app_type,
+                                        &method,
+                                        provider,
+                                        endpoint,
+                                        &provider_body,
+                                        &route_model,
+                                        &headers,
+                                        &extensions,
+                                        adapter.as_ref(),
+                                        &mut attempt_reasoning_effort,
+                                    )
+                                    .await
+                                {
+                                    Ok((response, claude_api_format, outbound_model)) => {
+                                        log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
+                                        self.record_success_result(
+                                            &provider.id,
+                                            app_type_str,
+                                            used_half_open_permit,
+                                        )
+                                        .await;
+
+                                        self.update_success_state(
+                                            provider,
+                                            &providers,
+                                            app_type_str,
+                                            affinity_preferred.as_deref(),
+                                        )
+                                        .await;
+
+                                        return Ok(ForwardResult {
+                                            response,
+                                            provider: provider.clone(),
+                                            claude_api_format,
+                                            outbound_model,
+                                            outbound_reasoning_effort: attempt_reasoning_effort,
+                                            connection_guard: None,
+                                        });
+                                    }
+                                    Err(retry_err) => {
+                                        last_outbound_reasoning_effort =
+                                            attempt_reasoning_effort.clone();
+                                        log::warn!(
+                                            "[{app_type_str}] [RECT-012] budget 整流重试仍失败: {retry_err}"
+                                        );
+                                        if let Some(mut err) = self
+                                            .handle_rectifier_retry_failure(
+                                                retry_err,
+                                                provider,
+                                                app_type_str,
+                                                used_half_open_permit,
+                                                "budget 整流",
+                                                &mut last_error,
+                                                &mut last_provider,
+                                            )
+                                            .await
+                                        {
+                                            err.outbound_reasoning_effort =
+                                                attempt_reasoning_effort.clone();
+                                            return Err(err);
+                                        }
+                                        continue 'candidates;
+                                    }
+                                }
+                            }
                         }
-                        return Err(ForwardError {
-                            error: e,
-                            provider: Some(provider.clone()),
-                        });
-                    }
 
-                    // 先分类错误，决定是否计入 provider 健康度
-                    // —— NonRetryable / ClientAbort 是客户端层错误，无论换哪家 provider 都会被拒绝，
-                    //    不应污染熔断器和数据库健康度（与 release_permit_neutral 同语义）。
+                    } // rectifiers: failed preparation falls through to candidate classification.
+
                     let category = self.categorize_proxy_error(&e, provider);
 
                     match category {
-                        ErrorCategory::Retryable => {
-                            // 可重试：真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度
-                            let _ = self
-                                .router
-                                .record_result(
-                                    &provider.id,
-                                    app_type_str,
-                                    used_half_open_permit,
-                                    false,
-                                    Some(e.to_string()),
-                                )
-                                .await;
+                        ErrorCategory::Retryable | ErrorCategory::ProviderIncompatible => {
+                            let rate_limited = matches!(
+                                &e,
+                                ProxyError::UpstreamError { status: 429, .. }
+                            );
+                            let credential_limited = matches!(
+                                &e,
+                                ProxyError::UpstreamError {
+                                    status: 401 | 402 | 403,
+                                    ..
+                                }
+                            );
+                            if rate_limited
+                                || credential_limited
+                                || category == ErrorCategory::ProviderIncompatible
+                            {
+                                // Quota/auth/model availability is tracked as a cooldown,
+                                // independently from transport health and the circuit breaker.
+                                self.router
+                                    .release_permit_neutral(
+                                        &provider.id,
+                                        app_type_str,
+                                        used_half_open_permit,
+                                    )
+                                    .await;
+                                if credential_limited {
+                                    self.router
+                                        .cooldown_provider(
+                                            provider.gateway_source_provider_id(),
+                                            app_type_str,
+                                            "",
+                                            Duration::from_secs(30 * 60),
+                                        )
+                                        .await;
+                                }
+                                if category == ErrorCategory::ProviderIncompatible
+                                    && (matches!(
+                                        &e,
+                                        ProxyError::UpstreamError { status: 404, .. }
+                                    ) || super::upstream_error::is_model_support_rejection(&e))
+                                {
+                                    self.router
+                                        .cooldown_provider(
+                                            provider.gateway_source_provider_id(),
+                                            app_type_str,
+                                            &route_model,
+                                            Duration::from_secs(12 * 60 * 60),
+                                        )
+                                        .await;
+                                }
+                            } else {
+                                // 真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度。
+                                let _ = self
+                                    .router
+                                    .record_result(
+                                        &provider.id,
+                                        app_type_str,
+                                        used_half_open_permit,
+                                        false,
+                                        Some(e.to_string()),
+                                    )
+                                    .await;
+                            }
 
                             {
                                 let mut status = self.status.write().await;
@@ -1047,6 +1363,12 @@ impl RequestForwarder {
                                 &e,
                             );
                             log::warn!("[{app_type_str}] [{log_code}] {log_message}");
+
+                            // 会话亲和：当前候选已经发生服务故障或被证明不兼容，
+                            // 解除绑定，避免后续同类请求继续被粘回它。
+                            // 上面的 NonRetryable 分支是客户端层错误，不走到这里，
+                            // 所以「请求级错误不打断亲和」是自然成立的。
+                            self.release_session_affinity(&provider.id).await;
 
                             last_error = Some(e);
                             last_provider = Some(provider.clone());
@@ -1083,6 +1405,7 @@ impl RequestForwarder {
                             return Err(ForwardError {
                                 error: e,
                                 provider: Some(provider.clone()),
+                                outbound_reasoning_effort: attempt_reasoning_effort.clone(),
                             });
                         }
                     }
@@ -1091,11 +1414,11 @@ impl RequestForwarder {
         }
 
         if attempted_providers == 0 {
-            // providers 列表非空，但全部被熔断器拒绝（典型：HalfOpen 探测名额被占用）
+            // providers 列表非空，但全部被熔断器或限流冷却拒绝。
             {
                 let mut status = self.status.write().await;
                 status.failed_requests += 1;
-                status.last_error = Some("所有供应商暂时不可用（熔断器限制）".to_string());
+                status.last_error = Some("所有供应商暂时不可用（熔断器/限流冷却）".to_string());
                 if status.total_requests > 0 {
                     status.success_rate =
                         (status.success_requests as f32 / status.total_requests as f32) * 100.0;
@@ -1104,6 +1427,7 @@ impl RequestForwarder {
             return Err(ForwardError {
                 error: ProxyError::NoAvailableProvider,
                 provider: None,
+                outbound_reasoning_effort: None,
             });
         }
 
@@ -1127,6 +1451,7 @@ impl RequestForwarder {
         Err(ForwardError {
             error: last_error.unwrap_or(ProxyError::MaxRetriesExceeded),
             provider: last_provider,
+            outbound_reasoning_effort: last_outbound_reasoning_effort,
         })
     }
 
@@ -1142,10 +1467,66 @@ impl RequestForwarder {
         provider: &Provider,
         endpoint: &str,
         body: &Value,
+        route_model: &str,
         headers: &axum::http::HeaderMap,
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
+        outbound_reasoning_effort: &mut Option<String>,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        let started = std::time::Instant::now();
+        self.trace.reset_http_status();
+        let mut reasoning_note = None;
+        let result = self.forward_inner(
+            app_type, method, provider, endpoint, body, route_model, headers,
+            extensions, adapter, outbound_reasoning_effort, &mut reasoning_note,
+        ).await;
+        let (status_code, error) = match &result {
+            Ok((r, _, _)) => (Some(r.status().as_u16()), None),
+            Err(e) => (
+                self.trace.http_status().or_else(|| match e {
+                    ProxyError::UpstreamError { status, .. } => Some(*status),
+                    _ => None,
+                }),
+                Some(e.to_string()),
+            ),
+        };
+        let index = self.trace.attempt(super::request_trace::Attempt {
+            provider_id: provider.id.clone(), provider_name: provider.name.clone(),
+            outcome: if result.is_ok() { "pending" } else { "failed" }.into(),
+            status_code, error, duration_ms: started.elapsed().as_millis() as u64,
+            sent_reasoning: outbound_reasoning_effort.clone(), reasoning_note, ..Default::default()
+        });
+        if result.as_ref().is_err_and(|e| !matches!(e, ProxyError::InvalidRequest(_) | ProxyError::ConfigError(_) | ProxyError::TransformError(_))) {
+            self.status.write().await.upstream_failed_attempts += 1;
+        }
+        result.map(|(response, format, model)| (self.trace.observe(response, index, started), format, model))
+    }
+
+    async fn forward_inner(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        body: &Value,
+        route_model: &str,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+        outbound_reasoning_effort: &mut Option<String>,
+        reasoning_note: &mut Option<String>,
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        let original_body = body;
+        // Each attempt starts from the immutable ingress payload. Only cross-protocol
+        // candidates enter the bridge; native Chat keeps tools, history and extensions.
+        let plan = if matches!(app_type, AppType::Codex) {
+            Some(super::request_plan::OpenAiRequestPlan::for_provider(endpoint, body, provider)?)
+        } else {
+            None
+        };
+        let endpoint = plan.as_ref().map_or(endpoint, |plan| plan.endpoint.as_str());
+        let body = plan.as_ref().map_or(body, |plan| &plan.body);
+        let native_chat = plan.as_ref().is_some_and(|plan| plan.native_chat);
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
 
@@ -1190,7 +1571,16 @@ impl RequestForwarder {
         };
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
-        let mut mapped_body = normalize_thinking_type(mapped_body);
+        let mut mapped_body = if native_chat { mapped_body } else { normalize_thinking_type(mapped_body) };
+        if native_chat {
+            super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            super::providers::transform_codex_chat::sanitize_native_chat_reasoning_history(
+                &mut mapped_body,
+            );
+            if let Some(config) = provider.meta.as_ref().and_then(|meta| meta.codex_chat_reasoning.as_ref()) {
+                super::providers::transform_codex_chat::apply_native_chat_reasoning(&mut mapped_body, config);
+            }
+        }
 
         if is_copilot {
             mapped_body =
@@ -1390,7 +1780,7 @@ impl RequestForwarder {
         };
 
         let codex_chat_base_is_full_endpoint =
-            codex_responses_to_chat && base_url_is_full_endpoint(&base_url, "/chat/completions");
+            (codex_responses_to_chat || native_chat) && base_url_is_full_endpoint(&base_url, "/chat/completions");
 
         // Defensive fallback mirroring `codex_chat_base_is_full_endpoint`: if a user pastes
         // a base URL already ending in the Anthropic `/v1/messages` endpoint but leaves the
@@ -1539,6 +1929,12 @@ impl RequestForwarder {
             self.apply_media_prevention(&mut request_body, provider);
         }
 
+        if (native_chat || codex_responses_to_chat || resolved_claude_api_format.as_deref() == Some("openai_chat"))
+            && provider.meta.as_ref().is_some_and(|meta| meta.chat_schema_required_defaults)
+        {
+            super::request_plan::default_chat_tool_required_arrays(&mut request_body);
+        }
+
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游
         // 默认使用空白名单，过滤所有 _ 前缀字段
         let mut filtered_body = prepare_upstream_request_body(request_body);
@@ -1553,6 +1949,41 @@ impl RequestForwarder {
                 }
             }
         }
+        let target_format = if native_chat || codex_responses_to_chat {
+            "openai_chat"
+        } else if codex_responses_to_anthropic {
+            "anthropic"
+        } else if let Some(format) = resolved_claude_api_format.as_deref() {
+            format
+        } else if matches!(app_type, AppType::Codex) {
+            "openai_responses"
+        } else if adapter.name() == "Claude" {
+            "anthropic"
+        } else {
+            "gemini_native"
+        };
+        let source_format = if matches!(app_type, AppType::Codex) { "openai_responses" }
+            else if adapter.name() == "Claude" { "anthropic" } else { "gemini_native" };
+        let reasoning_overridden = !is_copilot && provider.meta.as_ref()
+            .and_then(|m| m.local_proxy_request_overrides.as_ref())
+            .and_then(|o| o.body.as_ref())
+            .is_some_and(|o| ["reasoning", "reasoning_effort", "thinking", "output_config", "generationConfig", "generation_config", "enable_thinking"].iter().any(|key| o.get(key).is_some()));
+        // Gemini carries its model in the URL; supply it only for validation.
+        let policy_model_only = filtered_body.get("model").is_none();
+        if policy_model_only {
+            filtered_body["model"] = serde_json::json!(outbound_model.as_deref().unwrap_or(route_model));
+        }
+        let reasoning_result = super::reasoning_policy::apply(&mut filtered_body, original_body, provider, source_format, target_format, reasoning_overridden);
+        if policy_model_only {
+            if let Some(object) = filtered_body.as_object_mut() { object.remove("model"); }
+        }
+        match reasoning_result {
+            Ok(note) => *reasoning_note = Some(note),
+            Err(error) => {
+                *reasoning_note = Some(format!("本地能力校验拒绝，未发送上游：{error}"));
+                return Err(error);
+            }
+        }
         // 出站 body 定稿后刷新真值（覆盖 Codex chat 上游模型覆写、转换层模型改写）
         if let Some(m) = filtered_body
             .get("model")
@@ -1560,6 +1991,26 @@ impl RequestForwarder {
             .filter(|m| !m.is_empty())
         {
             outbound_model = Some(m.to_string());
+        }
+        *outbound_reasoning_effort = extract_outbound_reasoning(&filtered_body);
+        let request_is_streaming =
+            is_streaming_request(&effective_endpoint, &filtered_body, headers);
+        // 请求体录制（诊断）：发出前记录最终请求体（已完成协议转换/模型映射/私有字段过滤）。
+        // 命中录制范围时生成 trace id，与后续响应/错误记录配对。
+        let body_trace_id = super::body_recorder::request_trace_id(provider, outbound_model.as_deref());
+        if let Some(trace_id) = &body_trace_id {
+            super::body_recorder::record_request(
+                provider,
+                trace_id,
+                &effective_endpoint,
+                outbound_model.as_deref().unwrap_or(""),
+                filtered_body
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or(""),
+                &filtered_body,
+                request_is_streaming,
+            );
         }
         log_prompt_cache_trace(
             app_type,
@@ -1569,8 +2020,6 @@ impl RequestForwarder {
             &filtered_body,
             self.session_client_provided,
         );
-        let request_is_streaming =
-            is_streaming_request(&effective_endpoint, &filtered_body, headers);
         let force_identity_encoding = needs_transform
             || codex_responses_to_chat
             || codex_responses_to_anthropic
@@ -2190,28 +2639,75 @@ impl RequestForwarder {
 
         // 检查响应状态
         let status = response.status();
+        self.trace.set_http_status(status.as_u16());
 
         if status.is_success() {
+            // 响应体录制：命中录制范围时，在成功出口把响应包装成 tee 流，
+            // 字节原样透传客户端的同时旁路收集副本，流结束后异步落盘。
+            // 非流式（Buffered/整包读取）响应直接记录整包；流式响应经 tee。
+            let response = if body_trace_id.is_some() {
+                Self::record_success_response_before_return(
+                    response,
+                    provider,
+                    body_trace_id.as_deref().unwrap_or(""),
+                    outbound_model.as_deref().unwrap_or(""),
+                )
+                .await?
+            } else {
+                response
+            };
             let mut response = self
                 .prepare_success_response_for_failover(response, request_is_streaming)
                 .await?;
-            // Streaming requests normally return SSE. If a compatible gateway
-            // explicitly returns JSON instead, buffer and validate it inside the retry
-            // loop as well so a 2xx Anthropic error envelope can still fail over. Do
-            // not buffer unknown content types: some gateways omit the SSE header.
-            if codex_responses_to_anthropic && (!request_is_streaming || response.is_json()) {
-                response = self
-                    .validate_codex_anthropic_success_response(response)
-                    .await?;
-            } else if matches!(
-                resolved_claude_api_format.as_deref(),
-                Some("openai_responses")
-            ) {
-                if !request_is_streaming || response.is_json() {
+            // Streaming requests must remain streams. A JSON response is still parsed
+            // here to preserve an upstream error message, but even valid non-stream JSON
+            // cannot satisfy the request and must fail over before success is recorded.
+            // Unknown content types continue through the SSE start validators because
+            // some compatible gateways omit the event-stream header.
+            if resolved_claude_api_format.as_deref() == Some("gemini_native") {
+                if !request_is_streaming {
+                    response = self.validate_gemini_success_response(response).await?;
+                } else if response.is_json() {
+                    self.validate_gemini_success_response(response).await?;
+                    return Err(streaming_json_protocol_mismatch("Gemini"));
+                }
+            } else if codex_responses_to_anthropic
+                || resolved_claude_api_format.as_deref() == Some("anthropic")
+            {
+                if !request_is_streaming {
+                    response = self.validate_anthropic_success_response(response).await?;
+                } else if response.is_json() {
+                    self.validate_anthropic_success_response(response).await?;
+                    return Err(streaming_json_protocol_mismatch("Anthropic"));
+                } else {
+                    response = self.validate_anthropic_stream_start(response).await?;
+                }
+            } else if native_chat
+                || codex_responses_to_chat
+                || resolved_claude_api_format.as_deref() == Some("openai_chat")
+            {
+                if !request_is_streaming {
+                    response = self.validate_chat_success_response(response).await?;
+                } else if response.is_json() {
+                    self.validate_chat_success_response(response).await?;
+                    return Err(streaming_json_protocol_mismatch("Chat"));
+                } else {
+                    response = self
+                        .validate_openai_stream_start(response, OpenAiResponseProtocol::Chat)
+                        .await?;
+                }
+            } else if matches!(resolved_claude_api_format.as_deref(), Some("openai_responses"))
+                || (matches!(app_type, AppType::Codex)
+                    && matches!(split_endpoint_and_query(&effective_endpoint).0, "/responses" | "/v1/responses"))
+            {
+                if !request_is_streaming {
                     // Claude→Responses gateways can also return a semantic failure in an
                     // HTTP 2xx Response object. Validate buffered/JSON bodies inside the
                     // retry loop so an early failure can still select another provider.
                     response = self.validate_responses_success_response(response).await?;
+                } else if response.is_json() {
+                    self.validate_responses_success_response(response).await?;
+                    return Err(streaming_json_protocol_mismatch("Responses"));
                 } else {
                     // Delay committing the downstream stream until the upstream emits
                     // either productive output or a valid non-failure terminal event.
@@ -2222,6 +2718,23 @@ impl RequestForwarder {
             Ok((response, resolved_claude_api_format, outbound_model))
         } else {
             let status_code = status.as_u16();
+            if status_code == 429 {
+                let cooldown = retry_after_duration(response.headers());
+                self.router
+                    .cooldown_provider(
+                        provider.gateway_source_provider_id(),
+                        app_type.as_str(),
+                        route_model,
+                        cooldown,
+                    )
+                    .await;
+                log::warn!(
+                    "[{}] Provider {} returned HTTP 429; cooling it down for {}s",
+                    app_type.as_str(),
+                    provider.id,
+                    cooldown.as_secs()
+                );
+            }
             // 错误响应同样可能被上游压缩（content-encoding）。reqwest 未启用任何
             // 自动解压 feature，这里拿到的是原始字节；不解压的话，压缩过的错误体会
             // 在 from_utf8 处变成非 UTF-8 而被丢弃，隐藏掉上游的限流/鉴权等详情。
@@ -2236,6 +2749,17 @@ impl RequestForwarder {
                 None => raw.to_vec(),
             };
             let body_text = String::from_utf8(decoded).ok();
+
+            // 请求体录制：非 2xx 错误体一并落盘，与请求记录配对分析
+            if let Some(trace_id) = &body_trace_id {
+                super::body_recorder::record_upstream_error(
+                    provider,
+                    trace_id,
+                    outbound_model.as_deref().unwrap_or(""),
+                    status_code,
+                    body_text.as_deref(),
+                );
+            }
 
             Err(ProxyError::UpstreamError {
                 status: status_code,
@@ -2276,10 +2800,94 @@ impl RequestForwarder {
         Ok(ProxyResponse::buffered(status, headers, body))
     }
 
+    /// 响应体录制（诊断）：把成功响应包装为「边透传边收集」的形态。
+    ///
+    /// - 流式响应：用 tee 流包裹字节流，客户端侧语义不变，收集满 16 MiB
+    ///   后只透传不再积累；流结束（或出错）时把已收集字节解压后落盘。
+    /// - 非流式响应：整包已在内存（Buffered）或需要主动读取，直接解压
+    ///   落盘后原样返回，不改变响应形状。
+    async fn record_success_response_before_return(
+        response: ProxyResponse,
+        provider: &Provider,
+        trace_id: &str,
+        outbound_model: &str,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let status = response.status().as_u16();
+        let content_type = response.content_type().map(str::to_string);
+        let encoding = get_content_encoding(response.headers());
+
+        // 连接级变体（Hyper/Reqwest/Streamed）：包装成 tee 流，客户端语义不变，
+        // 收集满 16 MiB 后只透传不再积累；流结束（或出错）时解压后落盘。
+        // Buffered 变体（上游验证步骤产物）：整包已在内存，克隆一份直接落盘。
+        if matches!(
+            response,
+            ProxyResponse::Hyper(_) | ProxyResponse::Reqwest(_) | ProxyResponse::Streamed { .. }
+        ) {
+            let headers = response.headers().clone();
+            let provider_name = provider.name.clone();
+            let provider_id = provider.id.clone();
+            let outbound_model = outbound_model.to_string();
+            let trace_id = trace_id.to_string();
+            // 闭包要求 'static：捕获所有权（克隆），而不是借用栈上的局部变量
+            let encoding = encoding.clone();
+            let content_type = content_type.clone();
+            let tee = super::body_recorder::tee_response_stream(
+                response.bytes_stream(),
+                move |collected| {
+                    let decoded = match encoding.as_deref() {
+                        Some(enc) => decompress_body(enc, &collected)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(collected),
+                        None => collected,
+                    };
+                    super::body_recorder::record_response_from_async(
+                        &provider_name,
+                        &provider_id,
+                        &trace_id,
+                        &outbound_model,
+                        status,
+                        content_type.as_deref(),
+                        decoded,
+                    );
+                },
+            );
+            Ok(ProxyResponse::Streamed {
+                status: http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::OK),
+                headers,
+                stream: Box::pin(tee),
+            })
+        } else if let ProxyResponse::Buffered {
+            status,
+            headers,
+            body,
+        } = response
+        {
+            let decoded = match &encoding {
+                Some(enc) => decompress_body(enc, &body)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| body.to_vec()),
+                None => body.to_vec(),
+            };
+            super::body_recorder::record_response(
+                provider,
+                trace_id,
+                outbound_model,
+                status.as_u16(),
+                content_type.as_deref(),
+                decoded,
+            );
+            Ok(ProxyResponse::buffered(status, headers, body))
+        } else {
+            Ok(response)
+        }
+    }
+
     /// Some Anthropic-compatible gateways return an Anthropic error envelope with
     /// HTTP 2xx. Validate it inside the retry loop so the request can fail over to
     /// the next provider; the response transformer runs too late for that.
-    async fn validate_codex_anthropic_success_response(
+    async fn validate_anthropic_success_response(
         &self,
         response: ProxyResponse,
     ) -> Result<ProxyResponse, ProxyError> {
@@ -2300,6 +2908,27 @@ impl RequestForwarder {
                 "Anthropic upstream returned a 2xx error envelope: {message}"
             )));
         }
+        validate_anthropic_response_shape(&decoded)?;
+
+        Ok(ProxyResponse::buffered(status, headers, raw))
+    }
+
+    async fn validate_chat_success_response(
+        &self,
+        response: ProxyResponse,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let encoding = get_content_encoding(&headers);
+        let raw = response.bytes().await?;
+        let decoded = decode_upstream_body(encoding.as_deref(), &raw);
+
+        if let Some(message) = responses_error_envelope_message(&decoded) {
+            return Err(ProxyError::TransformError(format!(
+                "Chat upstream returned a 2xx failure: {message}"
+            )));
+        }
+        validate_chat_response_shape(&decoded)?;
 
         Ok(ProxyResponse::buffered(status, headers, raw))
     }
@@ -2325,11 +2954,123 @@ impl RequestForwarder {
                 "Responses upstream returned a 2xx failure: {message}"
             )));
         }
+        validate_responses_response_shape(&decoded)?;
+
+        Ok(ProxyResponse::buffered(status, headers, raw))
+    }
+
+    async fn validate_gemini_success_response(
+        &self,
+        response: ProxyResponse,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let encoding = get_content_encoding(&headers);
+        let raw = response.bytes().await?;
+        let decoded = decode_upstream_body(encoding.as_deref(), &raw);
+
+        if let Some(message) = responses_error_envelope_message(&decoded) {
+            return Err(ProxyError::TransformError(format!(
+                "Gemini upstream returned a 2xx failure: {message}"
+            )));
+        }
+        validate_gemini_response_shape(&decoded)?;
 
         Ok(ProxyResponse::buffered(status, headers, raw))
     }
 
     async fn validate_responses_stream_start(
+        &self,
+        response: ProxyResponse,
+    ) -> Result<ProxyResponse, ProxyError> {
+        self.validate_openai_stream_start(response, OpenAiResponseProtocol::Responses)
+            .await
+    }
+
+    async fn validate_openai_stream_start(
+        &self,
+        response: ProxyResponse,
+        protocol: OpenAiResponseProtocol,
+    ) -> Result<ProxyResponse, ProxyError> {
+        const MAX_PRIME_BYTES: usize = 256 * 1024;
+
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut stream = Box::pin(response.bytes_stream());
+        let mut replay_chunks: Vec<Bytes> = Vec::new();
+        let mut parse_buffer = String::new();
+        let mut utf8_remainder = Vec::new();
+
+        loop {
+            let next = if self.streaming_first_byte_timeout.is_zero() {
+                stream.next().await
+            } else {
+                tokio::time::timeout(self.streaming_first_byte_timeout, stream.next())
+                    .await
+                    .map_err(|_| {
+                        ProxyError::Timeout(format!(
+                            "OpenAI stream produced no semantic output within {}s",
+                            self.streaming_first_byte_timeout.as_secs()
+                        ))
+                    })?
+            };
+
+            let Some(chunk) = next else {
+                if let Some(outcome) = inspect_openai_json_document(&parse_buffer, protocol) {
+                    outcome?;
+                    let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
+                    return Ok(ProxyResponse::streamed(status, headers, replay));
+                }
+                if !parse_buffer.trim().is_empty() {
+                    if let Some(outcome) = inspect_openai_start_event(parse_buffer.trim(), protocol) {
+                        outcome?;
+                        let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
+                        return Ok(ProxyResponse::streamed(status, headers, replay));
+                    }
+                }
+                return Err(ProxyError::ForwardFailed(
+                    "OpenAI stream ended before producing output or a terminal event"
+                        .to_string(),
+                ));
+            };
+            let chunk = chunk.map_err(|error| {
+                ProxyError::ForwardFailed(format!(
+                    "Failed while validating OpenAI stream start: {error}"
+                ))
+            })?;
+            crate::proxy::sse::append_utf8_safe(&mut parse_buffer, &mut utf8_remainder, &chunk);
+            replay_chunks.push(chunk);
+
+            // Some compatible gateways ignore `stream:true` and return a complete
+            // Responses JSON document without a JSON content-type. Recognize that
+            // shape before looking for SSE delimiters; pretty-printed JSON may itself
+            // contain blank lines and must stay intact.
+            if let Some(outcome) = inspect_openai_json_document(&parse_buffer, protocol) {
+                outcome?;
+                let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
+                return Ok(ProxyResponse::streamed(status, headers, replay));
+            }
+
+            while let Some(block) = crate::proxy::sse::take_sse_block(&mut parse_buffer) {
+                if let Some(outcome) = inspect_openai_start_event(&block, protocol) {
+                    outcome?;
+                    let replay =
+                        futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
+                    return Ok(ProxyResponse::streamed(status, headers, replay));
+                }
+            }
+
+            if replay_chunks.iter().map(Bytes::len).sum::<usize>() >= MAX_PRIME_BYTES {
+                log::warn!(
+                    "[OpenAI] semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing buffered stream"
+                );
+                let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
+                return Ok(ProxyResponse::streamed(status, headers, replay));
+            }
+        }
+    }
+
+    async fn validate_anthropic_stream_start(
         &self,
         response: ProxyResponse,
     ) -> Result<ProxyResponse, ProxyError> {
@@ -2350,50 +3091,46 @@ impl RequestForwarder {
                     .await
                     .map_err(|_| {
                         ProxyError::Timeout(format!(
-                            "Responses stream produced no semantic output within {}s",
+                            "Anthropic stream produced no semantic output within {}s",
                             self.streaming_first_byte_timeout.as_secs()
                         ))
                     })?
             };
 
             let Some(chunk) = next else {
-                if let Some(outcome) = inspect_responses_json_document(&parse_buffer) {
+                if let Some(outcome) = inspect_anthropic_json_document(&parse_buffer) {
                     outcome?;
                     let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                     return Ok(ProxyResponse::streamed(status, headers, replay));
                 }
                 if !parse_buffer.trim().is_empty() {
-                    if let Some(outcome) = inspect_responses_start_event(parse_buffer.trim()) {
+                    if let Some(outcome) = inspect_anthropic_start_event(parse_buffer.trim()) {
                         outcome?;
                         let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                         return Ok(ProxyResponse::streamed(status, headers, replay));
                     }
                 }
                 return Err(ProxyError::ForwardFailed(
-                    "Responses stream ended before producing output or a terminal event"
+                    "Anthropic stream ended before producing output or a terminal event"
                         .to_string(),
                 ));
             };
             let chunk = chunk.map_err(|error| {
                 ProxyError::ForwardFailed(format!(
-                    "Failed while validating Responses stream start: {error}"
+                    "Failed while validating Anthropic stream start: {error}"
                 ))
             })?;
             crate::proxy::sse::append_utf8_safe(&mut parse_buffer, &mut utf8_remainder, &chunk);
             replay_chunks.push(chunk);
 
-            // Some compatible gateways ignore `stream:true` and return a complete
-            // Responses JSON document without a JSON content-type. Recognize that
-            // shape before looking for SSE delimiters; pretty-printed JSON may itself
-            // contain blank lines and must stay intact.
-            if let Some(outcome) = inspect_responses_json_document(&parse_buffer) {
+            if let Some(outcome) = inspect_anthropic_json_document(&parse_buffer) {
                 outcome?;
                 let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                 return Ok(ProxyResponse::streamed(status, headers, replay));
             }
 
             while let Some(block) = crate::proxy::sse::take_sse_block(&mut parse_buffer) {
-                if let Some(outcome) = inspect_responses_start_event(&block) {
+                if let Some(outcome) = inspect_anthropic_start_event(&block) {
                     outcome?;
                     let replay =
                         futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
@@ -2403,7 +3140,7 @@ impl RequestForwarder {
 
             if replay_chunks.iter().map(Bytes::len).sum::<usize>() >= MAX_PRIME_BYTES {
                 log::warn!(
-                    "[Claude/Responses] semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing buffered stream"
+                    "[Anthropic] semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing buffered stream"
                 );
                 let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                 return Ok(ProxyResponse::streamed(status, headers, replay));
@@ -2552,18 +3289,10 @@ impl RequestForwarder {
     }
 
     fn categorize_proxy_error(&self, error: &ProxyError, provider: &Provider) -> ErrorCategory {
-        // Authentication belongs to the Codex client for the built-in official
-        // route. Retrying another provider would silently move the conversation
-        // away from the selected official account and poison its health state.
+        // Local official-account authentication failures cannot be repaired by routing.
+        // HTTP errors returned by an upstream, including 401/403, may rotate.
         if super::providers::is_codex_official_provider(provider)
-            && (matches!(error, ProxyError::AuthError(_))
-                || matches!(
-                    error,
-                    ProxyError::UpstreamError {
-                        status: 401 | 403,
-                        ..
-                    }
-                ))
+            && matches!(error, ProxyError::AuthError(_))
         {
             return ErrorCategory::NonRetryable;
         }
@@ -2573,29 +3302,18 @@ impl RequestForwarder {
             ProxyError::Timeout(_) => ErrorCategory::Retryable,
             ProxyError::ForwardFailed(_) => ErrorCategory::Retryable,
             ProxyError::ProviderUnhealthy(_) => ErrorCategory::Retryable,
-            // 上游 HTTP 错误：按状态码分桶。
-            //
-            // 仅把“换哪家都会同样失败”的客户端语义错误标为 NonRetryable：
-            //   400 / 422  ← 请求体格式或语义错误（对所有上游通常相同）
-            //   406 / 414 / 415 ← Accept / URI / Content-Type 客户端构造问题
-            //
-            // 多供应商中转场景下，下列状态码经常是“这一家”的问题，应继续 failover：
-            //   405 ← 常见于某家 nginx location 未放开 POST /v1/responses，不是本地方法错
-            //   413 ← 各家 client_max_body_size / 网关限额不同，换源可能成功
-            //   501 ← 某一家未实现该协议/端点，另一家可能支持
-            //   401/403/404/429 与全部 5xx ← 换 key、配额、通道或节点后可能恢复
-            ProxyError::UpstreamError { status, body } => match *status {
-                400 | 406 | 414 | 415 | 422 => ErrorCategory::NonRetryable,
-                // 405：默认允许换源。若响应体是明确的 JSON 应用层“方法不允许”，
-                // 且完全不像边缘/反代 HTML，才视为客户端协议问题并中止 failover。
-                405 if is_application_method_not_allowed(body.as_deref()) => {
-                    ErrorCategory::NonRetryable
-                }
-                _ => ErrorCategory::Retryable,
-            },
-            // Provider 级配置/转换问题：换一个 Provider 可能就能成功
-            ProxyError::ConfigError(_) => ErrorCategory::Retryable,
-            ProxyError::TransformError(_) => ErrorCategory::Retryable,
+            // A relay's rejection is evidence about that candidate, not every
+            // source behind the public model alias. Rotate without treating 4xx
+            // schema/history/size disagreements as transport-health failures.
+            ProxyError::UpstreamError { status: 400..=499, .. } => {
+                ErrorCategory::ProviderIncompatible
+            }
+            ProxyError::UpstreamError { .. } => ErrorCategory::Retryable,
+            // CPA records executor preparation/translation failures against the
+            // attempted candidate and continues with another credential.
+            ProxyError::ConfigError(_) | ProxyError::TransformError(_) => {
+                ErrorCategory::Retryable
+            }
             ProxyError::AuthError(_) => ErrorCategory::Retryable,
             ProxyError::StreamIdleTimeout(_) => ErrorCategory::Retryable,
             // 无可用供应商：所有供应商都试过了，无法重试
@@ -2604,50 +3322,6 @@ impl RequestForwarder {
             _ => ErrorCategory::NonRetryable,
         }
     }
-}
-
-/// 判断 405 是否更像“应用层明确拒绝该方法”，而不是 nginx/CDN 边缘页。
-///
-/// 中转站返回的裸 nginx HTML（`<h1>405 Not Allowed</h1>`）对下一户供应商没有约束，
-/// 必须允许 failover；只有带 JSON 业务错误码/文案的 405 才倾向视为协议用错。
-fn is_application_method_not_allowed(body: Option<&str>) -> bool {
-    let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) else {
-        return false;
-    };
-
-    if looks_like_edge_gateway_body(body) {
-        return false;
-    }
-
-    let Ok(json_body) = serde_json::from_str::<Value>(body) else {
-        return false;
-    };
-
-    let message = extract_json_error_message(&json_body)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let code = json_body
-        .pointer("/error/code")
-        .or_else(|| json_body.get("code"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    message.contains("method not allowed")
-        || message.contains("method_not_allowed")
-        || code.contains("method_not_allowed")
-}
-
-fn looks_like_edge_gateway_body(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    lower.contains("<html")
-        || lower.contains("<!doctype")
-        || lower.contains("<center>")
-        || lower.contains("nginx")
-        || lower.contains("cloudflare")
-        || lower.contains("405 not allowed")
-        || lower.contains("error code: 1010")
-        || lower.contains("error code: 1003")
 }
 
 /// 从 ProxyError 中提取错误消息
@@ -2704,6 +3378,7 @@ fn build_nonretryable_failure_log(
         ErrorCategory::ClientAbort => "客户端已断开",
         ErrorCategory::NonRetryable => "判定为客户端/协议层错误，换源通常无效",
         ErrorCategory::Retryable => "不可重试",
+        ErrorCategory::ProviderIncompatible => "当前供应商接口不兼容",
     };
 
     (
@@ -2924,6 +3599,146 @@ fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
     Some(format!("{error_type}: {message}"))
 }
 
+/// Read the reasoning control from the final body that is about to be sent to
+/// the selected upstream. The order prefers a concrete effort/level over a
+/// boolean or enabled/disabled thinking switch.
+fn extract_outbound_reasoning(body: &Value) -> Option<String> {
+    super::request_trace::reasoning(body)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OpenAiResponseProtocol {
+    Chat,
+    Responses,
+}
+
+fn decode_upstream_body(content_encoding: Option<&str>, raw: &[u8]) -> Vec<u8> {
+    match content_encoding {
+        Some(encoding) => decompress_body(encoding, raw)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| raw.to_vec()),
+        None => raw.to_vec(),
+    }
+}
+
+fn parse_upstream_json(body: &[u8], protocol: &str) -> Result<Value, ProxyError> {
+    serde_json::from_slice(body).map_err(|error| {
+        ProxyError::TransformError(format!(
+            "{protocol} upstream returned invalid JSON with HTTP 2xx: {error}"
+        ))
+    })
+}
+
+fn validate_chat_response_shape(body: &[u8]) -> Result<(), ProxyError> {
+    let value = parse_upstream_json(body, "Chat")?;
+    let choices = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .filter(|choices| !choices.is_empty())
+        .ok_or_else(|| {
+            ProxyError::TransformError(
+                "Chat upstream returned HTTP 2xx without a non-empty choices array".to_string(),
+            )
+        })?;
+    if choices.iter().any(|choice| {
+        choice.get("message").is_some_and(Value::is_object)
+            || choice.get("delta").is_some_and(Value::is_object)
+    }) {
+        Ok(())
+    } else {
+        Err(ProxyError::TransformError(
+            "Chat upstream returned HTTP 2xx without a message or delta choice".to_string(),
+        ))
+    }
+}
+
+fn validate_gemini_response_shape(body: &[u8]) -> Result<(), ProxyError> {
+    let value: Value = serde_json::from_slice(body).map_err(|error| {
+        ProxyError::TransformError(format!("Invalid Gemini JSON response: {error}"))
+    })?;
+    let blocked = value
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(Value::as_str)
+        .is_some();
+    let has_candidate = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .is_some();
+    if blocked || has_candidate {
+        return Ok(());
+    }
+    Err(ProxyError::TransformError(
+        "No candidates in Gemini response".to_string(),
+    ))
+}
+
+fn streaming_json_protocol_mismatch(protocol: &str) -> ProxyError {
+    ProxyError::TransformError(format!(
+        "{protocol} upstream returned JSON for a streaming request"
+    ))
+}
+
+fn validate_responses_response_shape(body: &[u8]) -> Result<(), ProxyError> {
+    let value = parse_upstream_json(body, "Responses")?;
+    let output = value
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProxyError::TransformError(
+                "Responses upstream returned HTTP 2xx without an output array".to_string(),
+            )
+        })?;
+
+    // CPA translates the response inside the executor before reporting success.
+    // Our Responses→Anthropic translator can reject completed function calls, so
+    // preflight the same invariant here before provider health is marked healthy.
+    if value.get("status").and_then(Value::as_str) == Some("completed") {
+        for item in output.iter().filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call")
+        }) {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            if arguments.trim().is_empty() {
+                continue;
+            }
+            let parsed: Value = serde_json::from_str(arguments).map_err(|error| {
+                ProxyError::TransformError(format!(
+                    "Invalid function_call arguments for '{name}': {error}"
+                ))
+            })?;
+            if !parsed.is_object() {
+                return Err(ProxyError::TransformError(format!(
+                    "Function call arguments for '{name}' must be a JSON object"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_anthropic_response_shape(body: &[u8]) -> Result<(), ProxyError> {
+    let value = parse_upstream_json(body, "Anthropic")?;
+    if value.get("content").is_some_and(Value::is_array)
+        && value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_none_or(|value_type| value_type == "message")
+    {
+        Ok(())
+    } else {
+        Err(ProxyError::TransformError(
+            "Anthropic upstream returned HTTP 2xx without a message content array".to_string(),
+        ))
+    }
+}
+
 fn responses_error_envelope_message(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let status = value.get("status").and_then(Value::as_str);
@@ -2964,9 +3779,11 @@ fn codex_anthropic_cache_config(config: &OptimizerConfig) -> OptimizerConfig {
 }
 
 /// A streaming request may receive a whole JSON document even when the gateway
-/// omits `application/json`. `None` means either "not JSON" or "not complete yet";
-/// a parsed document is safe to commit unless it is a semantic failure envelope.
-fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError>> {
+/// omits `application/json`. `None` means either "not JSON" or "not complete yet".
+fn inspect_openai_json_document(
+    buffer: &str,
+    protocol: OpenAiResponseProtocol,
+) -> Option<Result<(), ProxyError>> {
     let trimmed = buffer.trim();
     if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
         return None;
@@ -2977,7 +3794,107 @@ fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError
             "Responses upstream returned a 2xx failure: {message}"
         ))));
     }
-    Some(Ok(()))
+    Some(match protocol {
+        OpenAiResponseProtocol::Chat => validate_chat_response_shape(trimmed.as_bytes()),
+        OpenAiResponseProtocol::Responses => {
+            validate_responses_response_shape(trimmed.as_bytes())
+        }
+    })
+}
+
+fn inspect_openai_start_event(
+    block: &str,
+    protocol: OpenAiResponseProtocol,
+) -> Option<Result<(), ProxyError>> {
+    match protocol {
+        OpenAiResponseProtocol::Chat => inspect_chat_start_event(block),
+        OpenAiResponseProtocol::Responses => inspect_responses_start_event(block),
+    }
+}
+
+fn inspect_anthropic_json_document(buffer: &str) -> Option<Result<(), ProxyError>> {
+    let trimmed = buffer.trim();
+    if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
+        return None;
+    }
+    let _: Value = serde_json::from_str(trimmed).ok()?;
+    if let Some(message) = codex_anthropic_error_envelope_message(trimmed.as_bytes()) {
+        return Some(Err(ProxyError::TransformError(format!(
+            "Anthropic upstream returned a 2xx error envelope: {message}"
+        ))));
+    }
+    Some(validate_anthropic_response_shape(trimmed.as_bytes()))
+}
+
+fn inspect_anthropic_start_event(block: &str) -> Option<Result<(), ProxyError>> {
+    let mut named_event = None;
+    let mut data_lines = Vec::new();
+    for line in block.lines() {
+        if let Some(event) = crate::proxy::sse::strip_sse_field(line, "event") {
+            named_event = Some(event.trim().to_string());
+        } else if let Some(data) = crate::proxy::sse::strip_sse_field(line, "data") {
+            data_lines.push(data);
+        }
+    }
+    if data_lines.is_empty() {
+        return None;
+    }
+    let data = data_lines.join("\n");
+    let value: Value = serde_json::from_str(&data).ok()?;
+    let event = named_event
+        .as_deref()
+        .filter(|event| !event.is_empty())
+        .or_else(|| value.get("type").and_then(Value::as_str))
+        .unwrap_or("");
+
+    if event == "error" || value.get("type").and_then(Value::as_str) == Some("error") {
+        let message = codex_anthropic_error_envelope_message(data.as_bytes())
+            .unwrap_or_else(|| "Anthropic upstream failed before output".to_string());
+        return Some(Err(ProxyError::TransformError(format!(
+            "Anthropic stream failed before output: {message}"
+        ))));
+    }
+
+    match event {
+        "message_start" | "content_block_start" | "ping" => None,
+        "content_block_delta" => {
+            let delta = value.get("delta").unwrap_or(&value);
+            let productive = delta.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+                || delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .is_some_and(|json| !json.is_empty())
+                || delta.get("thinking").and_then(Value::as_str).is_some_and(|text| !text.is_empty());
+            productive.then_some(Ok(()))
+        }
+        "content_block_stop" => None,
+        "message_delta" => value
+            .pointer("/delta/stop_reason")
+            .is_some_and(|reason| !reason.is_null())
+            .then_some(Ok(())),
+        "message_stop" => Some(Ok(())),
+        "" => None,
+        _ => Some(Ok(())),
+    }
+}
+
+/// Commit a Chat stream only on output or a terminal, never on a role-only preamble.
+fn inspect_chat_start_event(block: &str) -> Option<Result<(), ProxyError>> {
+    let data = block.lines().filter_map(|line| crate::proxy::sse::strip_sse_field(line, "data"))
+        .collect::<Vec<_>>().join("\n");
+    if data.trim() == "[DONE]" { return Some(Ok(())); }
+    let value: Value = serde_json::from_str(&data).ok()?;
+    if let Some(message) = responses_error_envelope_message(data.as_bytes()) {
+        return Some(Err(ProxyError::ForwardFailed(format!("Chat stream failed before output: {message}"))));
+    }
+    let productive = value.get("choices").and_then(Value::as_array)?.iter().any(|choice| {
+        choice.get("finish_reason").is_some_and(|v| !v.is_null())
+            || choice.get("delta").and_then(Value::as_object).is_some_and(|delta| {
+                delta.iter().any(|(key, value)| key != "role" && !value.is_null()
+                    && value.as_str() != Some("") && !value.as_array().is_some_and(Vec::is_empty))
+            })
+    });
+    productive.then_some(Ok(()))
 }
 
 /// Inspect one complete Responses SSE block while the response is still inside
@@ -3046,7 +3963,19 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
                 "Responses upstream {error_type}: {message}"
             ))))
         }
-        "response.created" | "response.in_progress" | "response.queued" => None,
+        "response.created"
+        | "response.in_progress"
+        | "response.queued"
+        | "response.output_item.added"
+        | "response.content_part.added" => None,
+        "response.output_text.delta"
+        | "response.function_call_arguments.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_text.delta" => value
+            .get("delta")
+            .and_then(Value::as_str)
+            .is_some_and(|delta| !delta.is_empty())
+            .then_some(Ok(())),
         "" => None,
         // Productive output, incomplete, and completed terminals are all safe to
         // expose. Mid-stream failures after this point are surfaced by the converter
@@ -3556,6 +4485,23 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    #[test]
+    fn retry_after_seconds_are_honored_and_bounded() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("90"));
+        assert_eq!(retry_after_duration(&headers), Duration::from_secs(90));
+
+        headers.insert("retry-after", HeaderValue::from_static("999999"));
+        assert_eq!(retry_after_duration(&headers), MAX_RATE_LIMIT_COOLDOWN);
+    }
+
+    #[test]
+    fn malformed_retry_after_uses_short_default() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("not-a-date"));
+        assert_eq!(retry_after_duration(&headers), DEFAULT_RATE_LIMIT_COOLDOWN);
+    }
+
     fn test_provider_with_type(provider_type: Option<&str>) -> Provider {
         test_provider_with_id("provider-1", provider_type)
     }
@@ -3587,6 +4533,7 @@ mod tests {
         let db = Arc::new(Database::memory().expect("memory db"));
 
         RequestForwarder {
+            trace: Default::default(),
             router: Arc::new(ProviderRouter::new(db.clone())),
             status: Arc::new(RwLock::new(ProxyStatus::default())),
             current_providers: Arc::new(RwLock::new(HashMap::new())),
@@ -3598,6 +4545,8 @@ mod tests {
             current_provider_id_at_start: String::new(),
             session_id: String::new(),
             session_client_provided: false,
+            session_affinity_key: None,
+            session_affinity: Arc::new(RwLock::new(SessionAffinityStore::default())),
             rectifier_config: RectifierConfig::default(),
             optimizer_config: OptimizerConfig::default(),
             copilot_optimizer_config: CopilotOptimizerConfig::default(),
@@ -3610,25 +4559,168 @@ mod tests {
     #[test]
     fn single_provider_success_is_not_failover() {
         let providers = vec![test_provider_with_id("only", None)];
-        assert!(!RequestForwarder::route_used_fallback(&providers, "only"));
+        assert!(!RequestForwarder::route_used_fallback(
+            &providers, "only", None
+        ));
     }
 
     #[test]
     fn primary_success_is_not_failover() {
-        let providers = vec![test_provider_with_id("primary", None), test_provider_with_id("backup", None)];
+        let providers = vec![
+            test_provider_with_id("primary", None),
+            test_provider_with_id("backup", None),
+        ];
         assert!(!RequestForwarder::route_used_fallback(
             &providers,
-            "primary"
+            "primary",
+            None
         ));
     }
 
     #[test]
     fn backup_success_is_failover() {
-        let providers = vec![test_provider_with_id("primary", None), test_provider_with_id("backup", None)];
+        let providers = vec![
+            test_provider_with_id("primary", None),
+            test_provider_with_id("backup", None),
+        ];
         assert!(RequestForwarder::route_used_fallback(
             &providers,
-            "backup"
+            "backup",
+            None
         ));
+    }
+
+    #[test]
+    fn affinity_promoted_success_is_not_failover() {
+        let providers = vec![
+            test_provider_with_id("primary", None),
+            test_provider_with_id("bound", None),
+        ];
+
+        // 亲和把 bound 提到最前并成功 —— 首选并没有失败，不该记一次故障转移
+        assert!(!RequestForwarder::route_used_fallback(
+            &providers,
+            "bound",
+            Some("bound")
+        ));
+        // 同一家不是靠亲和上去的，就仍然是故障转移
+        assert!(RequestForwarder::route_used_fallback(
+            &providers,
+            "bound",
+            None
+        ));
+    }
+
+    #[test]
+    fn order_providers_promotes_preferred_to_front() {
+        let providers = vec![
+            test_provider_with_id("a", None),
+            test_provider_with_id("b", None),
+            test_provider_with_id("c", None),
+        ];
+
+        let ids = |ordered: Vec<&Provider>| -> Vec<String> {
+            ordered
+                .iter()
+                .map(|provider| provider.id.clone())
+                .collect()
+        };
+
+        assert_eq!(
+            ids(RequestForwarder::order_providers(&providers, Some("c"))),
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
+        // 偏好不在链上：保持原顺序
+        assert_eq!(
+            ids(RequestForwarder::order_providers(&providers, Some("missing"))),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // 没有偏好：保持原顺序
+        assert_eq!(
+            ids(RequestForwarder::order_providers(&providers, None)),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    fn affinity_forwarder(key: Option<&str>) -> RequestForwarder {
+        let mut forwarder =
+            test_forwarder(Duration::from_secs(30), Duration::from_secs(30));
+        forwarder.session_affinity_key = key.map(|key| key.to_string());
+        forwarder
+    }
+
+    #[tokio::test]
+    async fn session_affinity_binds_and_releases() {
+        let forwarder = affinity_forwarder(Some("session-1"));
+        let providers = vec![
+            test_provider_with_id("a", None),
+            test_provider_with_id("b", None),
+        ];
+
+        // 还没绑定：没有偏好，走配置顺序
+        assert!(forwarder
+            .session_affinity_preference(&providers)
+            .await
+            .is_none());
+
+        forwarder.bind_session_affinity("b").await;
+        assert_eq!(
+            forwarder
+                .session_affinity_preference(&providers)
+                .await
+                .as_deref(),
+            Some("b")
+        );
+
+        // provider 自身故障 → 解绑 → 偏好消失
+        forwarder.release_session_affinity("b").await;
+        assert!(forwarder
+            .session_affinity_preference(&providers)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn session_affinity_release_is_compare_and_delete() {
+        let forwarder = affinity_forwarder(Some("session-1"));
+
+        forwarder.bind_session_affinity("b").await;
+        // 解绑一个不是当前绑定的 provider：不能误删
+        forwarder.release_session_affinity("a").await;
+
+        let mut store = forwarder.session_affinity.write().await;
+        assert_eq!(store.get("session-1").as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn session_affinity_drops_binding_outside_route_chain() {
+        let forwarder = affinity_forwarder(Some("session-1"));
+
+        forwarder.bind_session_affinity("gone").await;
+
+        // 绑定的 provider 已不在本次路由链里 → 无偏好，且绑定被解除
+        let providers = vec![test_provider_with_id("a", None)];
+        assert!(forwarder
+            .session_affinity_preference(&providers)
+            .await
+            .is_none());
+
+        let mut store = forwarder.session_affinity.write().await;
+        assert!(store.get("session-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_affinity_is_skipped_without_stable_key() {
+        let forwarder = affinity_forwarder(None);
+        let providers = vec![test_provider_with_id("a", None)];
+
+        forwarder.bind_session_affinity("a").await;
+
+        assert!(forwarder
+            .session_affinity_preference(&providers)
+            .await
+            .is_none());
+        assert!(forwarder.session_affinity.write().await.is_empty());
     }
 
     #[tokio::test]
@@ -3638,7 +4730,7 @@ mod tests {
         let mut guard = ActiveConnectionGuard::acquire(status.clone(), counts.clone()).await;
 
         guard
-            .switch_provider("codex", "primary", "Primary · openai_responses")
+            .switch_provider("codex", "primary", "Primary · openai_responses", None)
             .await;
         assert_eq!(status.read().await.active_connections, 1);
         assert_eq!(
@@ -3651,7 +4743,7 @@ mod tests {
         );
 
         guard
-            .switch_provider("codex", "backup", "Backup · anthropic")
+            .switch_provider("codex", "backup", "Backup · anthropic", None)
             .await;
         let snapshot = counts.read().await;
         assert!(!snapshot.contains_key(&("codex".to_string(), "primary".to_string())));
@@ -4377,23 +5469,97 @@ mod tests {
     #[test]
     fn responses_stream_start_accepts_unlabelled_whole_json() {
         assert!(matches!(
-            inspect_responses_json_document(
+            inspect_openai_json_document(
                 r#"{
                     "status": "completed",
 
                     "output": []
-                }"#
+                }"#,
+                OpenAiResponseProtocol::Responses,
             ),
             Some(Ok(()))
         ));
-        assert!(inspect_responses_json_document(r#"{"status":"completed""#).is_none());
+        assert!(inspect_openai_json_document(
+            r#"{"status":"completed""#,
+            OpenAiResponseProtocol::Responses,
+        )
+        .is_none());
 
-        let failed = inspect_responses_json_document(
+        let failed = inspect_openai_json_document(
             r#"{"status":"failed","error":{"message":"backend unavailable"}}"#,
+            OpenAiResponseProtocol::Responses,
         );
         assert!(
             matches!(failed, Some(Err(ProxyError::TransformError(message))) if message.contains("backend unavailable"))
         );
+    }
+
+    #[test]
+    fn successful_status_requires_the_selected_protocol_shape() {
+        assert!(validate_chat_response_shape(
+            br#"{"id":"chat_1","choices":[{"message":{"role":"assistant","content":"ok"}}]}"#
+        )
+        .is_ok());
+        assert!(validate_chat_response_shape(br#"{"status":"ok"}"#).is_err());
+
+        assert!(validate_responses_response_shape(
+            br#"{"id":"resp_1","status":"completed","output":[]}"#
+        )
+        .is_ok());
+        assert!(validate_responses_response_shape(
+            br#"{"id":"resp_1","status":"completed","output":[{"type":"function_call","name":"lookup","arguments":"{\"q\":\"ok\"}"}]}"#
+        )
+        .is_ok());
+        assert!(validate_responses_response_shape(
+            br#"{"id":"resp_1","status":"completed","output":[{"type":"function_call","name":"lookup","arguments":"{"}]}"#
+        )
+        .is_err());
+        assert!(validate_responses_response_shape(
+            br#"{"id":"resp_1","status":"completed","output":[{"type":"function_call","name":"lookup","arguments":"[]"}]}"#
+        )
+        .is_err());
+        assert!(validate_responses_response_shape(br#"{"choices":[]}"#).is_err());
+
+        assert!(validate_anthropic_response_shape(
+            br#"{"type":"message","content":[]}"#
+        )
+        .is_ok());
+        assert!(validate_anthropic_response_shape(br#"{"type":"message"}"#).is_err());
+
+        assert!(validate_gemini_response_shape(
+            br#"{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}"#
+        )
+        .is_ok());
+        assert!(validate_gemini_response_shape(
+            br#"{"promptFeedback":{"blockReason":"SAFETY"}}"#
+        )
+        .is_ok());
+        assert!(validate_gemini_response_shape(br#"{"candidates":[]}"#).is_err());
+        assert!(validate_gemini_response_shape(br#"{"status":"ok"}"#).is_err());
+    }
+
+    #[test]
+    fn anthropic_stream_waits_through_lifecycle_and_rejects_early_error() {
+        let start = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"content\":[]}}"
+        );
+        assert!(inspect_anthropic_start_event(start).is_none());
+
+        let failed = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}"
+        );
+        assert!(matches!(
+            inspect_anthropic_start_event(failed),
+            Some(Err(ProxyError::TransformError(message))) if message.contains("busy")
+        ));
+
+        let delta = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}"
+        );
+        assert!(matches!(inspect_anthropic_start_event(delta), Some(Ok(()))));
     }
 
     #[test]
@@ -4443,100 +5609,61 @@ mod tests {
         ] {
             assert_eq!(
                 forwarder.categorize_proxy_error(&error, &provider),
-                ErrorCategory::NonRetryable
+                if matches!(error, ProxyError::AuthError(_)) { ErrorCategory::NonRetryable } else { ErrorCategory::ProviderIncompatible }
             );
         }
     }
 
     #[test]
-    fn nginx_html_405_is_retryable_for_multi_provider_failover() {
+    fn upstream_http_errors_rotate_across_independent_sources() {
         let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
         let provider = test_provider_with_type(None);
-        let error = ProxyError::UpstreamError {
-            status: 405,
-            body: Some(
-                r#"<html>
-<head><title>405 Not Allowed</title></head>
-<body>
-<center><h1>405 Not Allowed</h1></center>
-<hr><center>nginx</center>
-</body>
-</html>"#
-                    .to_string(),
-            ),
-        };
-
-        assert_eq!(
-            forwarder.categorize_proxy_error(&error, &provider),
-            ErrorCategory::Retryable,
-            "裸 nginx 405 应继续换源，而不是中止整条 failover 链"
-        );
-    }
-
-    #[test]
-    fn empty_or_edge_405_and_413_are_retryable() {
-        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
-        let provider = test_provider_with_type(None);
+        for status in [400_u16, 409, 413, 422] {
+            assert_eq!(
+                forwarder.categorize_proxy_error(
+                    &ProxyError::UpstreamError {
+                        status,
+                        body: Some(r#"{"error":{"message":"request failed"}}"#.to_string()),
+                    },
+                    &provider,
+                ),
+                ErrorCategory::ProviderIncompatible,
+                "status {status} should rotate"
+            );
+        }
 
         assert_eq!(
             forwarder.categorize_proxy_error(
                 &ProxyError::UpstreamError {
-                    status: 405,
-                    body: None,
+                    status: 404,
+                    body: Some(r#"{"error":{"message":"not found"}}"#.to_string()),
                 },
                 &provider,
             ),
-            ErrorCategory::Retryable
+            ErrorCategory::ProviderIncompatible
         );
-        assert_eq!(
-            forwarder.categorize_proxy_error(
-                &ProxyError::UpstreamError {
-                    status: 413,
-                    body: Some(
-                        "<html><head><title>413 Request Entity Too Large</title></head></html>"
-                            .to_string(),
-                    ),
-                },
-                &provider,
-            ),
-            ErrorCategory::Retryable
-        );
-        assert_eq!(
-            forwarder.categorize_proxy_error(
-                &ProxyError::UpstreamError {
-                    status: 501,
-                    body: Some(r#"{"error":{"message":"not implemented"}}"#.to_string()),
-                },
-                &provider,
-            ),
-            ErrorCategory::Retryable
-        );
+
+        for status in [405_u16, 406, 414, 415, 501] {
+            assert_eq!(
+                forwarder.categorize_proxy_error(
+                    &ProxyError::UpstreamError {
+                        status,
+                        body: Some(r#"{"error":{"message":"upstream failed"}}"#.to_string()),
+                    },
+                    &provider,
+                ),
+                if status < 500 { ErrorCategory::ProviderIncompatible } else { ErrorCategory::Retryable },
+                "status {status} should remain eligible for candidate rotation"
+            );
+        }
     }
 
     #[test]
-    fn application_json_method_not_allowed_405_stays_non_retryable() {
-        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
-        let provider = test_provider_with_type(None);
-        let error = ProxyError::UpstreamError {
-            status: 405,
-            body: Some(
-                r#"{"error":{"code":"method_not_allowed","message":"Method Not Allowed"}}"#
-                    .to_string(),
-            ),
-        };
-
-        assert_eq!(
-            forwarder.categorize_proxy_error(&error, &provider),
-            ErrorCategory::NonRetryable
-        );
-    }
-
-    #[test]
-    fn client_semantic_4xx_remain_non_retryable() {
+    fn upstream_semantic_4xx_do_not_prevent_other_sources() {
         let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
         let provider = test_provider_with_type(None);
 
-        for status in [400_u16, 406, 414, 415, 422] {
+        for status in [400_u16, 422] {
             assert_eq!(
                 forwarder.categorize_proxy_error(
                     &ProxyError::UpstreamError {
@@ -4545,8 +5672,8 @@ mod tests {
                     },
                     &provider,
                 ),
-                ErrorCategory::NonRetryable,
-                "status {status} should stay non-retryable"
+                ErrorCategory::ProviderIncompatible,
+                "status {status} should rotate"
             );
         }
     }
@@ -5048,5 +6175,32 @@ mod tests {
         });
         let body = body_with_image("any-model");
         assert!(fwd.media_retry_should_trigger("Claude", false, &body, &image_unsupported_error()));
+    }
+
+    #[test]
+    fn extracts_reasoning_from_final_upstream_body() {
+        assert_eq!(
+            extract_outbound_reasoning(&json!({
+                "reasoning_effort": "max",
+                "reasoning": {"effort": "low"}
+            }))
+            .as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            extract_outbound_reasoning(&json!({"reasoning": {"effort": "high"}}))
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            extract_outbound_reasoning(&json!({"thinking": {"type": "enabled"}}))
+                .as_deref(),
+            Some("enabled")
+        );
+        assert_eq!(
+            extract_outbound_reasoning(&json!({"enable_thinking": false})).as_deref(),
+            Some("disabled")
+        );
+        assert_eq!(extract_outbound_reasoning(&json!({"model": "plain"})), None);
     }
 }

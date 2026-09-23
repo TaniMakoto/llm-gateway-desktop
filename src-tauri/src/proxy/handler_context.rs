@@ -23,6 +23,10 @@ pub struct StreamingTimeoutConfig {
     pub idle_timeout: u64,
 }
 
+fn scoped_session_affinity_key(app_type: &str, model: &str, session_id: &str) -> String {
+    format!("{app_type}\u{0}{model}\u{0}{session_id}")
+}
+
 /// 请求上下文
 ///
 /// 贯穿整个请求生命周期，包含：
@@ -48,6 +52,9 @@ pub struct RequestContext {
     pub current_provider_id: String,
     /// 请求中的模型名称
     pub request_model: String,
+    /// 最终成功候选或最后失败尝试收到的上游思考配置（适配后的真值）。
+    pub reasoning_effort: Option<String>,
+    pub trace: super::request_trace::RequestTrace,
     /// 实际发往上游的模型名（路由接管/模型映射后的真值，forward 成功后回填）。
     ///
     /// usage 归因的兜底顺序：上游响应回显 → outbound_model → request_model。
@@ -64,6 +71,11 @@ pub struct RequestContext {
     pub session_id: String,
     /// Session ID 是否由客户端提供。生成的 UUID 不能作为上游缓存 key，否则每个请求都会换 key。
     pub session_client_provided: bool,
+    /// 会话亲和的键（仅当 Session ID 是**稳定**键时存在）
+    ///
+    /// `None` = 这个会话没有可复用的身份（客户端没提供标识、内容也推不出锚点），
+    /// 不参与粘性路由——绑一个一次性随机 UUID 只会污染绑定表。
+    pub session_affinity_key: Option<String>,
     /// 整流器配置
     pub rectifier_config: RectifierConfig,
     /// 优化器配置
@@ -121,6 +133,18 @@ impl RequestContext {
         // 提取 Session ID
         let session_result = extract_session_id(headers, body, app_type_str);
         let session_id = session_result.session_id.clone();
+        // Match CPA's provider/model/session affinity scope. A raw session ID is
+        // not globally unique across API families and one conversation may switch
+        // aliases; sharing the binding would leak one route's choice into another.
+        let session_affinity_key = session_result
+            .is_stable()
+            .then(|| scoped_session_affinity_key(app_type_str, &request_model, &session_id));
+        let existing_affinity_provider = if let Some(key) = session_affinity_key.as_deref() {
+            let mut store = state.session_affinity.write().await;
+            store.get(key)
+        } else {
+            None
+        };
 
         log::debug!(
             "[{}] Session ID: {} (from {:?}, client_provided: {})",
@@ -140,8 +164,42 @@ impl RequestContext {
         )
         .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
         {
-            Some(providers) if !providers.is_empty() => providers,
+            Some((providers, routing_policy, routing_weights)) if !providers.is_empty() => {
+                // CPA filters blocked credentials before Round Robin/Weighted
+                // selection. Otherwise an open circuit still consumes a turn and
+                // biases traffic toward the candidate immediately behind it.
+                let providers = state
+                    .provider_router
+                    .schedulable_providers(app_type_str, &request_model, providers)
+                    .await;
+                if providers.is_empty() {
+                    return Err(ProxyError::NoAvailableProvider);
+                }
+                let affinity_is_valid = existing_affinity_provider
+                    .as_deref()
+                    .is_some_and(|bound| providers.iter().any(|provider| provider.id == bound));
+                if affinity_is_valid {
+                    providers
+                } else {
+                    let active_provider_counts = state.active_provider_counts.read().await.clone();
+                    state
+                        .provider_router
+                        .apply_gateway_routing_policy(
+                            app_type_str,
+                            &request_model,
+                            routing_policy,
+                            &routing_weights,
+                            &active_provider_counts,
+                            providers,
+                        )
+                        .await
+                }
+            }
             Some(_) => return Err(ProxyError::NoAvailableProvider),
+            None if state.db.get_setting(crate::gateway::CONFIG_KEY)
+                .map_err(|e| ProxyError::DatabaseError(e.to_string()))?.is_some() => {
+                return Err(ProxyError::InvalidRequest(format!("未知模型别名: {request_model}")));
+            }
             None => state
                 .provider_router
                 .select_providers(app_type_str)
@@ -178,10 +236,14 @@ impl RequestContext {
             providers,
             current_provider_id,
             request_model,
+            reasoning_effort: None,
+            trace: super::request_trace::RequestTrace::new(
+                super::response_processor::usage_logging_enabled(state).then(|| state.db.clone()), app_type_str, body),
             outbound_model: None,
             tag,
             app_type_str,
             app_type,
+            session_affinity_key,
             session_id,
             session_client_provided: session_result.client_provided,
             rectifier_config,
@@ -250,13 +312,15 @@ impl RequestContext {
             self.current_provider_id.clone(),
             self.session_id.clone(),
             self.session_client_provided,
+            self.session_affinity_key.clone(),
+            state.session_affinity.clone(),
             first_byte_timeout,
             idle_timeout,
             self.rectifier_config.clone(),
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
-        )
+        ).with_trace(self.trace.clone())
     }
 
     /// 获取 Provider 列表（用于故障转移）
@@ -315,7 +379,24 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_gemini_model_from_path;
+    use super::{extract_gemini_model_from_path, scoped_session_affinity_key};
+
+    #[test]
+    fn affinity_key_isolated_by_app_and_model() {
+        let base = scoped_session_affinity_key("codex", "agent", "session-1");
+        assert_ne!(
+            base,
+            scoped_session_affinity_key("claude", "agent", "session-1")
+        );
+        assert_ne!(
+            base,
+            scoped_session_affinity_key("codex", "vision", "session-1")
+        );
+        assert_ne!(
+            base,
+            scoped_session_affinity_key("codex", "agent", "session-2")
+        );
+    }
 
     #[test]
     fn extract_model_with_action() {

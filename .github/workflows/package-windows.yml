@@ -1,0 +1,90 @@
+name: Package Windows
+# Rebuild marker: adaptive routing and backpressure P1
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/session-affinity
+    paths:
+      - ".github/workflows/package-windows.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  package-windows:
+    name: Windows x64 packages
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          key: windows-package
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Windows installers
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tauriScript: pnpm tauri
+          args: "--bundles nsis,msi"
+          retryAttempts: 1
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: "[platform]-[arch]-[bundle]"
+
+      - name: Create Windows portable ZIP
+        shell: pwsh
+        run: |
+          $version = (Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
+          $portableRoot = Join-Path $PWD "portable"
+          $packageDir = Join-Path $portableRoot "LLM Gateway Desktop"
+          $exePath = "src-tauri/target/release/llm-gateway-desktop.exe"
+
+          if (-not (Test-Path $exePath)) {
+            throw "Portable executable was not found: $exePath"
+          }
+
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "data") | Out-Null
+          New-Item -ItemType File -Force -Path (Join-Path $packageDir "portable.flag") | Out-Null
+          Copy-Item $exePath (Join-Path $packageDir "LLM Gateway Desktop.exe")
+          Copy-Item "LICENSE" $packageDir
+          Copy-Item "THIRD_PARTY_NOTICES.md" $packageDir
+          Copy-Item "README.md" $packageDir
+
+          "LLM Gateway Desktop $version - Windows x64 Portable" |
+            Set-Content (Join-Path $packageDir "PORTABLE_README.txt") -Encoding UTF8
+
+          $zipName = "LLM-Gateway-Desktop_${version}_windows_x64_portable.zip"
+          $zipPath = Join-Path $portableRoot $zipName
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+
+      - name: Upload Windows portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-portable
+          path: portable/*.zip
+          if-no-files-found: error

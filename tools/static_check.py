@@ -21,6 +21,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUST_FILES = [
     "src-tauri/src/gateway.rs",
     "src-tauri/src/gateway_chat.rs",
+    "src-tauri/src/gateway_runtime.rs",
+    "src-tauri/src/gateway/protocol_tests.rs",
     "src-tauri/src/lib.rs",
     "src-tauri/src/main.rs",
     "src-tauri/src/config.rs",
@@ -30,12 +32,16 @@ RUST_FILES = [
     "src-tauri/src/database/backup.rs",
     "src-tauri/src/proxy/server.rs",
     "src-tauri/src/proxy/types.rs",
+    "src-tauri/src/proxy/body_recorder.rs",
     "src-tauri/src/proxy/forwarder.rs",
     "src-tauri/src/proxy/handlers.rs",
     "src-tauri/src/proxy/handler_context.rs",
     "src-tauri/src/proxy/model_mapper.rs",
+    "src-tauri/src/proxy/session.rs",
+    "src-tauri/src/proxy/session_affinity.rs",
     "src-tauri/src/proxy/response_processor.rs",
     "src-tauri/src/proxy/providers/codex.rs",
+    "src-tauri/src/provider.rs",
 ]
 
 
@@ -175,7 +181,14 @@ def check_public_branding() -> None:
         ".lock", ".plist", ".wxs", ".xml", ".sh", ".ps1",
     }
     matches: list[str] = []
+    ignored_roots = {".git", "node_modules", "dist", "target", "_refs"}
+    ignored_prefixes = {("docs", "history-session")}
     for path in ROOT.rglob("*"):
+        rel_parts = path.relative_to(ROOT).parts
+        if any(part in ignored_roots for part in rel_parts):
+            continue
+        if any(rel_parts[: len(prefix)] == prefix for prefix in ignored_prefixes):
+            continue
         if not path.is_file() or path in allowed:
             continue
         if path.suffix.lower() not in text_suffixes and path.name not in {
@@ -202,6 +215,7 @@ def main() -> None:
         "src-tauri/tauri.conf.json",
         "src-tauri/tauri.windows.conf.json",
         "src-tauri/capabilities/default.json",
+        "src-tauri/src/resources/model_capabilities.json",
     ]:
         json.loads((ROOT / rel).read_text(encoding="utf-8"))
         print(f"PASS  parse {rel}")
@@ -224,6 +238,7 @@ def main() -> None:
     server = (ROOT / "src-tauri/src/proxy/server.rs").read_text(encoding="utf-8")
     for route in [
         '"/health"',
+        '"/v1/gateway/status"',
         '"/v1/models"',
         '"/v1/messages"',
         '"/v1/chat/completions"',

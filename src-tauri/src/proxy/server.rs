@@ -14,6 +14,7 @@ use super::{
     log_codes::srv as log_srv,
     provider_router::ProviderRouter,
     providers::{codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore},
+    session_affinity::SessionAffinityStore,
     types::*,
     ProxyError,
 };
@@ -47,6 +48,11 @@ pub struct ProxyState {
     pub gemini_shadow: Arc<GeminiShadowStore>,
     /// Codex Chat bridge history，用于恢复 previous_response_id 指向的 tool call
     pub codex_chat_history: Arc<CodexChatHistoryStore>,
+    /// 会话 → provider 绑定表（会话亲和，跨请求保持）
+    ///
+    /// 见 `proxy::session_affinity`。只对**稳定**会话键建立绑定：
+    /// 客户端显式提供的会话 ID，或由内容哈希派生的稳定键。
+    pub session_affinity: Arc<RwLock<SessionAffinityStore>>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
@@ -83,6 +89,7 @@ impl ProxyServer {
             provider_router,
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            session_affinity: Arc::new(RwLock::new(SessionAffinityStore::default())),
             app_handle,
             failover_manager,
         };
@@ -340,6 +347,7 @@ impl ProxyServer {
     fn build_router(&self) -> Router {
         Router::new()
             .route("/health", get(handlers::health_check))
+            .route("/v1/gateway/status", get(handlers::handle_gateway_status))
             .route("/v1/models", get(handlers::handle_models))
             .route("/v1/messages", post(handlers::handle_messages))
             .route(
@@ -387,5 +395,34 @@ impl ProxyServer {
             .provider_router
             .reset_provider_breaker(provider_id, app_type)
             .await;
+    }
+
+    /// 读取指定 Provider 当前进程内的熔断器统计。
+    pub async fn get_circuit_breaker_stats(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Option<super::circuit_breaker::CircuitBreakerStats> {
+        self.state
+            .provider_router
+            .get_circuit_breaker_stats(provider_id, app_type)
+            .await
+    }
+
+    pub async fn get_provider_cooldown_remaining_seconds(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Option<u64> {
+        self.state
+            .provider_router
+            .provider_cooldown_remaining_seconds(provider_id, app_type)
+            .await
+    }
+
+    pub fn get_provider_capacity_snapshot(&self, source_provider_id: &str) -> (u32, u32, u32) {
+        self.state
+            .provider_router
+            .provider_capacity_snapshot(source_provider_id)
     }
 }

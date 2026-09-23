@@ -105,7 +105,13 @@ pub struct LogFilters {
     pub app_type: Option<String>,
     pub provider_name: Option<String>,
     pub model: Option<String>,
+    /// 客户端请求的公开模型名。与 `model`（实际/计价模型）分开，供路由日志页按
+    /// 用户看到的 alias 过滤。
+    pub request_model: Option<String>,
     pub status_code: Option<u16>,
+    /// Uses observed completion; legacy rows fall back to HTTP status.
+    pub success: Option<bool>,
+    pub outcome: Option<String>,
     pub start_date: Option<i64>,
     pub end_date: Option<i64>,
 }
@@ -132,6 +138,9 @@ pub struct RequestLogDetail {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    pub evidence: Option<crate::proxy::request_trace::Evidence>,
     pub cost_multiplier: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -159,15 +168,15 @@ pub struct RequestLogDetail {
     pub pricing_model: Option<String>,
 }
 
-/// 把 26 列的查询结果映射为 `RequestLogDetail`。
+/// 把 28 列的查询结果映射为 `RequestLogDetail`。
 ///
-/// 调用方的 SELECT **必须**按以下顺序返回 26 列：
+/// 调用方的 SELECT **必须**按以下顺序返回 28 列：
 /// `request_id, provider_id, provider_name, app_type, model, request_model,
 ///  cost_multiplier, input_tokens, output_tokens, cache_read_tokens,
 ///  cache_creation_tokens, input_cost_usd, output_cost_usd, cache_read_cost_usd,
 ///  cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
 ///  first_token_ms, duration_ms, status_code, error_message, created_at,
-///  data_source, pricing_model, input_token_semantics`
+///  data_source, pricing_model, input_token_semantics, reasoning_effort`
 ///
 /// 不需要 provider_name 时（如 backfill）SELECT `NULL AS provider_name` 占位即可。
 fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogDetail> {
@@ -200,6 +209,8 @@ fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
         data_source: row.get(23)?,
         pricing_model: row.get(24)?,
         input_token_semantics: row.get::<_, i64>(25)?,
+        reasoning_effort: row.get(26)?,
+        evidence: row.get::<_, Option<String>>(27)?.and_then(|v| serde_json::from_str(&v).ok()),
     })
 }
 
@@ -608,7 +619,7 @@ impl Database {
                     COALESCE(SUM(l.output_tokens), 0) as total_output_tokens,
                     COALESCE(SUM(l.cache_creation_tokens), 0) as total_cache_creation_tokens,
                     COALESCE(SUM(l.cache_read_tokens), 0) as total_cache_read_tokens,
-                    COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count
+                    COALESCE(SUM(CASE WHEN COALESCE((SELECT o.outcome IN ('direct_success', 'fallback_success') FROM request_observations o WHERE o.request_id = l.request_id), l.status_code >= 200 AND l.status_code < 300) THEN 1 ELSE 0 END), 0) as success_count
                  FROM proxy_request_logs l {detail_join} {where_clause}) d,
                 (SELECT
                     COALESCE(SUM(r.request_count), 0) as total_requests,
@@ -754,7 +765,7 @@ impl Database {
                     COALESCE(SUM(l.output_tokens), 0) as output_t,
                     COALESCE(SUM(l.cache_creation_tokens), 0) as cache_create_t,
                     COALESCE(SUM(l.cache_read_tokens), 0) as cache_read_t,
-                    COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count
+                    COALESCE(SUM(CASE WHEN COALESCE((SELECT o.outcome IN ('direct_success', 'fallback_success') FROM request_observations o WHERE o.request_id = l.request_id), l.status_code >= 200 AND l.status_code < 300) THEN 1 ELSE 0 END), 0) as success_count
                 FROM proxy_request_logs l {detail_join} {detail_where}
                 GROUP BY l.app_type
                 UNION ALL
@@ -1258,7 +1269,7 @@ impl Database {
                     COUNT(*) as request_count,
                     COALESCE(SUM({fresh_input_detail} + l.output_tokens), 0) as total_tokens,
                     COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0) as total_cost,
-                    COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count,
+                    COALESCE(SUM(CASE WHEN COALESCE((SELECT o.outcome IN ('direct_success', 'fallback_success') FROM request_observations o WHERE o.request_id = l.request_id), l.status_code >= 200 AND l.status_code < 300) THEN 1 ELSE 0 END), 0) as success_count,
                     COALESCE(SUM(l.latency_ms), 0) as latency_sum
                 FROM proxy_request_logs l
                 LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
@@ -1490,9 +1501,24 @@ impl Database {
             filters.provider_name.as_deref(),
             filters.model.as_deref(),
         );
+        if let Some(ref request_model) = filters.request_model {
+            conditions.push("COALESCE(NULLIF(l.request_model, ''), l.model) = ?".to_string());
+            params.push(Box::new(request_model.clone()));
+        }
         if let Some(status) = filters.status_code {
             conditions.push("l.status_code = ?".to_string());
             params.push(Box::new(status as i64));
+        }
+        if let Some(outcome) = &filters.outcome {
+            conditions.push("(SELECT o.outcome FROM request_observations o WHERE o.request_id = l.request_id) = ?".to_string());
+            params.push(Box::new(outcome.clone()));
+        }
+        if let Some(success) = filters.success {
+            conditions.push(if success {
+                "COALESCE((SELECT o.outcome IN ('direct_success', 'fallback_success') FROM request_observations o WHERE o.request_id = l.request_id), l.status_code >= 200 AND l.status_code < 300)".to_string()
+            } else {
+                "NOT COALESCE((SELECT o.outcome IN ('direct_success', 'fallback_success') FROM request_observations o WHERE o.request_id = l.request_id), l.status_code >= 200 AND l.status_code < 300)".to_string()
+            });
         }
         if let Some(start) = filters.start_date {
             conditions.push("l.created_at >= ?".to_string());
@@ -1533,7 +1559,8 @@ impl Database {
                     l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
                     l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
                     l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
-                    l.input_token_semantics
+                    l.input_token_semantics, l.reasoning_effort,
+                    (SELECT evidence FROM request_observations o WHERE o.request_id = l.request_id)
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              {where_clause}
@@ -1577,7 +1604,8 @@ impl Database {
                     input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                     is_streaming, latency_ms, first_token_ms, duration_ms,
                     status_code, error_message, created_at, l.data_source, l.pricing_model,
-                    l.input_token_semantics
+                    l.input_token_semantics, l.reasoning_effort,
+                    (SELECT evidence FROM request_observations o WHERE o.request_id = l.request_id)
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              WHERE l.request_id = ?"
@@ -1733,7 +1761,7 @@ impl Database {
                         input_cost_usd, output_cost_usd, cache_read_cost_usd,
                         cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
                         first_token_ms, duration_ms, status_code, error_message, created_at,
-                        data_source, pricing_model, input_token_semantics
+                        data_source, pricing_model, input_token_semantics, reasoning_effort, NULL AS evidence
              FROM proxy_request_logs
              WHERE CAST(total_cost_usd AS REAL) <= 0
                AND (input_tokens > 0 OR output_tokens > 0
@@ -2362,6 +2390,72 @@ mod tests {
         let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
         assert_eq!(count, 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_logs_filter_public_model_and_result_class() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let conn = lock_conn!(db.conn);
+        insert_usage_log(
+            &conn,
+            "success-request",
+            "codex",
+            "provider-success",
+            "upstream-model",
+            "proxy",
+            1_000,
+            10,
+            2,
+            0,
+            0,
+            200,
+            "0",
+        )?;
+        insert_usage_log(
+            &conn,
+            "failed-request",
+            "codex",
+            "provider-failed",
+            "upstream-model",
+            "proxy",
+            1_001,
+            0,
+            0,
+            0,
+            0,
+            400,
+            "0",
+        )?;
+        conn.execute(
+            "UPDATE proxy_request_logs SET request_model = 'public-alias'",
+            [],
+        )?;
+        drop(conn);
+
+        let successful = db.get_request_logs(
+            &LogFilters {
+                request_model: Some("public-alias".to_string()),
+                success: Some(true),
+                ..Default::default()
+            },
+            0,
+            50,
+        )?;
+        assert_eq!(successful.total, 1);
+        assert_eq!(successful.data[0].request_id, "success-request");
+
+        let failed = db.get_request_logs(
+            &LogFilters {
+                request_model: Some("public-alias".to_string()),
+                success: Some(false),
+                ..Default::default()
+            },
+            0,
+            50,
+        )?;
+        assert_eq!(failed.total, 1);
+        assert_eq!(failed.data[0].request_id, "failed-request");
         Ok(())
     }
 

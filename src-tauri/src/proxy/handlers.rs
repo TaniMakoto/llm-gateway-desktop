@@ -13,7 +13,7 @@ use super::{
     forwarder::ActiveConnectionGuard,
     handler_config::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
-        CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG,
+        CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
     providers::{
@@ -34,10 +34,10 @@ use super::{
     response_processor::{
         create_logged_passthrough_stream, process_response, read_decoded_body,
         strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
-        usage_logging_enabled, SseUsageCollector,
+        usage_logging_enabled, PassthroughDiagnostics, SseUsageCollector,
     },
     server::ProxyState,
-    sse::{strip_sse_field, take_sse_block},
+    sse::{strip_sse_field, take_sse_block, ClientSseProtocol},
     types::*,
     usage::parser::TokenUsage,
     ProxyError,
@@ -68,6 +68,26 @@ pub async fn health_check() -> (StatusCode, Json<Value>) {
 pub async fn get_status(State(state): State<ProxyState>) -> Result<Json<ProxyStatus>, ProxyError> {
     let status = state.status.read().await.clone();
     Ok(Json(status))
+}
+
+/// Authenticated gateway runtime status for local API clients and diagnostics.
+pub async fn handle_gateway_status(
+    State(state): State<ProxyState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, ProxyError> {
+    crate::gateway::validate_local_auth(state.db.as_ref(), &headers)?;
+    let runtime = crate::gateway::gateway_runtime_statuses_for_router(
+        state.db.as_ref(),
+        state.provider_router.as_ref(),
+    )
+    .await
+    .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
+    let status = state.status.read().await.clone();
+    Ok(Json(json!({
+        "status": status,
+        "provider_runtime": runtime,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    })))
 }
 
 /// GET /v1/models — Codex model list (reachability check)
@@ -195,6 +215,7 @@ async fn handle_messages_for_app(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
+            ctx.reasoning_effort = err.outbound_reasoning_effort.take();
             log_forward_error(&state, &ctx, is_stream, &err.error);
             return Err(err.error);
         }
@@ -202,6 +223,7 @@ async fn handle_messages_for_app(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.reasoning_effort = result.outbound_reasoning_effort.take();
     ctx.provider = result.provider;
     let api_format = result
         .claude_api_format
@@ -280,6 +302,8 @@ struct ClaudeUsageLog {
     latency_ms: u64,
     status_code: u16,
     is_streaming: bool,
+    reasoning_effort: Option<String>,
+    trace: super::request_trace::RequestTrace,
 }
 
 fn prepare_claude_usage_log(
@@ -313,6 +337,8 @@ fn prepare_claude_usage_log(
         latency_ms: ctx.latency_ms(),
         status_code,
         is_streaming,
+        reasoning_effort: ctx.reasoning_effort.clone(),
+        trace: ctx.trace.clone(),
     })
 }
 
@@ -330,6 +356,8 @@ async fn write_claude_usage_log(state: &ProxyState, log: ClaudeUsageLog) {
         log.is_streaming,
         log.status_code,
         Some(log.session_id),
+        log.reasoning_effort,
+        log.trace,
     )
     .await;
 }
@@ -422,6 +450,8 @@ async fn handle_claude_transform(
             let status_code = status.as_u16();
             let start_time = ctx.start_time;
             let session_id = ctx.session_id.clone();
+            let reasoning_effort = ctx.reasoning_effort.clone();
+            let trace = ctx.trace.clone();
             // 用 ctx 的 app_type：Claude Desktop 网关也走此转换路径，硬编码
             // "claude" 会把 claude-desktop 的行错记到 claude 名下
             let app_type_str = ctx.app_type_str;
@@ -442,6 +472,8 @@ async fn handle_claude_transform(
                         let session_id = session_id.clone();
                         let request_model = request_model.clone();
                         let outbound_model = fallback_model.clone();
+                        let reasoning_effort = reasoning_effort.clone();
+                        let trace = trace.clone();
 
                         tokio::spawn(async move {
                             log_usage(
@@ -457,6 +489,8 @@ async fn handle_claude_transform(
                                 true,
                                 status_code,
                                 Some(session_id),
+                                reasoning_effort,
+                                trace,
                             )
                             .await;
                         });
@@ -474,7 +508,16 @@ async fn handle_claude_transform(
 
         let logged_stream = create_logged_passthrough_stream(
             sse_stream,
-            "Claude/OpenRouter",
+            PassthroughDiagnostics {
+                trace: Some(ctx.trace.clone()),
+                tag: "Claude/OpenRouter",
+                protocol: ClientSseProtocol::Anthropic,
+                provider_id: ctx.provider.id.clone(),
+                model: ctx
+                    .outbound_model
+                    .clone()
+                    .unwrap_or_else(|| ctx.request_model.clone()),
+            },
             usage_collector,
             timeout_config,
             connection_guard,
@@ -679,14 +722,22 @@ pub async fn handle_chat_completions(
     state: State<ProxyState>,
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, ProxyError> {
-    crate::gateway_chat::handle_chat_completions(state, request).await
+    handle_openai_request(state, request, true).await
 }
 
 
 /// 处理 /v1/responses 请求（OpenAI Responses API - Codex CLI 透传）
 pub async fn handle_responses(
+    state: State<ProxyState>,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    handle_openai_request(state, request, false).await
+}
+
+async fn handle_openai_request(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
+    source_chat: bool,
 ) -> Result<axum::response::Response, ProxyError> {
     crate::gateway::validate_local_auth(state.db.as_ref(), request.headers())?;
     let (parts, req_body) = request.into_parts();
@@ -701,17 +752,21 @@ pub async fn handle_responses(
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+        .map_err(|e| ProxyError::InvalidRequest(format!("Invalid request JSON: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex", Some("openai_responses")).await?;
-    let endpoint = endpoint_with_query(&uri, "/responses");
+    super::request_plan::validate_openai_request(&body, source_chat)?;
+    let format = if source_chat { "openai_chat" } else { "openai_responses" };
+    let tag = if source_chat { "Chat" } else { "Responses" };
+    let mut ctx = RequestContext::new(
+        &state, &body, &headers, AppType::Codex, tag, "codex", Some(format),
+    ).await?;
+    let endpoint = endpoint_with_query(&uri, if source_chat { "/chat/completions" } else { "/responses" });
 
     let is_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
+    let original_body = body.clone();
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -731,6 +786,7 @@ pub async fn handle_responses(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
+            ctx.reasoning_effort = err.outbound_reasoning_effort.take();
             log_forward_error(&state, &ctx, is_stream, &err.error);
             return build_codex_proxy_error_response(&ctx, &endpoint, &err.error);
         }
@@ -738,41 +794,42 @@ pub async fn handle_responses(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.reasoning_effort = result.outbound_reasoning_effort.take();
     ctx.provider = result.provider;
     let response = result.response;
 
-    if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
-        return handle_codex_anthropic_to_responses_transform(
-            response,
-            &ctx,
-            &state,
-            is_stream,
-            connection_guard,
-            codex_tool_context,
-        )
-        .await;
+    // Select response processing using the actual successful candidate, not the first route.
+    let native_chat = source_chat
+        && super::providers::codex_provider_uses_chat_completions(&ctx.provider);
+    if native_chat {
+        return process_response(response, &ctx, &state, &OPENAI_PARSER_CONFIG, connection_guard).await;
     }
-
-    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
-        return handle_codex_chat_to_responses_transform(
-            response,
-            &ctx,
-            &state,
-            is_stream,
-            connection_guard,
-            codex_tool_context,
-        )
-        .await;
+    let context_body = if source_chat {
+        crate::gateway_chat::chat_request_to_responses(original_body)?
+    } else {
+        original_body
+    };
+    let tool_context = transform_codex_chat::build_codex_tool_context_from_request(&context_body);
+    let response = if super::providers::codex_provider_uses_anthropic(&ctx.provider) {
+        handle_codex_anthropic_to_responses_transform(
+            response, &ctx, &state, is_stream, connection_guard, tool_context,
+        ).await?
+    } else if super::providers::codex_provider_uses_chat_completions(&ctx.provider) {
+        handle_codex_chat_to_responses_transform(
+            response, &ctx, &state, is_stream, connection_guard, tool_context,
+        ).await?
+    } else {
+        process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG, connection_guard).await?
+    };
+    if source_chat && response.status().is_success() {
+        if is_stream {
+            Ok(crate::gateway_chat::responses_sse_to_chat_response(response, ctx.request_model))
+        } else {
+            crate::gateway_chat::responses_json_to_chat_response(response, &ctx.request_model).await
+        }
+    } else {
+        Ok(response)
     }
-
-    process_response(
-        response,
-        &ctx,
-        &state,
-        &CODEX_PARSER_CONFIG,
-        connection_guard,
-    )
-    .await
 }
 
 /// 处理 /v1/responses/compact 请求（OpenAI Responses Compact API - Codex CLI 透传）
@@ -823,6 +880,7 @@ pub async fn handle_responses_compact(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
+            ctx.reasoning_effort = err.outbound_reasoning_effort.take();
             log_forward_error(&state, &ctx, is_stream, &err.error);
             return build_codex_proxy_error_response(&ctx, &endpoint, &err.error);
         }
@@ -830,6 +888,7 @@ pub async fn handle_responses_compact(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.reasoning_effort = result.outbound_reasoning_effort.take();
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -901,6 +960,8 @@ async fn handle_codex_chat_to_responses_transform(
             let app_type_str = ctx.app_type_str;
             let start_time = ctx.start_time;
             let session_id = ctx.session_id.clone();
+            let reasoning_effort = ctx.reasoning_effort.clone();
+            let trace = ctx.trace.clone();
 
             Some(SseUsageCollector::new(
                 start_time,
@@ -929,6 +990,8 @@ async fn handle_codex_chat_to_responses_transform(
                     let request_model = request_model.clone();
                     let outbound_model = fallback_model.clone();
                     let session_id = session_id.clone();
+                    let reasoning_effort = reasoning_effort.clone();
+                    let trace = trace.clone();
 
                     tokio::spawn(async move {
                         log_usage(
@@ -944,6 +1007,8 @@ async fn handle_codex_chat_to_responses_transform(
                             true,
                             status.as_u16(),
                             Some(session_id),
+                            reasoning_effort,
+                            trace,
                         )
                         .await;
                     });
@@ -955,7 +1020,16 @@ async fn handle_codex_chat_to_responses_transform(
 
         let logged_stream = create_logged_passthrough_stream(
             sse_stream,
-            ctx.tag,
+            PassthroughDiagnostics {
+                trace: Some(ctx.trace.clone()),
+                tag: ctx.tag,
+                protocol: ClientSseProtocol::Responses,
+                provider_id: ctx.provider.id.clone(),
+                model: ctx
+                    .outbound_model
+                    .clone()
+                    .unwrap_or_else(|| ctx.request_model.clone()),
+            },
             usage_collector,
             ctx.streaming_timeout_config(),
             connection_guard,
@@ -1045,6 +1119,8 @@ async fn handle_codex_chat_to_responses_transform(
             let provider_id = ctx.provider.id.clone();
             let session_id = ctx.session_id.clone();
             let latency_ms = ctx.latency_ms();
+            let reasoning_effort = ctx.reasoning_effort.clone();
+            let trace = ctx.trace.clone();
             async move {
                 log_usage(
                     &state,
@@ -1059,6 +1135,8 @@ async fn handle_codex_chat_to_responses_transform(
                     false,
                     status.as_u16(),
                     Some(session_id),
+                    reasoning_effort,
+                    trace,
                 )
                 .await;
             }
@@ -1209,6 +1287,8 @@ async fn handle_codex_anthropic_to_responses_transform(
             let provider_id = ctx.provider.id.clone();
             let session_id = ctx.session_id.clone();
             let latency_ms = ctx.latency_ms();
+            let reasoning_effort = ctx.reasoning_effort.clone();
+            let trace = ctx.trace.clone();
             async move {
                 log_usage(
                     &state,
@@ -1223,6 +1303,8 @@ async fn handle_codex_anthropic_to_responses_transform(
                     false,
                     status.as_u16(),
                     Some(session_id),
+                    reasoning_effort,
+                    trace,
                 )
                 .await;
             }
@@ -1273,6 +1355,8 @@ fn build_codex_anthropic_sse_response(
         let app_type_str = ctx.app_type_str;
         let start_time = ctx.start_time;
         let session_id = ctx.session_id.clone();
+        let reasoning_effort = ctx.reasoning_effort.clone();
+        let trace = ctx.trace.clone();
 
         Some(SseUsageCollector::new(
             start_time,
@@ -1295,6 +1379,8 @@ fn build_codex_anthropic_sse_response(
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
                 let session_id = session_id.clone();
+                let reasoning_effort = reasoning_effort.clone();
+                let trace = trace.clone();
 
                 tokio::spawn(async move {
                     log_usage(
@@ -1310,6 +1396,8 @@ fn build_codex_anthropic_sse_response(
                         true,
                         status.as_u16(),
                         Some(session_id),
+                        reasoning_effort,
+                        trace,
                     )
                     .await;
                 });
@@ -1321,7 +1409,16 @@ fn build_codex_anthropic_sse_response(
 
     let logged_stream = create_logged_passthrough_stream(
         sse_stream,
-        ctx.tag,
+        PassthroughDiagnostics {
+            trace: Some(ctx.trace.clone()),
+            tag: ctx.tag,
+            protocol: ClientSseProtocol::Responses,
+            provider_id: ctx.provider.id.clone(),
+            model: ctx
+                .outbound_model
+                .clone()
+                .unwrap_or_else(|| ctx.request_model.clone()),
+        },
         usage_collector,
         ctx.streaming_timeout_config(),
         connection_guard,
@@ -1503,14 +1600,14 @@ fn codex_proxy_error_json(
         let cause = error_obj
             .get("message")
             .and_then(|value| value.as_str())
-            .map(ToString::to_string)
+            .map(summarize_upstream_error_cause)
             .filter(|message| !message.trim().is_empty())
-            .unwrap_or_else(|| get_error_message(error));
+            .unwrap_or_else(|| summarize_upstream_error_cause(&get_error_message(error)));
         let status_fragment = upstream_status
             .map(|status| format!("; upstream_status: HTTP {status}"))
             .unwrap_or_default();
         format!(
-            "LLM Gateway Desktop local proxy failed while handling Codex endpoint {endpoint}. Provider: {provider_name}; model: {request_model}{status_fragment}; cause: {cause}"
+            "LLM Gateway Desktop local proxy failed while handling endpoint {endpoint}. Provider: {provider_name}; model: {request_model}{status_fragment}; cause: {cause}"
         )
     };
 
@@ -1564,6 +1661,7 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::ForwardFailed(_) => "llm_gateway_forward_failed",
         ProxyError::Timeout(_) | ProxyError::StreamIdleTimeout(_) => "llm_gateway_timeout",
         ProxyError::NoAvailableProvider => "llm_gateway_no_available_provider",
+        ProxyError::GatewayOverloaded(_) => "llm_gateway_overloaded",
         ProxyError::AllProvidersCircuitOpen => "llm_gateway_all_providers_circuit_open",
         ProxyError::NoProvidersConfigured => "llm_gateway_no_providers_configured",
         ProxyError::MaxRetriesExceeded => "llm_gateway_max_retries_exceeded",
@@ -1596,6 +1694,24 @@ fn compact_error_message(message: &str, max_chars: usize) -> String {
         .trim_end()
         .to_string();
     format!("{truncated}…(truncated)")
+}
+
+fn summarize_upstream_error_cause(message: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = normalized.to_ascii_lowercase();
+    if lower.contains("<html") || lower.contains("<!doctype html") {
+        if let (Some(start), Some(end)) = (lower.find("<title>"), lower.find("</title>")) {
+            let content_start = start + "<title>".len();
+            if end > content_start {
+                let title = normalized[content_start..end].trim();
+                if !title.is_empty() {
+                    return format!("upstream HTML error page: {}", compact_error_message(title, 240));
+                }
+            }
+        }
+        return "upstream returned an HTML error page".to_string();
+    }
+    compact_error_message(&normalized, 1200)
 }
 
 // ============================================================================
@@ -1660,6 +1776,7 @@ pub async fn handle_gemini(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
+            ctx.reasoning_effort = err.outbound_reasoning_effort.take();
             log_forward_error(&state, &ctx, is_stream, &err.error);
             return Err(err.error);
         }
@@ -1667,6 +1784,7 @@ pub async fn handle_gemini(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.reasoning_effort = result.outbound_reasoning_effort.take();
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -2239,7 +2357,7 @@ fn log_forward_error(
 ) {
     use super::usage::logger::UsageLogger;
 
-    let logger = UsageLogger::new(&state.db);
+    let logger = UsageLogger::new(&state.db).with_trace(ctx.trace.clone());
     let status_code = map_proxy_error_to_status(error);
     let error_message = get_error_message(error);
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -2255,6 +2373,7 @@ fn log_forward_error(
         is_streaming,
         Some(ctx.session_id.clone()),
         None,
+        ctx.reasoning_effort.clone(),
     ) {
         log::warn!("记录失败请求日志失败: {e}");
     }
@@ -2278,6 +2397,8 @@ async fn log_usage(
     is_streaming: bool,
     status_code: u16,
     session_id: Option<String>,
+    reasoning_effort: Option<String>,
+    trace: super::request_trace::RequestTrace,
 ) {
     use super::usage::logger::UsageLogger;
 
@@ -2285,7 +2406,7 @@ async fn log_usage(
         return;
     }
 
-    let logger = UsageLogger::new(&state.db);
+    let logger = UsageLogger::new(&state.db).with_trace(trace);
 
     let (multiplier, pricing_model_source) =
         logger.resolve_pricing_config(provider_id, app_type).await;
@@ -2312,6 +2433,7 @@ async fn log_usage(
         session_id,
         None, // provider_type
         is_streaming,
+        reasoning_effort,
     ) {
         log::warn!("[USG-001] 记录使用量失败: {e}");
     }
@@ -2998,5 +3120,28 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         assert_eq!(body["error"]["provider"], "HCAI");
         assert_eq!(body["error"]["model"], "gpt-5.5");
         assert_eq!(body["error"]["endpoint"], "/responses");
+    }
+
+    #[test]
+    fn codex_proxy_html_error_keeps_title_and_drops_embedded_payload() {
+        let error = ProxyError::UpstreamError {
+            status: 504,
+            body: Some(
+                r#"<html><head><title>无法连接到服务器</title><style>@font-face{src:url(data:font/woff2;base64,AAAAAAAAAAAAAAAA)}</style></head><body>gateway timeout</body></html>"#
+                    .to_string(),
+            ),
+        };
+
+        let body = codex_proxy_error_json(
+            "黑与白默认 · openai_chat",
+            "deepseek-v4-flash",
+            "/responses",
+            &error,
+        );
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("HTTP 504"));
+        assert!(message.contains("无法连接到服务器"));
+        assert!(!message.contains("base64"));
+        assert!(!message.contains("@font-face"));
     }
 }

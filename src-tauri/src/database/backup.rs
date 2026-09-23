@@ -18,6 +18,7 @@ const LLM_GATEWAY_SQL_EXPORT_HEADER: &str = "-- LLM Gateway Desktop SQLite å¯¼å‡
 /// Tables whose data rows are skipped when exporting for WebDAV sync.
 const SYNC_SKIP_TABLES: &[&str] = &[
     "proxy_request_logs",
+    "request_observations",
     "stream_check_logs",
     "provider_health",
     "proxy_live_backup",
@@ -28,6 +29,7 @@ const SYNC_SKIP_TABLES: &[&str] = &[
 /// Excludes ephemeral tables like provider_health that can safely rebuild at runtime.
 const SYNC_PRESERVE_TABLES: &[&str] = &[
     "proxy_request_logs",
+    "request_observations",
     "stream_check_logs",
     "proxy_live_backup",
     "usage_daily_rollups",

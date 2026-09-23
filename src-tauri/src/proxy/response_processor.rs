@@ -9,7 +9,9 @@ use super::{
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::ProxyResponse,
     server::ProxyState,
-    sse::{strip_sse_field, take_sse_block},
+    sse::{
+        strip_sse_field, take_sse_block, ClientSseProtocol, SseTerminalState, TerminalMarkerScanner,
+    },
     usage::parser::TokenUsage,
     ProxyError,
 };
@@ -24,7 +26,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
 
@@ -188,7 +190,16 @@ pub async fn handle_streaming(
     // 创建带日志和超时的透传流
     let logged_stream = create_logged_passthrough_stream(
         stream,
-        ctx.tag,
+        PassthroughDiagnostics {
+            trace: Some(ctx.trace.clone()),
+            tag: ctx.tag,
+            protocol: parser_config.stream_protocol,
+            provider_id: ctx.provider.id.clone(),
+            model: ctx
+                .outbound_model
+                .clone()
+                .unwrap_or_else(|| ctx.request_model.clone()),
+        },
         usage_collector,
         timeout_config,
         connection_guard,
@@ -489,6 +500,8 @@ fn create_usage_collector(
     let stream_parser = parser_config.stream_parser;
     let model_extractor = parser_config.model_extractor;
     let session_id = ctx.session_id.clone();
+    let reasoning_effort = ctx.reasoning_effort.clone();
+    let trace = ctx.trace.clone();
 
     Some(SseUsageCollector::new(
         start_time,
@@ -503,6 +516,8 @@ fn create_usage_collector(
                 let session_id = session_id.clone();
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
+                let reasoning_effort = reasoning_effort.clone();
+                let trace = trace.clone();
 
                 tokio::spawn(async move {
                     log_usage_internal(
@@ -518,6 +533,8 @@ fn create_usage_collector(
                         true, // is_streaming
                         status_code,
                         Some(session_id),
+                        reasoning_effort,
+                        trace,
                     )
                     .await;
                 });
@@ -529,6 +546,8 @@ fn create_usage_collector(
                 let session_id = session_id.clone();
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
+                let reasoning_effort = reasoning_effort.clone();
+                let trace = trace.clone();
 
                 tokio::spawn(async move {
                     log_usage_internal(
@@ -544,6 +563,8 @@ fn create_usage_collector(
                         true, // is_streaming
                         status_code,
                         Some(session_id),
+                        reasoning_effort,
+                        trace,
                     )
                     .await;
                 });
@@ -582,6 +603,8 @@ fn spawn_log_usage(
         .unwrap_or_else(|| ctx.request_model.clone());
     let latency_ms = ctx.latency_ms();
     let session_id = ctx.session_id.clone();
+    let reasoning_effort = ctx.reasoning_effort.clone();
+    let trace = ctx.trace.clone();
 
     tokio::spawn(async move {
         log_usage_internal(
@@ -597,6 +620,8 @@ fn spawn_log_usage(
             is_streaming,
             status_code,
             Some(session_id),
+            reasoning_effort,
+            trace,
         )
         .await;
     });
@@ -630,10 +655,12 @@ async fn log_usage_internal(
     is_streaming: bool,
     status_code: u16,
     session_id: Option<String>,
+    reasoning_effort: Option<String>,
+    trace: super::request_trace::RequestTrace,
 ) {
     use super::usage::logger::UsageLogger;
 
-    let logger = UsageLogger::new(&state.db);
+    let logger = UsageLogger::new(&state.db).with_trace(trace);
     let (multiplier, pricing_model_source) =
         logger.resolve_pricing_config(provider_id, app_type).await;
     let pricing_model = if pricing_model_source == PRICING_SOURCE_REQUEST {
@@ -668,21 +695,59 @@ async fn log_usage_internal(
         session_id,
         None, // provider_type
         is_streaming,
+        reasoning_effort,
     ) {
         log::warn!("[USG-001] 记录使用量失败: {e}");
+    }
+}
+
+/// 透传流的诊断上下文。**只用于上游异常结束时的 ERROR 日志**，不参与任何转发决策。
+pub(crate) struct PassthroughDiagnostics {
+    pub trace: Option<super::request_trace::RequestTrace>,
+    /// 日志前缀，沿用既有 `[{tag}]` 格式（如 "Claude"、"Codex"）
+    pub tag: &'static str,
+    /// 客户端侧 SSE 协议（决定"正常结束标记"的形态）
+    pub protocol: ClientSseProtocol,
+    /// 上游 provider id
+    pub provider_id: String,
+    /// 出站模型名（路由映射后的真值，缺失时调用方用请求别名兜底）
+    pub model: String,
+}
+
+/// 按应用类型推断客户端侧 SSE 协议。
+///
+/// Claude / Claude Desktop 客户端说 Anthropic Messages，Codex 说 OpenAI Responses，
+/// 其余（Gemini 以及透传的 OpenAI 兼容客户端）按 data-only SSE 处理。
+pub(crate) fn client_sse_protocol_for_app(app_type_str: &str) -> ClientSseProtocol {
+    match app_type_str {
+        "claude" | "claude-desktop" => ClientSseProtocol::Anthropic,
+        "codex" => ClientSseProtocol::Responses,
+        _ => ClientSseProtocol::Chat,
     }
 }
 
 /// 创建带日志记录和超时控制的透传流
 pub fn create_logged_passthrough_stream(
     stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
-    tag: &'static str,
+    diagnostics: PassthroughDiagnostics,
     usage_collector: Option<SseUsageCollector>,
     timeout_config: StreamingTimeoutConfig,
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let _conn_guard = connection_guard;
+        let PassthroughDiagnostics {
+            trace,
+            tag,
+            protocol,
+            provider_id,
+            model,
+        } = diagnostics;
+        // 以下三个量只喂给断流日志，不影响下发的字节。
+        let stream_start = Instant::now();
+        let mut forwarded_events: u64 = 0;
+        let mut forwarded_bytes: u64 = 0;
+        let mut terminal = TerminalMarkerScanner::new(protocol);
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut collector = usage_collector;
@@ -722,6 +787,7 @@ pub fn create_logged_passthrough_stream(
                             // 超时
                             let timeout_type = if is_first_chunk { "首字节" } else { "静默期" };
                             log::error!("[{tag}] 流式响应{}超时 ({}秒)", timeout_type, duration.as_secs());
+                            if let Some(trace) = &trace { trace.interrupt_stream(format!("上游流式响应{timeout_type}超时（{}秒）", duration.as_secs())); }
                             yield Err(std::io::Error::other(format!("流式响应{timeout_type}超时")));
                             break;
                         }
@@ -739,36 +805,43 @@ pub fn create_logged_passthrough_stream(
                         );
                     }
                     is_first_chunk = false;
-                    if inspect_sse_events {
-                        crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    forwarded_bytes += bytes.len() as u64;
+                    // 无条件累积并切块：既供 usage collector / debug 日志使用，也用于
+                    // 统计已下发事件数并观察协议终态（只喂给断流日志）。
+                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
 
-                        // 尝试解析并记录完整的 SSE 事件
-                        while let Some(event_text) = take_sse_block(&mut buffer) {
-                            if !event_text.trim().is_empty() {
-                                // 提取 data 部分；只有 usage collector 存在时才解析 JSON。
-                                for line in event_text.lines() {
-                                    if let Some(data) = strip_sse_field(line, "data") {
-                                        if data.trim() != "[DONE]" {
-                                            let collected = match &collector {
-                                                Some(c) if c.should_collect(data) => {
-                                                    match serde_json::from_str::<Value>(data) {
-                                                        Ok(json_value) => {
-                                                            c.push(json_value).await;
-                                                            true
-                                                        }
-                                                        Err(_) => false,
+                    // 尝试解析并记录完整的 SSE 事件
+                    while let Some(event_text) = take_sse_block(&mut buffer) {
+                        if event_text.trim().is_empty() {
+                            continue;
+                        }
+                        forwarded_events += 1;
+                        terminal.push(&event_text);
+
+                        if inspect_sse_events {
+                            // 提取 data 部分；只有 usage collector 存在时才解析 JSON。
+                            for line in event_text.lines() {
+                                if let Some(data) = strip_sse_field(line, "data") {
+                                    if data.trim() != "[DONE]" {
+                                        let collected = match &collector {
+                                            Some(c) if c.should_collect(data) => {
+                                                match serde_json::from_str::<Value>(data) {
+                                                    Ok(json_value) => {
+                                                        c.push(json_value).await;
+                                                        true
                                                     }
+                                                    Err(_) => false,
                                                 }
-                                                _ => false,
-                                            };
-                                            if collected {
-                                                log::debug!("[{tag}] <<< SSE 事件: {data}");
-                                            } else {
-                                                log::debug!("[{tag}] <<< SSE 数据: {data}");
                                             }
+                                            _ => false,
+                                        };
+                                        if collected {
+                                            log::debug!("[{tag}] <<< SSE 事件: {data}");
                                         } else {
-                                            log::debug!("[{tag}] <<< SSE: [DONE]");
+                                            log::debug!("[{tag}] <<< SSE 数据: {data}");
                                         }
+                                    } else {
+                                        log::debug!("[{tag}] <<< SSE: [DONE]");
                                     }
                                 }
                             }
@@ -778,12 +851,30 @@ pub fn create_logged_passthrough_stream(
                     yield Ok(bytes);
                 }
                 Some(Err(e)) => {
-                    log::error!("[{tag}] 流错误: {e}");
+                    // 上游流中途断开。行为不变（仍然 yield Err 让连接按原语义收尾），
+                    // 只是补上可定位的上下文：此前这条日志既没有 provider/model，也
+                    // 不知道已经下发了多少内容，排查"客户端表现成静默中断"时没用。
+                    log::error!(
+                        "[{tag}] 上游流式中断: provider={provider_id}, model={model}, 协议={}, 终态={:?}, 已转发 {forwarded_events} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms, error={e}",
+                        protocol.name(),
+                        terminal.state(),
+                        stream_start.elapsed().as_millis()
+                    );
+                    if let Some(trace) = &trace { trace.interrupt_stream(e.to_string()); }
                     yield Err(std::io::Error::other(e.to_string()));
                     break;
                 }
                 None => {
-                    // 流正常结束
+                    // 流正常结束。正常收尾都会带本协议的终态标记；到 EOF 仍停在
+                    // Pending 说明上游提前收口（close-delimited 响应在字节层看不出
+                    // 错误），记一条 ERROR 便于事后区分"干净结束"与"半条消息"。
+                    if terminal.state() == SseTerminalState::Pending && forwarded_events > 0 {
+                        log::error!(
+                            "[{tag}] 上游流式响应提前结束（未收到 {} 的正常结束标记）: provider={provider_id}, model={model}, 已转发 {forwarded_events} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms",
+                            protocol.name(),
+                            stream_start.elapsed().as_millis()
+                        );
+                    }
                     break;
                 }
             }
@@ -820,6 +911,7 @@ mod tests {
     use crate::proxy::providers::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore,
     };
+    use crate::proxy::session_affinity::SessionAffinityStore;
     use crate::proxy::types::{ProxyConfig, ProxyStatus};
     use rust_decimal::Decimal;
     use std::collections::HashMap;
@@ -943,6 +1035,7 @@ mod tests {
             provider_router: Arc::new(ProviderRouter::new(db.clone())),
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            session_affinity: Arc::new(RwLock::new(SessionAffinityStore::default())),
             app_handle: None,
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
         }
@@ -1022,6 +1115,8 @@ mod tests {
             false,
             200,
             None,
+            None,
+            Default::default(),
         )
         .await;
 
@@ -1092,6 +1187,8 @@ mod tests {
             false,
             200,
             None,
+            None,
+            Default::default(),
         )
         .await;
 
@@ -1172,6 +1269,8 @@ mod tests {
             false,
             200,
             None,
+            None,
+            Default::default(),
         )
         .await;
 
@@ -1194,5 +1293,67 @@ mod tests {
             Decimal::from_str("1.5").unwrap()
         );
         Ok(())
+    }
+
+    /// 诊断上下文只加日志，不得改变下发给客户端的字节序列，也不得吞掉上游错误，
+    /// 更不得在流末尾追加任何"人造"事件。
+    #[tokio::test]
+    async fn passthrough_stream_diagnostics_do_not_alter_the_byte_stream() {
+        let diagnostics = || PassthroughDiagnostics {
+            trace: None,
+            tag: "Test",
+            protocol: ClientSseProtocol::Anthropic,
+            provider_id: "provider-test".to_string(),
+            model: "test-model".to_string(),
+        };
+        let timeout_config = StreamingTimeoutConfig {
+            first_byte_timeout: 0,
+            idle_timeout: 0,
+        };
+
+        // 干净收尾：message_stop 之后既不加字节也不报错。
+        let expected_len = 2;
+        let out = create_logged_passthrough_stream(
+            futures::stream::iter(vec![
+                Ok(Bytes::from_static(
+                    b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+                )),
+                Ok(Bytes::from_static(
+                    b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                )),
+            ]),
+            diagnostics(),
+            None,
+            timeout_config,
+            None,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(out.len(), expected_len, "干净收尾不得追加任何字节");
+        assert!(out.iter().all(|result| result.is_ok()));
+
+        // 上游半途断开：错误必须原样传播（仍然 yield Err），不做 in-band 转换。
+        let broken: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            )),
+            Err(std::io::Error::other("upstream reset mid-stream")),
+        ];
+        let expected_len = broken.len();
+        let out = create_logged_passthrough_stream(
+            futures::stream::iter(broken),
+            diagnostics(),
+            None,
+            timeout_config,
+            None,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(out.len(), expected_len);
+        assert!(out[0].is_ok());
+        assert!(
+            out[1].is_err(),
+            "上游错误必须继续向下游传播，诊断层不得把它吞成正常 EOF"
+        );
     }
 }

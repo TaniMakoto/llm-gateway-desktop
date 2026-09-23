@@ -150,7 +150,7 @@ impl Database {
                     COALESCE(l.request_model, '') as rm,
                     COALESCE(l.pricing_model, '') as pm,
                     COUNT(*) as new_req,
-                    SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END) as new_succ,
+                    SUM(CASE WHEN COALESCE((SELECT o.outcome IN ('direct_success', 'fallback_success') FROM request_observations o WHERE o.request_id = l.request_id), l.status_code >= 200 AND l.status_code < 300) THEN 1 ELSE 0 END) as new_succ,
                     COALESCE(SUM({fresh_detail_input}), 0) as new_in,
                     COALESCE(SUM(l.output_tokens), 0) as new_out,
                     COALESCE(SUM(l.cache_read_tokens), 0) as new_cr,

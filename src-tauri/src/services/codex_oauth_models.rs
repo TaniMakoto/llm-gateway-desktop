@@ -75,6 +75,10 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
             id: id.to_string(),
             owned_by: Some("Codex".to_string()),
             display_name: None,
+            context_length: None,
+            max_output_tokens: None,
+            input_modalities: Vec::new(),
+            reasoning_levels: Vec::new(),
         });
         return;
     }
@@ -85,6 +89,10 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
                 id: id.to_string(),
                 owned_by: Some("Codex".to_string()),
                 display_name: None,
+                context_length: None,
+                max_output_tokens: None,
+                input_modalities: Vec::new(),
+                reasoning_levels: Vec::new(),
             });
         }
         return;
@@ -111,6 +119,10 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
         id,
         owned_by,
         display_name,
+        context_length: None,
+        max_output_tokens: None,
+        input_modalities: Vec::new(),
+        reasoning_levels: Vec::new(),
     });
 }
 

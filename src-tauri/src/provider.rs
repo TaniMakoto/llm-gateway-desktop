@@ -44,6 +44,34 @@ pub struct Provider {
 }
 
 impl Provider {
+    pub fn gateway_source_provider_id(&self) -> &str {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.gateway_source_provider_id.as_deref())
+            .unwrap_or(&self.id)
+    }
+
+    pub fn gateway_max_concurrent_requests(&self) -> u32 {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.gateway_max_concurrent_requests)
+            .unwrap_or(0)
+    }
+
+    pub fn gateway_queue_limit(&self) -> u32 {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.gateway_queue_limit)
+            .unwrap_or(0)
+    }
+
+    pub fn gateway_queue_timeout_ms(&self) -> u64 {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.gateway_queue_timeout_ms)
+            .unwrap_or(0)
+    }
+
     /// 从现有ID创建供应商
     pub fn with_id(
         id: String,
@@ -388,6 +416,28 @@ impl LocalProxyRequestOverrides {
 /// 供应商元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
+    /// Unified gateway source provider id shared by protocol-materialized providers.
+    #[serde(
+        rename = "gatewaySourceProviderId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gateway_source_provider_id: Option<String>,
+    /// Provider-level concurrency cap for the local gateway. 0/None = unlimited.
+    #[serde(
+        rename = "gatewayMaxConcurrentRequests",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gateway_max_concurrent_requests: Option<u32>,
+    #[serde(
+        rename = "gatewayQueueLimit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gateway_queue_limit: Option<u32>,
+    #[serde(
+        rename = "gatewayQueueTimeoutMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gateway_queue_timeout_ms: Option<u64>,
     /// 自定义端点列表（按 URL 去重存储）
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_endpoints: HashMap<String, crate::settings::CustomEndpoint>,
@@ -440,15 +490,24 @@ pub struct ProviderMeta {
     /// - "openai_responses": OpenAI Responses API 格式，需要转换
     #[serde(rename = "apiFormat", skip_serializing_if = "Option::is_none")]
     pub api_format: Option<String>,
-    /// Claude -> OpenAI reasoning 请求映射策略：
-    /// - auto: 仅对已知支持 reasoning effort 的模型自动映射（默认）
-    /// - force: 只要客户端请求包含 thinking/effort，就强制映射
-    /// - disabled: 不向 OpenAI 上游发送 reasoning effort 字段
+    /// 思考请求策略；所有出站路径最终统一校验。
+    /// - auto: 已知能力校验/跨协议映射，未知能力保留请求
+    /// - force: 强制转换 thinking/effort，但不绕过已知能力校验
+    /// - disabled: 不发送思考控制参数
     #[serde(
         rename = "reasoningRequestMode",
         skip_serializing_if = "Option::is_none"
     )]
     pub reasoning_request_mode: Option<String>,
+    /// Per-upstream-model reasoning levels materialized by the unified gateway.
+    /// The Claude protocol adapter consumes this in `auto` mode instead of
+    /// guessing capability from model-name prefixes.
+    #[serde(
+        default,
+        rename = "reasoningModelLevels",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub reasoning_model_levels: HashMap<String, Vec<String>>,
     /// Claude -> OpenAI Chat 历史 thinking 回传策略：
     /// - auto: 沿用供应商/模型启发式（默认）
     /// - reasoning_content: 强制写入 assistant.reasoning_content
@@ -494,6 +553,8 @@ pub struct ProviderMeta {
     /// Codex Responses -> Chat Completions reasoning capability metadata.
     #[serde(rename = "codexChatReasoning", skip_serializing_if = "Option::is_none")]
     pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
+    #[serde(default)]
+    pub chat_schema_required_defaults: bool,
     /// Codex → Anthropic path: whether to emulate the Claude Code client
     /// (User-Agent / anthropic-beta / x-app + injecting the Claude Code system
     /// prompt first line). Disabled by default; only an explicit `true` enables it.
@@ -535,6 +596,15 @@ pub struct ProviderMeta {
     /// 用于多账号支持，关联到特定的 GitHub 账号
     #[serde(rename = "githubAccountId", skip_serializing_if = "Option::is_none")]
     pub github_account_id: Option<String>,
+    /// 请求体录制（统一网关诊断功能）：None=关闭；Some(list) 开启，
+    /// list 为空表示录制该 (供应商, 协议) 下所有模型，非空则只录制
+    /// 出站模型名命中的条目。由统一网关的供应商/模型级开关物化而来。
+    #[serde(
+        default,
+        rename = "bodyRecordingModels",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub body_recording_models: Option<Vec<String>>,
 }
 
 /// 解析 Provider 级自定义 User-Agent 字符串（单一真理来源）。

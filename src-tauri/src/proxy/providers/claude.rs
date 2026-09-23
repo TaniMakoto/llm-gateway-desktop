@@ -354,6 +354,42 @@ fn reasoning_request_mode(provider: &Provider) -> &str {
         .unwrap_or("auto")
 }
 
+fn materialized_reasoning_levels_for_model<'a>(
+    provider: &'a Provider,
+    model: &str,
+) -> Option<&'a [String]> {
+    let levels = &provider.meta.as_ref()?.reasoning_model_levels;
+    let exact = model.trim().to_ascii_lowercase();
+    if let Some(found) = levels.get(&exact) {
+        return Some(found.as_slice());
+    }
+    let canonical = crate::model_capabilities::canonical_model_key(model);
+    levels.get(&canonical).map(Vec::as_slice)
+}
+
+fn remove_reasoning_request_field(result: &mut Value, api_format: &str) {
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    match api_format {
+        "openai_chat" => {
+            object.remove("reasoning_effort");
+        }
+        "openai_responses" => {
+            object.remove("reasoning");
+        }
+        _ => {}
+    }
+}
+
+fn write_reasoning_request_field(result: &mut Value, api_format: &str, effort: &str) {
+    match api_format {
+        "openai_chat" => result["reasoning_effort"] = json!(effort),
+        "openai_responses" => result["reasoning"] = json!({"effort": effort}),
+        _ => {}
+    }
+}
+
 fn apply_reasoning_request_mode(
     result: &mut Value,
     api_format: &str,
@@ -361,27 +397,30 @@ fn apply_reasoning_request_mode(
     requested_effort: Option<&str>,
 ) {
     match reasoning_request_mode(provider) {
-        "disabled" => match api_format {
-            "openai_chat" => {
-                if let Some(object) = result.as_object_mut() {
-                    object.remove("reasoning_effort");
-                }
-            }
-            "openai_responses" => {
-                if let Some(object) = result.as_object_mut() {
-                    object.remove("reasoning");
-                }
-            }
-            _ => {}
-        },
+        "disabled" => remove_reasoning_request_field(result, api_format),
         "force" => {
             let Some(effort) = requested_effort else {
                 return;
             };
-            match api_format {
-                "openai_chat" => result["reasoning_effort"] = json!(effort),
-                "openai_responses" => result["reasoning"] = json!({"effort": effort}),
-                _ => {}
+            write_reasoning_request_field(result, api_format, effort);
+        }
+        "auto" => {
+            let Some(requested) = requested_effort else {
+                return;
+            };
+            let Some(model) = result.get("model").and_then(Value::as_str) else {
+                return;
+            };
+            // A materialized gateway model entry is more specific than the
+            // bundled registry. Treat it as authoritative: first remove any
+            // generic transform result, then re-inject the mapped level only
+            // when this route says the model supports it.
+            if let Some(levels) = materialized_reasoning_levels_for_model(provider, model) {
+                let mapped = super::transform::map_reasoning_effort_to_levels(requested, levels);
+                remove_reasoning_request_field(result, api_format);
+                if let Some(effort) = mapped {
+                    write_reasoning_request_field(result, api_format, &effort);
+                }
             }
         }
         _ => {}
@@ -2118,6 +2157,77 @@ mod tests {
                 .unwrap();
 
         assert!(transformed.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_reasoning_request_mode_auto_uses_materialized_model_levels() {
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.example.com",
+                    "ANTHROPIC_API_KEY": "test-key"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                reasoning_request_mode: Some("auto".to_string()),
+                reasoning_model_levels: std::collections::HashMap::from([(
+                    "custom-reasoner".to_string(),
+                    vec!["low".to_string(), "high".to_string(), "max".to_string()],
+                )]),
+                ..Default::default()
+            },
+        );
+        let body = json!({
+            "model": "custom-reasoner",
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64
+        });
+
+        let transformed =
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+                .unwrap();
+
+        assert_eq!(transformed["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn test_reasoning_request_mode_auto_can_suppress_generic_registry_result() {
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.example.com",
+                    "ANTHROPIC_API_KEY": "test-key"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                reasoning_request_mode: Some("auto".to_string()),
+                reasoning_model_levels: std::collections::HashMap::from([(
+                    "gpt-5.6-sol".to_string(),
+                    vec!["none".to_string()],
+                )]),
+                ..Default::default()
+            },
+        );
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64
+        });
+
+        let transformed = transform_claude_request_for_api_format(
+            body,
+            &provider,
+            "openai_responses",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(transformed.get("reasoning").is_none());
     }
 
     #[test]
