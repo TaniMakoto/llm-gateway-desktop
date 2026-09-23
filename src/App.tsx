@@ -2776,7 +2776,7 @@ function ProviderEditorModal({
                   <option value="disabled">不发送推理参数</option>
                 </select>
               </Field>
-              <Field label="Claude 推理请求映射">
+              <Field label="思考请求处理">
                 <select
                   className="input w-full"
                   value={provider.reasoningRequestMode}
@@ -2789,8 +2789,8 @@ function ProviderEditorModal({
                   }
                 >
                   <option value="auto">自动</option>
-                  <option value="force">强制映射 effort</option>
-                  <option value="disabled">不发送 effort</option>
+                  <option value="force">强制映射（仍校验已知能力）</option>
+                  <option value="disabled">不发送思考控制参数</option>
                 </select>
               </Field>
               <Field label="历史推理回传">

@@ -1566,9 +1566,10 @@ impl RequestForwarder {
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         let started = std::time::Instant::now();
         self.trace.reset_http_status();
+        let mut reasoning_note = None;
         let result = self.forward_inner(
             app_type, method, provider, endpoint, body, route_model, headers,
-            extensions, adapter, outbound_reasoning_effort,
+            extensions, adapter, outbound_reasoning_effort, &mut reasoning_note,
         ).await;
         let (status_code, error) = match &result {
             Ok((r, _, _)) => (Some(r.status().as_u16()), None),
@@ -1584,9 +1585,9 @@ impl RequestForwarder {
             provider_id: provider.id.clone(), provider_name: provider.name.clone(),
             outcome: if result.is_ok() { "pending" } else { "failed" }.into(),
             status_code, error, duration_ms: started.elapsed().as_millis() as u64,
-            sent_reasoning: outbound_reasoning_effort.clone(), ..Default::default()
+            sent_reasoning: outbound_reasoning_effort.clone(), reasoning_note, ..Default::default()
         });
-        if result.is_err() {
+        if result.as_ref().is_err_and(|e| !matches!(e, ProxyError::InvalidRequest(_) | ProxyError::ConfigError(_) | ProxyError::TransformError(_))) {
             self.status.write().await.upstream_failed_attempts += 1;
         }
         result.map(|(response, format, model)| (self.trace.observe(response, index, started), format, model))
@@ -1604,7 +1605,9 @@ impl RequestForwarder {
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
         outbound_reasoning_effort: &mut Option<String>,
+        reasoning_note: &mut Option<String>,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        let original_body = body;
         // Each attempt starts from the immutable ingress payload. Only cross-protocol
         // candidates enter the bridge; native Chat keeps tools, history and extensions.
         let plan = if matches!(app_type, AppType::Codex) {
@@ -2035,6 +2038,41 @@ impl RequestForwarder {
                 if apply_local_proxy_body_overrides(&mut filtered_body, overrides) {
                     filtered_body = prepare_upstream_request_body(filtered_body);
                 }
+            }
+        }
+        let target_format = if native_chat || codex_responses_to_chat {
+            "openai_chat"
+        } else if codex_responses_to_anthropic {
+            "anthropic"
+        } else if let Some(format) = resolved_claude_api_format.as_deref() {
+            format
+        } else if matches!(app_type, AppType::Codex) {
+            "openai_responses"
+        } else if adapter.name() == "Claude" {
+            "anthropic"
+        } else {
+            "gemini_native"
+        };
+        let source_format = if matches!(app_type, AppType::Codex) { "openai_responses" }
+            else if adapter.name() == "Claude" { "anthropic" } else { "gemini_native" };
+        let reasoning_overridden = !is_copilot && provider.meta.as_ref()
+            .and_then(|m| m.local_proxy_request_overrides.as_ref())
+            .and_then(|o| o.body.as_ref())
+            .is_some_and(|o| ["reasoning", "reasoning_effort", "thinking", "output_config", "generationConfig", "generation_config", "enable_thinking"].iter().any(|key| o.get(key).is_some()));
+        // Gemini carries its model in the URL; supply it only for validation.
+        let policy_model_only = filtered_body.get("model").is_none();
+        if policy_model_only {
+            filtered_body["model"] = serde_json::json!(outbound_model.as_deref().unwrap_or(route_model));
+        }
+        let reasoning_result = super::reasoning_policy::apply(&mut filtered_body, original_body, provider, source_format, target_format, reasoning_overridden);
+        if policy_model_only {
+            if let Some(object) = filtered_body.as_object_mut() { object.remove("model"); }
+        }
+        match reasoning_result {
+            Ok(note) => *reasoning_note = Some(note),
+            Err(error) => {
+                *reasoning_note = Some(format!("本地能力校验拒绝，未发送上游：{error}"));
+                return Err(error);
             }
         }
         // 出站 body 定稿后刷新真值（覆盖 Codex chat 上游模型覆写、转换层模型改写）

@@ -13,6 +13,7 @@ pub mod error_mapper;
 pub(crate) mod failover_switch;
 mod forwarder;
 pub mod request_trace;
+pub(crate) mod reasoning_policy;
 pub mod gemini_url;
 pub mod handler_config;
 pub mod handler_context;

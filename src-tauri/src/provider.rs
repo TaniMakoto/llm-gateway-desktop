@@ -490,10 +490,10 @@ pub struct ProviderMeta {
     /// - "openai_responses": OpenAI Responses API 格式，需要转换
     #[serde(rename = "apiFormat", skip_serializing_if = "Option::is_none")]
     pub api_format: Option<String>,
-    /// Claude -> OpenAI reasoning 请求映射策略：
-    /// - auto: 仅对已知支持 reasoning effort 的模型自动映射（默认）
-    /// - force: 只要客户端请求包含 thinking/effort，就强制映射
-    /// - disabled: 不向 OpenAI 上游发送 reasoning effort 字段
+    /// 思考请求策略；所有出站路径最终统一校验。
+    /// - auto: 已知能力校验/跨协议映射，未知能力保留请求
+    /// - force: 强制转换 thinking/effort，但不绕过已知能力校验
+    /// - disabled: 不发送思考控制参数
     #[serde(
         rename = "reasoningRequestMode",
         skip_serializing_if = "Option::is_none"

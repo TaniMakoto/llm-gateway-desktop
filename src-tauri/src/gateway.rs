@@ -449,12 +449,10 @@ impl GatewayModelMetadata {
             }
         }
         if !provider.reasoning_levels.is_empty() {
-            if self.reasoning_levels.is_empty() {
-                self.reasoning_levels = provider.reasoning_levels.clone();
-            } else {
-                self.reasoning_levels
-                    .retain(|value| provider.reasoning_levels.contains(value));
-            }
+            // The provider's wire enum is authoritative. Intersecting spellings
+            // (e.g. max versus xhigh) could erase a known declaration and make
+            // final request validation incorrectly fall back to a generic catalog.
+            self.reasoning_levels = provider.reasoning_levels.clone();
         }
     }
 
@@ -3123,6 +3121,13 @@ mod protocol_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_reasoning_enum_overrides_different_catalog_spelling() {
+        let mut metadata = GatewayModelMetadata { reasoning_levels: vec!["xhigh".into()], ..Default::default() };
+        metadata.constrain_with_provider_metadata(&GatewayModelMetadata { reasoning_levels: vec!["high".into(), "max".into()], ..Default::default() });
+        assert_eq!(metadata.reasoning_levels, vec!["high", "max"]);
+    }
 
     #[test]
     fn model_metadata_merge_is_conservative_across_failover_targets() {

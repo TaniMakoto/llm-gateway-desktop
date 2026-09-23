@@ -31,6 +31,7 @@ interface RoutingAttempt {
   error?: string;
   skipReason?: string;
   sentReasoning?: string;
+  reasoningNote?: string;
   returnedReasoning?: string;
 }
 interface RequestEvidence {
@@ -734,6 +735,9 @@ function LogDetail({ log, onClose }: { log: RequestLog; onClose: () => void }) {
               )}
               {attempt.skipReason && (
                 <p className="mt-2">跳过原因：{attempt.skipReason}</p>
+              )}
+              {attempt.reasoningNote && (
+                <p className="mt-2 text-muted-foreground">思考处理：{attempt.reasoningNote}</p>
               )}
               {attempt.error && (
                 <p className="mt-2 whitespace-pre-wrap break-words text-destructive">

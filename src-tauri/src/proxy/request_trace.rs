@@ -22,6 +22,8 @@ pub struct Attempt {
     pub error: Option<String>,
     pub skip_reason: Option<String>,
     pub sent_reasoning: Option<String>,
+    #[serde(default)]
+    pub reasoning_note: Option<String>,
     pub returned_reasoning: Option<String>,
 }
 
