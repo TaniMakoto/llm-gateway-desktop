@@ -118,6 +118,8 @@ struct ToolBlockState {
     name: String,
     started: bool,
     pending_args: String,
+    /// 保留完整参数供收尾校验；pending_args 仅保存尚未下发的片段。
+    arguments: String,
     /// 连续空白字符计数 — 用于检测 Copilot 无限换行 bug
     /// 当 function call 参数中的连续空白字符达到阈值时，强制终止流
     consecutive_whitespace: usize,
@@ -127,6 +129,43 @@ struct ToolBlockState {
 
 /// 无限空白 bug 的连续空白字符阈值
 const INFINITE_WHITESPACE_THRESHOLD: usize = 500;
+
+fn tool_completion_error(
+    tools: &HashMap<usize, ToolBlockState>,
+    has_finish_reason: bool,
+) -> Option<String> {
+    let mut indices: Vec<_> = tools.keys().copied().collect();
+    indices.sort_unstable();
+    for index in indices {
+        let tool = &tools[&index];
+        let problem = if tool.aborted {
+            Some("tool arguments were aborted")
+        } else if tool.name.trim().is_empty() {
+            Some("tool name is missing")
+        } else if !serde_json::from_str::<Value>(&tool.arguments)
+            .is_ok_and(|arguments| arguments.is_object())
+        {
+            Some("tool arguments are incomplete or are not a JSON object")
+        } else if !has_finish_reason {
+            Some("tool call has no finish_reason")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            // 不记录参数内容，避免把工具参数中的私有数据写进错误日志。
+            return Some(format!("Incomplete upstream tool call at index {index}: {problem}"));
+        }
+    }
+    None
+}
+
+fn stream_error_event(message: &str) -> Bytes {
+    let event = json!({
+        "type": "error",
+        "error": {"type": "stream_error", "message": message}
+    });
+    Bytes::from(format!("event: error\ndata: {event}\n\n"))
+}
 
 fn build_anthropic_usage_json(usage: &Usage) -> Value {
     // OpenAI prompt_tokens 含缓存，Anthropic input_tokens 不含，需减去 cache_read 与 cache_creation
@@ -200,7 +239,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 
         tokio::pin!(stream);
 
-        while let Some(chunk) = stream.next().await {
+        'upstream: while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
                     crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
@@ -212,8 +251,20 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 
                         for l in line.lines() {
                             if let Some(data) = strip_sse_field(l, "data") {
+                                if has_sent_message_stop {
+                                    continue;
+                                }
                                 if data.trim() == "[DONE]" {
                                     log::debug!("[Claude/OpenRouter] <<< OpenAI SSE: [DONE]");
+
+                                    if let Some(message) = tool_completion_error(
+                                        &tool_blocks_by_index, has_emitted_message_delta,
+                                    ) {
+                                        log::error!("[Claude/OpenRouter] {message}");
+                                        stream_ended_with_error = true;
+                                        yield Ok(stream_error_event(&message));
+                                        break 'upstream;
+                                    }
 
                                     // 流正常结束，发出缓存的 message_delta（含完整 usage）。
                                     if let Some((stop_reason, usage_json)) = pending_message_delta.take() {
@@ -419,6 +470,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                                     name: String::new(),
                                                                     started: false,
                                                                     pending_args: String::new(),
+                                                                    arguments: String::new(),
                                                                     consecutive_whitespace: 0,
                                                                     aborted: false,
                                                                 }
@@ -460,6 +512,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                             .as_ref()
                                                             .and_then(|f| f.arguments.clone());
                                                         let immediate_delta = if let Some(args) = args_delta {
+                                                            state.arguments.push_str(&args);
                                                             // 无限空白 bug 检测：跟踪连续空白字符
                                                             for ch in args.chars() {
                                                                 if ch.is_whitespace() {
@@ -556,6 +609,14 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                     *usage = Some(uj);
                                                 }
                                                 continue;
+                                            }
+                                            // 必须在关闭工具块之前校验。关闭块可能让客户端执行工具，
+                                            // 不能先发成功收尾再报告半截 JSON。
+                                            if let Some(message) = tool_completion_error(&tool_blocks_by_index, true) {
+                                                log::error!("[Claude/OpenRouter] {message}");
+                                                stream_ended_with_error = true;
+                                                yield Ok(stream_error_event(&message));
+                                                break 'upstream;
                                             }
                                             has_emitted_message_delta = true;
 
@@ -662,18 +723,17 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                 Err(e) => {
                     log::error!("Stream error: {e}");
                     stream_ended_with_error = true;
-                    let error_event = json!({
-                        "type": "error",
-                        "error": {
-                            "type": "stream_error",
-                            "message": format!("Stream error: {e}")
-                        }
-                    });
-                    let sse_data = format!("event: error\ndata: {}\n\n",
-                        serde_json::to_string(&error_event).unwrap_or_default());
-                    yield Ok(Bytes::from(sse_data));
+                    yield Ok(stream_error_event(&format!("Stream error: {e}")));
                     break;
                 }
+            }
+        }
+
+        if !stream_ended_with_error && !has_sent_message_stop {
+            if let Some(message) = tool_completion_error(&tool_blocks_by_index, has_emitted_message_delta) {
+                log::error!("[Claude/OpenRouter] {message}");
+                stream_ended_with_error = true;
+                yield Ok(stream_error_event(&message));
             }
         }
 
@@ -1361,6 +1421,58 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event_type(event) == Some("message_stop")));
+    }
+
+    fn tool_stream(arguments: &str, finish: Option<&str>, done: bool) -> String {
+        let mut input = format!("data: {}\n\n", json!({
+            "id": "chatcmpl_incomplete_tool", "model": "mock-model",
+            "choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_mock",
+                "type": "function", "function": {"name": "ask_question", "arguments": arguments}}]}}]
+        }));
+        if let Some(reason) = finish {
+            input.push_str(&format!("data: {}\n\n", json!({
+                "choices": [{"delta": {}, "finish_reason": reason}]
+            })));
+        }
+        if done { input.push_str("data: [DONE]\n\n"); }
+        input
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_tool_call_never_emits_success_or_closes_tool_block() {
+        for arguments in ["{", "", "null", "[]", "{} trailing"] {
+            for finish in [None, Some("tool_calls"), Some("length")] {
+                for done in [false, true] {
+                    let events = collect_anthropic_events(&tool_stream(arguments, finish, done)).await;
+                    assert_eq!(events.iter().filter(|e| event_type(e) == Some("error")).count(), 1,
+                        "arguments={arguments:?}, finish={finish:?}, done={done}: {events:?}");
+                    assert!(!events.iter().any(|e| matches!(event_type(e),
+                        Some("content_block_stop" | "message_delta" | "message_stop"))), "{events:?}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_done_without_tool_finish_reason_is_an_error_even_with_complete_json() {
+        let events = collect_anthropic_events(&tool_stream("{}", None, true)).await;
+        assert!(events.iter().any(|e| event_type(e) == Some("error")
+            && e["error"]["message"].as_str().unwrap().contains("finish_reason")));
+        assert!(!events.iter().any(|e| event_type(e) == Some("message_stop")));
+    }
+
+    #[tokio::test]
+    async fn test_complete_tool_call_keeps_success_and_ignores_duplicate_done() {
+        for done in [false, true] {
+            let mut input = tool_stream(r#"{"answer":"中文"}"#, Some("tool_calls"), done);
+            if done { input.push_str("data: [DONE]\n\n"); }
+            let events = collect_anthropic_events(&input).await;
+            assert!(!events.iter().any(|e| event_type(e) == Some("error")), "{events:?}");
+            assert_eq!(events.iter().filter(|e| event_type(e) == Some("content_block_stop")).count(), 1);
+            assert_eq!(events.iter().filter(|e| event_type(e) == Some("message_stop")).count(), 1);
+            assert!(events.iter().any(|e| event_type(e) == Some("message_delta")
+                && e["delta"]["stop_reason"] == "tool_use"));
+        }
     }
 
     #[tokio::test]

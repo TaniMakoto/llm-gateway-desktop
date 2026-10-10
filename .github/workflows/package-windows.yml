@@ -44,6 +44,13 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: TypeScript check
+        run: pnpm typecheck
+
+      # 包含真实网关 HTTP 协议矩阵与半截工具调用回归，测试通过后才生成安装包。
+      - name: Rust lib and protocol regression tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
       - name: Build Windows installers
         uses: tauri-apps/tauri-action@v1
         env:

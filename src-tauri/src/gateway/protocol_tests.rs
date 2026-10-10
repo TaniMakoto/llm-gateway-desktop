@@ -674,6 +674,15 @@ async fn routing_contract(
     payload: Value,
     candidates: Vec<(Format, Value, Option<Value>)>,
 ) -> (StatusCode, String, Vec<Vec<Value>>) {
+    let (status, wire, seen, _) = routing_contract_with_database(down, payload, candidates).await;
+    (status, wire, seen)
+}
+
+async fn routing_contract_with_database(
+    down: Format,
+    payload: Value,
+    candidates: Vec<(Format, Value, Option<Value>)>,
+) -> (StatusCode, String, Vec<Vec<Value>>, Arc<Database>) {
     let mut tasks = Vec::new();
     let mut captures = Vec::new();
     let mut providers = Vec::new();
@@ -718,7 +727,7 @@ async fn routing_contract(
     let db = Arc::new(Database::memory().unwrap());
     let config = GatewayConfig { providers, local_api_key:"matrix-local-key".into(), enable_logging:false, ..Default::default() };
     db.set_setting(CONFIG_KEY, &serde_json::to_string(&config).unwrap()).unwrap();
-    let runtime = configured_runtime(db, &config).await;
+    let runtime = configured_runtime(db.clone(), &config).await;
     let info = runtime.start().await.unwrap();
     let response = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(15)).build().unwrap()
         .post(format!("http://127.0.0.1:{}{}?trace=contract", info.port, down.path()))
@@ -727,7 +736,41 @@ async fn routing_contract(
     let wire = response.text().await.unwrap();
     runtime.stop().await.unwrap();
     for task in tasks { task.abort(); let _ = task.await; }
-    (status, wire, captures.iter().map(|seen| seen.lock().unwrap().clone()).collect())
+    (status, wire, captures.iter().map(|seen| seen.lock().unwrap().clone()).collect(), db)
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn incomplete_chat_tool_stream_reports_error_and_records_interruption() {
+    for finish in ["", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"] {
+        let text = json!({"id":"chatcmpl_partial","model":"mock-model",
+            "choices":[{"delta":{"content":"准备调用工具："}}]});
+        let tool = json!({"choices":[{"delta":{"tool_calls":[{"index":0,
+            "id":"call_partial","type":"function",
+            "function":{"name":"weather","arguments":"{"}}]}}]});
+        let sse = format!("data: {text}\n\ndata: {tool}\n\n{finish}data: [DONE]\n\n");
+        let (status, wire, seen, db) = routing_contract_with_database(
+            Format::Anthropic, request(Format::Anthropic, true, "tool"), vec![
+                (Format::Chat, json!({}), Some(json!({"_http_status":200,"_sse":sse}))),
+                (Format::Chat, json!({}), None),
+            ],
+        ).await;
+        // 已下发文本后 HTTP 状态无法改写，只能发流内 error，不能拼接备用模型。
+        assert_eq!(status, StatusCode::OK);
+        assert!(wire.contains("准备调用工具："));
+        assert!(wire.contains("event: error") && wire.contains("Incomplete upstream tool call"), "{wire}");
+        assert!(!wire.contains("event: message_stop") && !wire.contains("event: message_delta"), "{wire}");
+        assert!(seen[1].is_empty(), "already committed output must not fail over");
+        let conn = db.conn.lock().unwrap();
+        let (outcome, evidence): (String, String) = conn.query_row(
+            "SELECT outcome,evidence FROM request_observations", [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(outcome, "stream_interrupted", "{evidence}");
+        let error: Option<String> = conn.query_row(
+            "SELECT error_message FROM proxy_request_logs", [], |row| row.get(0),
+        ).unwrap();
+        assert!(error.is_some_and(|e| e.contains("Incomplete upstream tool call")), "{evidence}");
+    }
 }
 
 fn agent_chat_request(stream: bool) -> Value {

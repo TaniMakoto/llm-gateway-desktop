@@ -816,7 +816,23 @@ pub fn create_logged_passthrough_stream(
                             continue;
                         }
                         forwarded_events += 1;
+                        let previous_terminal = terminal.state();
                         terminal.push(&event_text);
+
+                        // 协议转换可能在上游 [DONE] 之后才发现半截工具参数。
+                        // 把下游 error 终态同步回请求记录，覆盖此前的上游成功标记。
+                        if previous_terminal != SseTerminalState::Failed
+                            && terminal.state() == SseTerminalState::Failed
+                        {
+                            let message = event_text.lines()
+                                .filter_map(|line| strip_sse_field(line, "data"))
+                                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                                .find_map(|event| event.pointer("/error/message")
+                                    .or_else(|| event.pointer("/response/error/message"))
+                                    .and_then(Value::as_str).map(str::to_owned))
+                                .unwrap_or_else(|| "上游流返回错误事件".to_string());
+                            if let Some(trace) = &trace { trace.interrupt_stream(message); }
+                        }
 
                         if inspect_sse_events {
                             // 提取 data 部分；只有 usage collector 存在时才解析 JSON。
