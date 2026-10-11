@@ -1143,11 +1143,13 @@ mod tests {
         );
         let merged = run(input).await;
         assert!(merged.contains("\"delta\":\"tail\""));
-        assert!(merged.contains("\"status\":\"incomplete\""));
+        assert!(merged.contains("event: response.failed"));
+        assert!(merged.contains("stream_truncated"));
+        assert!(!merged.contains("event: response.completed"));
     }
 
     #[tokio::test]
-    async fn test_error_after_message_stop_does_not_emit_second_terminal_event() {
+    async fn test_error_after_message_stop_is_not_discarded() {
         let input = concat!(
             "event: message_start\n",
             "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_terminal\"}}\n\n",
@@ -1158,7 +1160,12 @@ mod tests {
         );
         let merged = run(input).await;
         assert_eq!(merged.matches("event: response.completed").count(), 1);
-        assert_eq!(merged.matches("event: response.failed").count(), 0);
+        assert_eq!(merged.matches("event: response.failed").count(), 1);
+        assert!(merged.contains("\"status\":\"failed\""));
+        assert!(merged.contains("late"));
+        assert!(
+            merged.rfind("event: response.failed") > merged.rfind("event: response.completed")
+        );
     }
 
     #[tokio::test]

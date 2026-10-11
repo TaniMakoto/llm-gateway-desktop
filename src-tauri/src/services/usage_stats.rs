@@ -1600,10 +1600,10 @@ impl Database {
         let detail_sql = format!(
             "SELECT l.request_id, l.provider_id, {detail_pname} as provider_name, l.app_type, l.model,
                     l.request_model, l.cost_multiplier,
-                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-                    input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
-                    is_streaming, latency_ms, first_token_ms, duration_ms,
-                    status_code, error_message, created_at, l.data_source, l.pricing_model,
+                    l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens,
+                    l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
+                    l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
+                    l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
                     l.input_token_semantics, l.reasoning_effort,
                     (SELECT evidence FROM request_observations o WHERE o.request_id = l.request_id)
              FROM proxy_request_logs l
@@ -2390,6 +2390,59 @@ mod tests {
         let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
         assert_eq!(count, 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_detail_uses_log_timestamp_with_or_without_provider() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, created_at)
+                 VALUES ('detail-provider', 'codex', 'Fixture Provider', '{}', 9000)",
+                [],
+            )?;
+            insert_usage_log(
+                &conn,
+                "detail-request",
+                "codex",
+                "detail-provider",
+                "fixture-model",
+                "proxy",
+                1000,
+                10,
+                2,
+                0,
+                0,
+                200,
+                "0",
+            )?;
+        }
+        let detail = db
+            .get_request_detail("detail-request")?
+            .expect("request detail");
+        assert_eq!(detail.provider_name.as_deref(), Some("Fixture Provider"));
+        assert_eq!(detail.created_at, 1000);
+        assert_eq!(detail.input_tokens, 10);
+        assert_eq!(detail.output_tokens, 2);
+        assert_eq!(detail.status_code, 200);
+        let listed = db.get_request_logs(&LogFilters::default(), 0, 10)?;
+        assert_eq!(listed.data[0].created_at, detail.created_at);
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "DELETE FROM providers WHERE id = 'detail-provider' AND app_type = 'codex'",
+                [],
+            )?;
+        }
+        let historical = db
+            .get_request_detail("detail-request")?
+            .expect("deleted provider history");
+        assert_eq!(historical.provider_name.as_deref(), Some("detail-provider"));
+        assert_eq!(historical.created_at, 1000);
+        assert!(db.get_request_detail("missing-request")?.is_none());
         Ok(())
     }
 

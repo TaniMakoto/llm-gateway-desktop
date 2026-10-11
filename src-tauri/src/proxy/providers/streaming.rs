@@ -260,18 +260,18 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                 if data.trim() == "[DONE]" {
                                     log::debug!("[Claude/OpenRouter] <<< OpenAI SSE: [DONE]");
 
-                                    if !has_emitted_message_delta {
-                                        stream_ended_with_error = true;
-                                        yield Ok(stream_error_event("Upstream Chat stream ended before finish_reason"));
-                                        break 'upstream;
-                                    }
-
                                     if let Some(message) = tool_completion_error(
                                         &tool_blocks_by_index, has_emitted_message_delta,
                                     ) {
                                         log::error!("[Claude/OpenRouter] {message}");
                                         stream_ended_with_error = true;
                                         yield Ok(stream_error_event(&message));
+                                        break 'upstream;
+                                    }
+
+                                    if !has_emitted_message_delta {
+                                        stream_ended_with_error = true;
+                                        yield Ok(stream_error_event("Upstream Chat stream ended before finish_reason"));
                                         break 'upstream;
                                     }
 
@@ -1469,7 +1469,8 @@ mod tests {
     async fn test_done_without_tool_finish_reason_is_an_error_even_with_complete_json() {
         let events = collect_anthropic_events(&tool_stream("{}", None, true)).await;
         assert!(events.iter().any(|e| event_type(e) == Some("error")
-            && e["error"]["message"].as_str().unwrap().contains("finish_reason")));
+            && e["error"]["type"] == "incomplete_tool_call"
+            && e["error"]["message"].as_str().unwrap().contains("no semantic completion marker")));
         assert!(!events.iter().any(|e| event_type(e) == Some("message_stop")));
     }
 

@@ -25,6 +25,10 @@
 
 ## 本批本地验证与 CI 边界
 
+- 按用户要求检查了提交 `dc2de4e` 的失败结果：[Windows 打包](https://github.com/TaniMakoto/llm-gateway-desktop/actions/runs/38112592889) 的独立 core 测试通过，Rust lib 测试目标编译通过，测试结果为 1981 通过、19 失败，因此安装包构建未执行；[Linux 验证](https://github.com/TaniMakoto/llm-gateway-desktop/actions/runs/38112580112) 为 1991 通过、11 失败，共享失败原因一致。
+- 本次修复请求详情联表查询的 `created_at` 歧义，并增加供应商存在/已删除、请求不存在的回归；用仓库中的实际 SQL 和表定义在本地内存 SQLite 中复现旧错误，验证新查询返回日志时间及完整 28 列。这是 SQL 检查，不替代 Rust 测试。
+- Windows 路径夹具改由 TOML 序列化生成；旧测试与当前 Codex 包管理器升级、schema 版本、模型 reasoning 能力映射及异常终态规则对齐。Chat 收到 `[DONE]` 时优先检查工具完整性，使缺少 finish_reason 的工具与自然 EOF 使用相同错误分类；没有跳过测试或放宽工具成功条件。
+- 本次修复的 8 个 Rust 文件已通过 rustfmt 语法解析，静态检查通过；修复后的 Rust 全量测试与安装包构建仍交由新一轮 CI 执行，触发后立即汇报，不等待结果。
 - `python tools/static_check.py`：通过，包括所选 Rust 文件结构、公开路由、清单/Python 解析及 TS 语法检查。
 - `pnpm install --frozen-lockfile`、`pnpm typecheck`、`pnpm format:check`：通过。
 - `pnpm build:renderer`：通过前端产物构建；不代表 Tauri 安装包已生成。

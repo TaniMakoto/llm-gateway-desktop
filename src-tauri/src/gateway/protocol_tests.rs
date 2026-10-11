@@ -903,6 +903,8 @@ async fn native_chat_preserves_agent_fields_schema_and_response() {
         assert_eq!(status, StatusCode::OK, "{wire}");
         let mut expected = payload;
         expected["model"] = json!("deepseek-v4-flash");
+        // Candidate capabilities declare max; other native fields stay intact.
+        expected["reasoning_effort"] = json!("max");
         assert_eq!(seen[0], vec![expected]);
         if !stream {
             let response: Value = serde_json::from_str(&wire).unwrap();
@@ -931,10 +933,11 @@ async fn mixed_protocol_failover_rebuilds_each_candidate_from_original() {
             if matches!(second, Format::Chat) {
                 let mut expected = payload;
                 expected["model"] = json!("deepseek-v4-flash");
+                expected["reasoning_effort"] = json!("max");
                 assert_eq!(seen[1][0], expected);
             } else {
                 assert!(seen[1][0].get("messages").is_none());
-                assert_eq!(seen[1][0]["reasoning"]["effort"], "xhigh");
+                assert_eq!(seen[1][0]["reasoning"]["effort"], "max");
                 assert!(seen[1][0].get("thinking").is_none());
             }
             check_response(Format::Chat, stream, false, &wire, &mut String::new()).unwrap();
@@ -945,7 +948,9 @@ async fn mixed_protocol_failover_rebuilds_each_candidate_from_original() {
 #[tokio::test]
 #[serial_test::serial]
 async fn responses_bridge_uses_explicit_reasoning_wire_profile() {
-    for (profile, thinking, effort) in [("auto", false, "xhigh"), ("openai", false, "xhigh"), ("deepseek", true, "max")] {
+    // The wire profile controls thinking shape; candidate capabilities normalize
+    // the requested xhigh to max for this model, including auto/openai profiles.
+    for (profile, thinking, effort) in [("auto", false, "max"), ("openai", false, "max"), ("deepseek", true, "max")] {
         let mut payload = request(Format::Responses, false, "text");
         payload["reasoning"] = json!({"effort":"xhigh"});
         let (status, wire, seen) = routing_contract(Format::Responses, payload, vec![(Format::Chat, json!({"chatReasoningProfile":profile}), None)]).await;
@@ -963,6 +968,7 @@ async fn schema_compatibility_is_opt_in_and_preserves_nested_constraints() {
     assert_eq!(status, StatusCode::OK, "{wire}");
     let mut expected = payload;
     expected["model"] = json!("deepseek-v4-flash");
+    expected["reasoning_effort"] = json!("max");
     expected["tools"][0]["function"]["parameters"]["required"] = json!([]);
     assert_eq!(seen[0][0], expected);
 }
