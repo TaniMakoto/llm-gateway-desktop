@@ -17,6 +17,7 @@ use tokio::sync::{Notify, RwLock};
 #[derive(Debug)]
 struct ProviderCapacityState {
     limit: u32,
+    config_revision: Option<u64>,
     in_use: u32,
     waiters: u32,
     notify: Arc<Notify>,
@@ -108,6 +109,26 @@ pub struct ProviderRouter {
 }
 
 impl ProviderRouter {
+    /// 将并发与熔断放行交给同一个尝试对象；等待中取消也不会遗留容量。
+    pub(crate) async fn acquire_attempt(
+        &self,
+        provider: &Provider,
+        app_type: &str,
+        model: &str,
+        capacity: Option<ProviderCapacityPermit>,
+    ) -> Option<super::attempt_lease::AttemptLease> {
+        if self
+            .is_provider_cooled_down(provider.gateway_source_provider_id(), app_type, model)
+            .await
+        {
+            return None;
+        }
+        let key = Self::provider_key(app_type, &provider.id);
+        let breaker = self.get_or_create_circuit_breaker(&key).await;
+        let circuit = breaker.acquire_request_permit().await?;
+        Some(super::attempt_lease::AttemptLease::new(capacity, circuit))
+    }
+
     /// 创建新的供应商路由器
     pub fn new(db: Arc<Database>) -> Self {
         Self {
@@ -126,37 +147,50 @@ impl ProviderRouter {
     ) -> (&'a mut ProviderCapacityState, String) {
         let source_id = provider.gateway_source_provider_id().to_string();
         let configured_limit = provider.gateway_max_concurrent_requests();
+        let config_revision = provider.gateway_config_revision();
         let state = states.entry(source_id.clone()).or_insert_with(|| ProviderCapacityState {
             limit: configured_limit,
+            config_revision,
             in_use: 0,
             waiters: 0,
             notify: Arc::new(Notify::new()),
         });
-        state.limit = configured_limit;
+        let accepts_revision = match (state.config_revision, config_revision) {
+            (Some(current), Some(next)) => next >= current,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if accepts_revision {
+            let grew = configured_limit == 0 ||
+                (state.limit != 0 && configured_limit > state.limit);
+            state.limit = configured_limit;
+            state.config_revision = config_revision;
+            if grew { state.notify.notify_waiters(); }
+        }
         (state, source_id)
     }
 
     pub fn provider_capacity_available(&self, provider: &Provider) -> bool {
         let limit = provider.gateway_max_concurrent_requests();
-        if limit == 0 {
+        if limit == 0 && provider.gateway_config_revision().is_none() {
             return true;
         }
         let mut states = self.capacity_states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (state, _) = Self::capacity_state_for_provider(&mut states, provider);
-        state.in_use < state.limit
+        state.limit == 0 || state.in_use < state.limit
     }
 
     pub fn try_acquire_provider_capacity(
         &self,
         provider: &Provider,
     ) -> Result<Option<ProviderCapacityPermit>, CapacityAcquireError> {
-        if provider.gateway_max_concurrent_requests() == 0 {
+        if provider.gateway_max_concurrent_requests() == 0 && provider.gateway_config_revision().is_none() {
             return Ok(None);
         }
         let source_id = {
             let mut states = self.capacity_states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (state, source_id) = Self::capacity_state_for_provider(&mut states, provider);
-            if state.in_use >= state.limit {
+            if state.limit != 0 && state.in_use >= state.limit {
                 return Err(CapacityAcquireError::Full);
             }
             state.in_use = state.in_use.saturating_add(1);
@@ -172,7 +206,7 @@ impl ProviderRouter {
         &self,
         provider: &Provider,
     ) -> Result<Option<ProviderCapacityPermit>, CapacityAcquireError> {
-        if provider.gateway_max_concurrent_requests() == 0 {
+        if provider.gateway_max_concurrent_requests() == 0 && provider.gateway_config_revision().is_none() {
             return Ok(None);
         }
 
@@ -181,7 +215,7 @@ impl ProviderRouter {
         let (source_id, notify) = {
             let mut states = self.capacity_states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (state, source_id) = Self::capacity_state_for_provider(&mut states, provider);
-            if state.in_use < state.limit {
+            if state.limit == 0 || state.in_use < state.limit {
                 state.in_use = state.in_use.saturating_add(1);
                 return Ok(Some(ProviderCapacityPermit {
                     source_provider_id: source_id,
@@ -203,14 +237,16 @@ impl ProviderRouter {
 
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if timeout.is_zero() || tokio::time::timeout_at(deadline, notify.notified()).await.is_err() {
-                return Err(CapacityAcquireError::Timeout);
-            }
+            // Register before checking capacity: a release or revision increase
+            // between the check and await must not lose its wakeup.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
             let acquired = {
                 let mut states = self.capacity_states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let (state, _) = Self::capacity_state_for_provider(&mut states, provider);
-                if state.in_use < state.limit {
+                if state.limit == 0 || state.in_use < state.limit {
                     state.in_use = state.in_use.saturating_add(1);
                     true
                 } else {
@@ -222,6 +258,9 @@ impl ProviderRouter {
                     source_provider_id: source_id,
                     states: self.capacity_states.clone(),
                 }));
+            }
+            if timeout.is_zero() || tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return Err(CapacityAcquireError::Timeout);
             }
         }
     }
@@ -537,6 +576,7 @@ impl ProviderRouter {
             return AllowResult {
                 allowed: false,
                 used_half_open_permit: false,
+                probe_generation: None,
             };
         }
         let circuit_key = format!("{app_type}:{}", provider.id);
@@ -749,6 +789,59 @@ mod tests {
     use serial_test::serial;
     use std::env;
     use tempfile::TempDir;
+
+    fn revisioned_capacity_provider(limit: u32, revision: u64) -> Provider {
+        let mut provider = Provider::with_id("capacity::chat".into(), "fixture".into(), json!({}), None);
+        provider.meta = Some(crate::provider::ProviderMeta {
+            gateway_source_provider_id: Some("capacity".into()),
+            gateway_config_revision: Some(revision),
+            gateway_max_concurrent_requests: Some(limit),
+            gateway_queue_limit: Some(2),
+            gateway_queue_timeout_ms: Some(1_000),
+            ..Default::default()
+        });
+        provider
+    }
+
+    #[tokio::test]
+    async fn lowering_unlimited_capacity_counts_existing_requests_and_rejects_old_limits() {
+        let router = ProviderRouter::new(Arc::new(Database::memory().unwrap()));
+        let old = revisioned_capacity_provider(0, 1);
+        let first = router.try_acquire_provider_capacity(&old).unwrap().unwrap();
+        let second = router.try_acquire_provider_capacity(&old).unwrap().unwrap();
+        assert_eq!(router.provider_capacity_snapshot("capacity"), (0, 2, 0));
+        let current = revisioned_capacity_provider(1, 2);
+        assert!(!router.provider_capacity_available(&current));
+        assert_eq!(router.try_acquire_provider_capacity(&old).unwrap_err(), CapacityAcquireError::Full);
+        assert_eq!(router.provider_capacity_snapshot("capacity"), (1, 2, 0));
+        drop(first);
+        assert!(!router.provider_capacity_available(&old));
+        drop(second);
+        let admitted = router.try_acquire_provider_capacity(&old).unwrap().unwrap();
+        assert_eq!(router.provider_capacity_snapshot("capacity"), (1, 1, 0));
+        assert_eq!(router.try_acquire_provider_capacity(&current).unwrap_err(), CapacityAcquireError::Full);
+        drop(admitted);
+        assert_eq!(router.provider_capacity_snapshot("capacity"), (1, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn raising_capacity_to_unlimited_wakes_a_waiter_with_an_old_snapshot() {
+        let router = ProviderRouter::new(Arc::new(Database::memory().unwrap()));
+        let old = revisioned_capacity_provider(1, 1);
+        let first = router.try_acquire_provider_capacity(&old).unwrap().unwrap();
+        let mut queued = Box::pin(router.wait_acquire_provider_capacity(&old));
+        assert!(futures::poll!(queued.as_mut()).is_pending());
+        assert_eq!(router.provider_capacity_snapshot("capacity"), (1, 1, 1));
+        let current = revisioned_capacity_provider(0, 2);
+        assert!(router.provider_capacity_available(&current));
+        let admitted = tokio::time::timeout(Duration::from_millis(100), queued).await.unwrap().unwrap().unwrap();
+        assert_eq!(router.provider_capacity_snapshot("capacity"), (0, 2, 0));
+        assert!(router.provider_capacity_available(&old));
+        assert_eq!(router.provider_capacity_snapshot("capacity"), (0, 2, 0));
+        drop(admitted);
+        drop(first);
+        assert_eq!(router.provider_capacity_snapshot("capacity"), (0, 0, 0));
+    }
 
     struct TempHome {
         #[allow(dead_code)]

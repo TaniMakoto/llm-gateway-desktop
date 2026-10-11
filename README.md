@@ -24,6 +24,8 @@ A local desktop gateway for managing multiple LLM API providers behind one stabl
 - JSON and SSE streaming translation
 - Standard tool-call and tool-result conversion
 - SQLite-backed local configuration
+- Revision-checked configuration saves with rollback on failed publication
+- Build version and commit identity in the desktop and gateway status
 - Windows, Linux, and macOS packaging with GitHub Actions
 
 ## Supported endpoints
@@ -128,6 +130,11 @@ Run the dependency-free mock upstream:
 python tools/mock_upstream.py
 ```
 
+The desktop-independent completion rules can be tested with
+`cargo test --locked --manifest-path crates/gateway-core/Cargo.toml`.
+See the [refactoring plan](docs/REFACTOR_PLAN.md) and
+[validation status](docs/DEVELOPMENT_STATUS.md) for the current scope.
+
 After configuring a route to the mock server, run:
 
 ```bash
@@ -166,7 +173,7 @@ Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) be
 
 ## License
 
-MIT. This repository contains third-party MIT-licensed code; required attribution is preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+MIT. Third-party source attribution, copyright notices and permission text are consolidated in [LICENSE](LICENSE).
 ## Windows portable package
 
 Release builds include a Windows x64 portable ZIP in addition to NSIS and MSI installers.

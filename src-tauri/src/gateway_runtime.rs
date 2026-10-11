@@ -10,7 +10,7 @@ pub struct GatewayRuntime {
     db: Arc<Database>,
     // One lock covers the entire start/stop/reconfigure transaction. Concurrent
     // tray/UI requests cannot start two listeners or publish a stopped instance.
-    server: Mutex<Option<ProxyServer>>,
+    server: Arc<Mutex<Option<ProxyServer>>>,
     app_handle: RwLock<Option<tauri::AppHandle>>,
 }
 
@@ -18,7 +18,7 @@ impl GatewayRuntime {
     pub fn new(db: Arc<Database>) -> Self {
         Self {
             db,
-            server: Mutex::new(None),
+            server: Arc::new(Mutex::new(None)),
             app_handle: RwLock::new(None),
         }
     }
@@ -78,34 +78,59 @@ impl GatewayRuntime {
     }
 
     pub async fn update_config(&self, config: &ProxyConfig) -> Result<(), String> {
-        let mut guard = self.server.lock().await;
+        self.commit_reconfiguration(config, || {
+            self.db
+                .update_proxy_config_sync(config)
+                .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    pub(crate) async fn commit_reconfiguration(
+        &self,
+        config: &ProxyConfig,
+        persist: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut guard = self.server.clone().lock_owned().await;
         let previous = self.get_config().await?;
         let restart = guard.is_some()
             && (previous.listen_address != config.listen_address
                 || previous.listen_port != config.listen_port);
         // Bind the replacement before touching the working listener or persisted
         // configuration. A port conflict must not take a healthy gateway offline.
-        let replacement = if restart {
-            let server = self.create_server(config.clone());
-            server.start().await.map_err(|e| e.to_string())?;
-            Some(server)
+        let replacement = if let Some(current) = guard.as_ref().filter(|_| restart) {
+            let server = current.replacement(config.clone());
+            let listener = server
+                .prepare_listener()
+                .await
+                .map_err(|error| error.to_string())?;
+            let address = listener.local_addr().map_err(|error| error.to_string())?;
+            Some((server, listener, address))
         } else {
             None
         };
-        if let Err(error) = self.db.update_proxy_config(config.clone()).await {
-            if let Some(server) = replacement {
-                let _ = server.stop().await;
+        // Every fallible preparation happens before changing persistent state.
+        // A rejected transaction drops the reserved listener and leaves the old
+        // server untouched. No replacement request runs against a partial config.
+        persist()?;
+        let config = config.clone();
+        // Once storage commits, publication must finish even if the invoking UI
+        // task is cancelled. The owned lock stays with this publication task.
+        tokio::spawn(async move {
+            if let Some((server, listener, address)) = replacement {
+                server.apply_runtime_config(&config).await;
+                server.start_prepared(listener, address).await;
+                if let Some(old) = guard.replace(server) {
+                    if let Err(error) = old.stop().await {
+                        log::warn!("新配置已发布，旧监听停止异常: {error}");
+                    }
+                }
+            } else if let Some(server) = guard.as_ref() {
+                server.apply_runtime_config(&config).await;
             }
-            return Err(error.to_string());
-        }
-        if let Some(server) = replacement {
-            if let Some(old) = guard.replace(server) {
-                old.stop().await.map_err(|e| e.to_string())?;
-            }
-        } else if let Some(server) = guard.as_ref() {
-            server.apply_runtime_config(config).await;
-        }
-        Ok(())
+        })
+        .await
+        .map_err(|error| format!("配置发布任务异常: {error}"))
     }
 
     pub async fn get_circuit_breaker_stats(
@@ -143,6 +168,40 @@ impl GatewayRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rejected_persistence_keeps_old_listener_and_releases_reserved_port() {
+        let db = Arc::new(Database::memory().unwrap());
+        let runtime = GatewayRuntime::new(db);
+        let previous = ProxyConfig {
+            listen_port: 0,
+            ..Default::default()
+        };
+        runtime.update_config(&previous).await.unwrap();
+        let info = runtime.start().await.unwrap();
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let new_port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let next = ProxyConfig {
+            listen_port: new_port,
+            ..previous.clone()
+        };
+        assert!(runtime
+            .commit_reconfiguration(&next, || Err("write failed".into()))
+            .await
+            .is_err());
+        assert_eq!(
+            runtime.get_config().await.unwrap().listen_port,
+            previous.listen_port
+        );
+        assert_eq!(runtime.get_status().await.unwrap().port, info.port);
+        let available = tokio::net::TcpListener::bind(("127.0.0.1", new_port))
+            .await
+            .unwrap();
+        drop(available);
+        runtime.stop().await.unwrap();
+    }
 
     #[tokio::test]
     #[serial_test::serial]

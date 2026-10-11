@@ -6,7 +6,7 @@ use super::log_codes::cb as log_cb;
 use super::types::AppProxyConfig;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::RwLock;
 
@@ -89,7 +89,13 @@ pub struct CircuitBreaker {
     /// 配置（支持热更新）
     config: Arc<RwLock<CircuitBreakerConfig>>,
     /// 半开状态已放行的请求数（用于限流）
-    half_open_requests: Arc<AtomicU32>,
+    half_open_requests: Arc<Mutex<HalfOpenProbeState>>,
+}
+
+#[derive(Default)]
+struct HalfOpenProbeState {
+    generation: u64,
+    in_use: u32,
 }
 
 /// 熔断器放行结果
@@ -100,9 +106,48 @@ pub struct CircuitBreaker {
 pub struct AllowResult {
     pub allowed: bool,
     pub used_half_open_permit: bool,
+    pub(crate) probe_generation: Option<u64>,
+}
+
+/// 拥有一次放行名额。发送任务被取消时，半开探测名额仍会同步归还。
+/// 持有此对象的调用方记录健康结果时必须传 `used_half_open_permit=false`，
+/// 避免旧的手工释放接口与 Drop 重复归还。
+pub(crate) struct CircuitRequestPermit {
+    probes: Arc<Mutex<HalfOpenProbeState>>,
+    generation: Option<u64>,
+}
+
+impl CircuitRequestPermit {
+    #[cfg(test)]
+    pub(crate) fn is_half_open_probe(&self) -> bool {
+        self.generation.is_some()
+    }
+}
+
+impl Drop for CircuitRequestPermit {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation {
+            let mut probes = self
+                .probes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // 已过期探测不能归还新一轮 HalfOpen 的名额。
+            if probes.generation == generation {
+                probes.in_use = probes.in_use.saturating_sub(1);
+            }
+        }
+    }
 }
 
 impl CircuitBreaker {
+    pub(crate) async fn acquire_request_permit(self: &Arc<Self>) -> Option<CircuitRequestPermit> {
+        let allowed = self.allow_request().await;
+        allowed.allowed.then(|| CircuitRequestPermit {
+            probes: self.half_open_requests.clone(),
+            generation: allowed.probe_generation,
+        })
+    }
+
     /// 创建新的熔断器
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
@@ -113,7 +158,7 @@ impl CircuitBreaker {
             failed_requests: Arc::new(AtomicU32::new(0)),
             last_opened_at: Arc::new(RwLock::new(None)),
             config: Arc::new(RwLock::new(config)),
-            half_open_requests: Arc::new(AtomicU32::new(0)),
+            half_open_requests: Arc::new(Mutex::new(HalfOpenProbeState::default())),
         }
     }
 
@@ -161,6 +206,7 @@ impl CircuitBreaker {
             CircuitState::Closed => AllowResult {
                 allowed: true,
                 used_half_open_permit: false,
+                probe_generation: None,
             },
             CircuitState::Open => {
                 let config = self.config.read().await;
@@ -180,11 +226,13 @@ impl CircuitBreaker {
                             CircuitState::Closed => AllowResult {
                                 allowed: true,
                                 used_half_open_permit: false,
+                                probe_generation: None,
                             },
                             CircuitState::HalfOpen => self.allow_half_open_probe(),
                             CircuitState::Open => AllowResult {
                                 allowed: false,
                                 used_half_open_permit: false,
+                                probe_generation: None,
                             },
                         };
                     }
@@ -193,6 +241,7 @@ impl CircuitBreaker {
                 AllowResult {
                     allowed: false,
                     used_half_open_permit: false,
+                    probe_generation: None,
                 }
             }
             CircuitState::HalfOpen => self.allow_half_open_probe(),
@@ -315,19 +364,24 @@ impl CircuitBreaker {
     fn allow_half_open_probe(&self) -> AllowResult {
         // 半开状态限流：只允许有限请求通过进行探测
         let max_half_open_requests = 1u32;
-        let current = self.half_open_requests.fetch_add(1, Ordering::SeqCst);
+        let mut probes = self
+            .half_open_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if current < max_half_open_requests {
+        if probes.in_use < max_half_open_requests {
+            probes.in_use += 1;
             AllowResult {
                 allowed: true,
                 used_half_open_permit: true,
+                probe_generation: Some(probes.generation),
             }
         } else {
-            // 超过限额，回退计数，拒绝请求
-            self.half_open_requests.fetch_sub(1, Ordering::SeqCst);
+            // 超过限额，拒绝请求。
             AllowResult {
                 allowed: false,
                 used_half_open_permit: false,
+                probe_generation: None,
             }
         }
     }
@@ -337,22 +391,11 @@ impl CircuitBreaker {
     /// 用于整流器等场景：请求结果不应计入 Provider 健康度，
     /// 但仍需释放占用的探测名额，避免 HalfOpen 状态卡死
     pub fn release_half_open_permit(&self) {
-        let mut current = self.half_open_requests.load(Ordering::SeqCst);
-        loop {
-            if current == 0 {
-                return;
-            }
-
-            match self.half_open_requests.compare_exchange(
-                current,
-                current - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return,
-                Err(actual) => current = actual,
-            }
-        }
+        let mut probes = self
+            .half_open_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        probes.in_use = probes.in_use.saturating_sub(1);
     }
 
     /// 转换到打开状态
@@ -373,7 +416,12 @@ impl CircuitBreaker {
         *state = CircuitState::HalfOpen;
         self.consecutive_successes.store(0, Ordering::SeqCst);
         // 重置半开状态的请求限流计数
-        self.half_open_requests.store(0, Ordering::SeqCst);
+        let mut probes = self
+            .half_open_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        probes.generation = probes.generation.wrapping_add(1);
+        probes.in_use = 0;
     }
 
     /// 转换到关闭状态
@@ -401,6 +449,41 @@ pub struct CircuitBreakerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owned_probe_drop_is_neutral_and_reopens_admission() {
+        let breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            timeout_seconds: 0,
+            ..Default::default()
+        }));
+        breaker.transition_to_open().await;
+        let first = breaker.acquire_request_permit().await.unwrap();
+        assert!(first.is_half_open_probe());
+        assert!(breaker.acquire_request_permit().await.is_none());
+        let before = breaker.get_stats().await;
+        drop(first);
+        let second = breaker.acquire_request_permit().await.unwrap();
+        assert!(second.is_half_open_probe());
+        let after = breaker.get_stats().await;
+        assert_eq!(before.total_requests, after.total_requests);
+        assert_eq!(before.failed_requests, after.failed_requests);
+    }
+
+    #[tokio::test]
+    async fn stale_probe_cannot_release_a_new_half_open_generation() {
+        let breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            timeout_seconds: 0,
+            ..Default::default()
+        }));
+        breaker.transition_to_open().await;
+        let previous = breaker.acquire_request_permit().await.unwrap();
+        breaker.transition_to_open().await;
+        let current = breaker.acquire_request_permit().await.unwrap();
+        drop(previous);
+        assert!(breaker.acquire_request_permit().await.is_none());
+        drop(current);
+        assert!(breaker.acquire_request_permit().await.is_some());
+    }
 
     #[tokio::test]
     async fn test_circuit_breaker_closed_to_open() {

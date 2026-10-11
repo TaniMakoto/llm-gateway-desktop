@@ -174,7 +174,7 @@ def check_public_branding() -> None:
         "llm-gateway" + "-switch",
         "llm_gateway" + "_switch",
     )
-    allowed = {ROOT / "LICENSE", ROOT / "THIRD_PARTY_NOTICES.md"}
+    allowed = {ROOT / "LICENSE"}
     text_suffixes = {
         ".rs", ".toml", ".json", ".md", ".yml", ".yaml", ".ts",
         ".tsx", ".js", ".cjs", ".css", ".html", ".py", ".txt",

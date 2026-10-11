@@ -1,6 +1,6 @@
 # 架构说明
 
-核对日期：2026-09-20。依据当前源码；验证范围见 [开发状态](DEVELOPMENT_STATUS.md)。
+核对日期：2026-10-11。依据 0.2.0 重构源码；验证范围见 [开发状态](DEVELOPMENT_STATUS.md)，分批路线见 [重构计划](REFACTOR_PLAN.md)。
 
 ## 产品边界
 
@@ -22,8 +22,13 @@ React 配置 / 测试台 / 托盘 → Tauri commands → GatewayConfig / SQLite
 - 相同 alias 的启用模型条目构成候选集，默认按供应商配置顺序选择。
 - `routing_policies` 支持 `priority`、`round_robin`、`weighted_round_robin`、`least_outstanding`；`routing_weights` 保存别名下各供应商的权重。
 - `model_registry_overrides` 与数据目录下的 `model-registry.overrides.json` 管理模型能力修正；内置能力来源为 `resources/model_capabilities.json`。
+- 请求候选、模型映射、容量参数、策略和权重从同一次捕获的配置直接生成，统一路由的重试预算按候选数计算；派生供应商表只保留兼容用途。
 
-配置仍存储于 SQLite `settings` 表的 `unified_gateway_config_v1` 键。键名没有随结构变化而升级；`parse_config_with_migration` / `migrate_legacy_config` 负责读取旧 `routes/targets` 结构。旧文档中的 `GatewayRoute`、`GatewayRouteTarget` 已不是当前配置类型。
+监听重绑定复用原来的路由、健康、容量和会话亲和状态。旧监听停止时关闭空闲长连接，已开始的响应继续收尾；监听代次防止旧退出任务覆盖新监听状态。
+
+配置仍存储于 SQLite `settings` 表的 `unified_gateway_config_v1` 键，新增 `schemaVersion` 和递增的 `revision`；旧配置缺省为 1/0，未来未知版本明确拒绝。保存检查 revision，防止过期编辑覆盖。供应商镜像、代理参数和主配置在同一个 SQLite 事务中写入；旧 `routes/targets` 结构仍由迁移函数读取。
+
+`gateway/configuration.rs` 准备模型覆盖文件，`GatewayRuntime` 先保留新端口、持久化后才发布监听；失败恢复文件并保留旧服务。覆盖文件附带配置 revision，主配置保留恢复副本，文件保留前一版本，防止中断的发布覆盖已提交配置。提交后的监听发布不随 UI 调用取消而中止。
 
 为了复用原代理，每个供应商与协议组合物化为 `unified_gateway` 分类下的内部 provider，并分别写入 `claude`、`codex` 应用域。它们不是本机 CLI 配置。
 
@@ -51,7 +56,9 @@ Chat 和 Responses 入口共享 OpenAI handler，保留原始请求直到选定�
 
 `proxy/providers/` 负责三类协议转换、工具调用、reasoning 与 SSE。`forwarder.rs` 组织发送、错误处理与故障转移；`provider_router.rs` 提供路由、供应商容量控制、排队和冷却；`session_affinity.rs` 保存有界的会话绑定。并发容量按源供应商共享，避免物化为多个协议后重复获得并发额度。
 
-已有 429 / Retry-After 冷却、熔断、会话重新绑定及取消排队计数。供应商明确拒绝参数/模型能力的 400/422 可换源，释放熔断器探测名额但不累计供应商健康失败；无效 JSON、工具历史错误和未识别的 400 仍终止。每家仅从原始请求构建自己的出站参数。HTTP 200 错误正文和 OpenAI SSE 在实际输出前的错误也在重试循环内识别；输出已提交后不重放请求。详见 [路由可靠性改造](ROUTING_RELIABILITY.md)。
+已有 429 / Retry-After 冷却、熔断、会话重新绑定及取消排队计数。输出提交前，上游 HTTP 拒绝（包括 400/401/403/413/422）仍允许尝试下一可用候选；本地鉴权或本地请求校验错误可立即终止。每家仅从原始请求构建自己的出站参数。HTTP 200 错误正文和 SSE 实际输出前的错误也在尝试循环内识别；输出已提交后不重放请求。详见 [路由可靠性改造](ROUTING_RELIABILITY.md)。
+
+`crates/gateway-core` 保存终态语义和工具参数完成校验，不依赖桌面、HTTP 或 SQLite。合法限额结束、异常 EOF、错误和取消分别处理；晚到错误可以覆盖之前的完成标记。`AttemptLease` 管理每次尝试的容量与半开探测许可；成功后移交响应，最终转换结果决定供应商健康和请求计数，取消中性释放。
 
 ## 桌面、数据与继承代码
 
@@ -61,7 +68,7 @@ Chat 和 Responses 入口共享 OpenAI handler，保留原始请求直到选定�
 
 入口不执行原应用的 CLI 配置接管、MCP、Skills 和提示词初始化。首轮已删除未注册的认证聚合、深链、导入导出、模型发现包装、OMO、插件、S3/WebDAV 同步、workspace 和 session manager 命令，以及整个 CLI 会话历史浏览模块，共约 6,700 行；模型发现本身仍由 gateway 命令提供。
 
-`lib.rs`、`services/mod.rs`、`commands/mod.rs` 仍声明部分继承模块，旧 `ProxyService` 暂时留在 `AppState` 供继承服务引用。数据库及 provider 类型仍与其有依赖。运行入口已分离不等于全部继承依赖已经移除，后续应按编译依赖继续裁剪。
+`lib.rs`、`services/mod.rs`、`commands/mod.rs` 仍声明部分继承模块，旧 `ProxyService` 暂时留在 `AppState` 供继承服务引用。数据库及 provider 类型仍与其有依赖。2026-10-11 的第二轮移除不可达深链、未注册的 MCP/Prompt/Skill 命令及没有 worker 的 S3/WebDAV 同步服务和数据库通知 hook；仍被共享服务引用的业务与历史 schema 迁移保留。
 
 后续精简应先分离网关运行服务与外部应用配置服务，随后按编译依赖移除模块；旧数据库结构应通过迁移处理。不能仅凭目录名批量删除。
 

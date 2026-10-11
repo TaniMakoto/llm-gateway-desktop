@@ -12,9 +12,21 @@ permissions:
   contents: read
 
 jobs:
+  core:
+    name: Independent gateway core
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./crates/gateway-core -> target"
+      - run: cargo test --locked --manifest-path crates/gateway-core/Cargo.toml
+
   validate:
     name: TypeScript and Rust tests
     runs-on: ubuntu-22.04
+    needs: core
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -57,8 +69,11 @@ jobs:
       - name: TypeScript check
         run: pnpm typecheck
 
+      - name: Frontend format check
+        run: pnpm format:check
+
       - name: Rust lib tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 
       - name: Protocol matrix over real gateway HTTP
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml gateway::protocol_tests --lib -- --nocapture

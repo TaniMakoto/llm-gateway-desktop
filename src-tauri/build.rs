@@ -1,5 +1,30 @@
 fn main() {
     tauri_build::build();
+    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
+    println!("cargo:rerun-if-env-changed=GATEWAY_BUILD_TIME");
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    let commit = std::env::var("GITHUB_SHA")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let built_at = std::env::var("GATEWAY_BUILD_TIME").unwrap_or_else(|_| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string()
+    });
+    println!("cargo:rustc-env=GATEWAY_BUILD_COMMIT={commit}");
+    println!("cargo:rustc-env=GATEWAY_BUILD_TIME={built_at}");
 
     // Windows: Embed Common Controls v6 manifest for test binaries
     //

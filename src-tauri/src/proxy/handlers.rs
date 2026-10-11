@@ -85,6 +85,7 @@ pub async fn handle_gateway_status(
     let status = state.status.read().await.clone();
     Ok(Json(json!({
         "status": status,
+        "build": crate::build_info::get_build_info(),
         "provider_runtime": runtime,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     })))

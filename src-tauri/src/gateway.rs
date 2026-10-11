@@ -31,6 +31,8 @@ pub(crate) const CONFIG_KEY: &str = "unified_gateway_config_v1";
 const GENERATED_CATEGORY: &str = "unified_gateway";
 const MODEL_REGISTRY_OVERRIDES_FILE: &str = "model-registry.overrides.json";
 const MODEL_REGISTRY_OVERRIDES_VERSION: u32 = 1;
+const GATEWAY_CONFIG_SCHEMA_VERSION: u32 = 1;
+mod configuration;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -272,6 +274,8 @@ pub struct GatewayModelMetadata {
 struct ModelRegistryOverridesFile {
     #[serde(default = "default_model_registry_overrides_version")]
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config_revision: Option<u64>,
     #[serde(default)]
     overrides: HashMap<String, GatewayModelMetadata>,
 }
@@ -280,7 +284,7 @@ struct ModelRegistryOverridesFile {
 struct ModelRegistryOverridesCache {
     path: Option<PathBuf>,
     loaded: bool,
-    overrides: Option<HashMap<String, GatewayModelMetadata>>,
+    overrides: Option<ModelRegistryOverridesFile>,
 }
 
 fn model_registry_overrides_cache() -> &'static RwLock<ModelRegistryOverridesCache> {
@@ -314,7 +318,7 @@ fn normalize_registry_overrides(
 
 fn read_model_registry_overrides_file(
     path: &std::path::Path,
-) -> Result<Option<HashMap<String, GatewayModelMetadata>>, AppError> {
+) -> Result<Option<ModelRegistryOverridesFile>, AppError> {
     if !path.exists() {
         return Ok(None);
     }
@@ -324,7 +328,7 @@ fn read_model_registry_overrides_file(
 
     // v1 正式格式：{ "version": 1, "overrides": { ... } }。
     // 同时兼容早期手工维护过的直接 map 形状，避免升级后丢配置。
-    let overrides = if value.get("overrides").is_some() || value.get("version").is_some() {
+    let mut file = if value.get("overrides").is_some() || value.get("version").is_some() {
         let file: ModelRegistryOverridesFile = serde_json::from_value(value)
             .map_err(|e| AppError::Config(format!("模型 Registry 覆盖文件结构无效: {e}")))?;
         if file.version > MODEL_REGISTRY_OVERRIDES_VERSION {
@@ -333,16 +337,21 @@ fn read_model_registry_overrides_file(
                 file.version, MODEL_REGISTRY_OVERRIDES_VERSION
             )));
         }
-        file.overrides
+        file
     } else {
-        serde_json::from_value::<HashMap<String, GatewayModelMetadata>>(value)
-            .map_err(|e| AppError::Config(format!("模型 Registry 覆盖文件结构无效: {e}")))?
+        ModelRegistryOverridesFile {
+            version: MODEL_REGISTRY_OVERRIDES_VERSION,
+            config_revision: None,
+            overrides: serde_json::from_value(value)
+                .map_err(|e| AppError::Config(format!("模型 Registry 覆盖文件结构无效: {e}")))?,
+        }
     };
-    Ok(Some(normalize_registry_overrides(overrides)))
+    file.overrides = normalize_registry_overrides(file.overrides);
+    Ok(Some(file))
 }
 
 fn reload_model_registry_overrides_file(
-) -> Result<Option<HashMap<String, GatewayModelMetadata>>, AppError> {
+) -> Result<Option<ModelRegistryOverridesFile>, AppError> {
     let path = model_registry_overrides_path();
     let overrides = read_model_registry_overrides_file(&path)?;
     let mut cache = model_registry_overrides_cache()
@@ -355,7 +364,7 @@ fn reload_model_registry_overrides_file(
 }
 
 fn load_model_registry_overrides_file(
-) -> Result<Option<HashMap<String, GatewayModelMetadata>>, AppError> {
+) -> Result<Option<ModelRegistryOverridesFile>, AppError> {
     let path = model_registry_overrides_path();
     {
         let cache = model_registry_overrides_cache()
@@ -366,26 +375,6 @@ fn load_model_registry_overrides_file(
         }
     }
     reload_model_registry_overrides_file()
-}
-
-fn save_model_registry_overrides_file(
-    overrides: &HashMap<String, GatewayModelMetadata>,
-) -> Result<(), AppError> {
-    let path = model_registry_overrides_path();
-    let file = ModelRegistryOverridesFile {
-        version: MODEL_REGISTRY_OVERRIDES_VERSION,
-        overrides: normalize_registry_overrides(overrides.clone()),
-    };
-    let bytes = serde_json::to_vec_pretty(&file)
-        .map_err(|e| AppError::JsonSerialize { source: e })?;
-    crate::config::atomic_write(&path, &bytes)?;
-    let mut cache = model_registry_overrides_cache()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.path = Some(path);
-    cache.loaded = true;
-    cache.overrides = Some(file.overrides);
-    Ok(())
 }
 
 impl GatewayModelMetadata {
@@ -569,6 +558,10 @@ pub struct GatewayProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayConfig {
+    #[serde(default = "default_gateway_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub revision: u64,
     pub listen_address: String,
     pub listen_port: u16,
     #[serde(default = "default_true")]
@@ -595,6 +588,8 @@ pub struct GatewayConfig {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
+            schema_version: GATEWAY_CONFIG_SCHEMA_VERSION,
+            revision: 0,
             listen_address: "127.0.0.1".to_string(),
             listen_port: 10888,
             require_auth: true,
@@ -662,6 +657,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_gateway_schema_version() -> u32 {
+    GATEWAY_CONFIG_SCHEMA_VERSION
+}
+
 fn default_auth_style() -> String {
     "auto".to_string()
 }
@@ -692,8 +691,21 @@ pub fn load_config(db: &Database) -> Result<GatewayConfig, AppError> {
     // New SSOT: user-editable registry overrides live beside the rest of the
     // application data. Legacy DB-embedded overrides are still accepted and
     // are used as a migration fallback until the next save.
-    if let Some(file_overrides) = load_model_registry_overrides_file()? {
-        config.model_registry_overrides = file_overrides;
+    if config.schema_version > GATEWAY_CONFIG_SCHEMA_VERSION {
+        return Err(AppError::Config("网关配置版本过新，请升级程序".into()));
+    }
+    if let Some(file) = load_model_registry_overrides_file()? {
+        if file.config_revision.is_none_or(|revision| revision == config.revision) {
+            config.model_registry_overrides = file.overrides;
+        } else if file.config_revision.is_some_and(|revision| revision > config.revision) {
+            // A crash between file publication and SQLite commit must preserve
+            // the previous revision, including legacy file-only overrides.
+            if let Some(previous) = read_model_registry_overrides_file(&configuration::registry_backup_path(&model_registry_overrides_path()))? {
+                if previous.config_revision.is_none_or(|revision| revision == config.revision) {
+                    config.model_registry_overrides = previous.overrides;
+                }
+            }
+        }
     } else {
         config.model_registry_overrides =
             normalize_registry_overrides(config.model_registry_overrides);
@@ -705,6 +717,11 @@ pub fn load_config(db: &Database) -> Result<GatewayConfig, AppError> {
 /// 顶层 routes[].targets[]）解析并转换为新结构。
 fn parse_config_with_migration(raw: &str) -> Result<GatewayConfig, String> {
     let value: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if let Some(version) = value.get("schemaVersion") {
+        if version.as_u64() != Some(u64::from(GATEWAY_CONFIG_SCHEMA_VERSION)) {
+            return Err("网关配置版本不受支持，请升级程序".into());
+        }
+    }
 
     let has_new_models = value
         .get("providers")
@@ -879,6 +896,8 @@ fn migrate_legacy_config(value: &Value) -> Result<GatewayConfig, String> {
         })
         .collect();
     Ok(GatewayConfig {
+        schema_version: GATEWAY_CONFIG_SCHEMA_VERSION,
+        revision: 0,
         listen_address: legacy.listen_address,
         listen_port: legacy.listen_port,
         require_auth: legacy.require_auth,
@@ -1003,6 +1022,9 @@ pub fn routing_policy_for_alias(config: &GatewayConfig, alias: &str) -> GatewayR
 }
 
 fn validate_config(config: &GatewayConfig) -> Result<(), String> {
+    if config.schema_version != GATEWAY_CONFIG_SCHEMA_VERSION {
+        return Err("网关配置版本不受支持，请重新读取配置或升级程序".into());
+    }
     if config.listen_address.trim().is_empty() {
         return Err("监听地址不能为空".to_string());
     }
@@ -1269,6 +1291,7 @@ fn materialize_provider(
     app_type: &str,
     sort_index: usize,
     registry_overrides: &HashMap<String, GatewayModelMetadata>,
+    config_revision: Option<u64>,
 ) -> Provider {
     let exact_model_map = provider_model_map(provider, format);
     let auth_is_x_api_key = matches!(provider.auth_style.as_str(), "x-api-key")
@@ -1300,6 +1323,8 @@ fn materialize_provider(
         })
     };
 
+    let mut meta = provider_meta_with_registry(provider, format, registry_overrides);
+    meta.gateway_config_revision = config_revision;
     Provider {
         id: generated_provider_id(&provider.id, format),
         name: format!("{} · {}", provider.name, format.as_wire_name()),
@@ -1309,7 +1334,7 @@ fn materialize_provider(
         created_at: Some(chrono::Utc::now().timestamp_millis()),
         sort_index: Some(sort_index),
         notes: (!provider.notes.trim().is_empty()).then(|| provider.notes.clone()),
-        meta: Some(provider_meta_with_registry(provider, format, registry_overrides)),
+        meta: Some(meta),
         icon: Some(match format {
             GatewayApiFormat::Anthropic => "anthropic".to_string(),
             _ => "openai".to_string(),
@@ -1388,36 +1413,7 @@ pub(crate) async fn gateway_runtime_statuses_for_router(
 }
 
 fn sync_generated_providers(db: &Database, config: &GatewayConfig) -> Result<(), AppError> {
-    let combos = iter_materialized_combos(config);
-    let wanted: HashSet<String> = combos
-        .iter()
-        .map(|(_, provider, format)| generated_provider_id(&provider.id, *format))
-        .collect();
-
-    for app_type in ["claude", "codex"] {
-        let existing = db.get_all_providers(app_type)?;
-        for provider in existing.values() {
-            if provider.category.as_deref() == Some(GENERATED_CATEGORY)
-                && !wanted.contains(&provider.id)
-            {
-                db.delete_provider(app_type, &provider.id)?;
-            }
-        }
-
-        for (index, (_, provider, format)) in combos.iter().enumerate() {
-            db.save_provider(
-                app_type,
-                &materialize_provider(
-                    provider,
-                    *format,
-                    app_type,
-                    index,
-                    &config.model_registry_overrides,
-                ),
-            )?;
-        }
-    }
-    Ok(())
+    configuration::sync_providers(db, config)
 }
 
 pub fn resolve_route_providers(
@@ -1427,16 +1423,26 @@ pub fn resolve_route_providers(
     alias: &str,
 ) -> Result<Option<(Vec<Provider>, GatewayRoutingPolicy, HashMap<String, u32>)>, AppError> {
     let config = load_config(db)?;
+    Ok(resolve_route_providers_from_config(&config, app_type, alias))
+}
+
+/// 候选、路由策略、权重和供应商参数全部来自本次捕获的配置。
+/// 派生 providers 表用于兼容旧应用接口，不能在这里再次读取而混入另一 revision。
+fn resolve_route_providers_from_config(
+    config: &GatewayConfig,
+    app_type: &str,
+    alias: &str,
+) -> Option<(Vec<Provider>, GatewayRoutingPolicy, HashMap<String, u32>)> {
     let alias = alias.trim();
     if alias.is_empty() {
-        return Ok(None);
+        return None;
     }
-    let routing_policy = routing_policy_for_alias(&config, alias);
-    let routing_weights = routing_weights_for_alias(&config, alias);
+    let routing_policy = routing_policy_for_alias(config, alias);
+    let routing_weights = routing_weights_for_alias(config, alias);
 
-    let mut matched_ids: Vec<String> = Vec::new();
+    let mut result = Vec::new();
     let mut any_alias_defined = false;
-    for provider in &config.providers {
+    for (sort_index, provider) in config.providers.iter().enumerate() {
         let mut formats_for_alias: Vec<GatewayApiFormat> = Vec::new();
         for model in &provider.models {
             if model.alias == alias {
@@ -1453,21 +1459,21 @@ pub fn resolve_route_providers(
             }
         }
         for format in formats_for_alias {
-            matched_ids.push(generated_provider_id(&provider.id, format));
+            result.push(materialize_provider(
+                provider,
+                format,
+                app_type,
+                sort_index,
+                &config.model_registry_overrides,
+                Some(config.revision),
+            ));
         }
     }
 
     if !any_alias_defined {
-        return Ok(None);
+        return None;
     }
-
-    let mut result = Vec::new();
-    for id in matched_ids {
-        if let Some(provider) = db.get_provider_by_id(&id, app_type)? {
-            result.push(provider);
-        }
-    }
-    Ok(Some((result, routing_policy, routing_weights)))
+    Some((result, routing_policy, routing_weights))
 }
 
 pub fn validate_local_auth(db: &Database, headers: &HeaderMap) -> Result<(), crate::proxy::ProxyError> {
@@ -1627,68 +1633,17 @@ async fn gateway_runtime_statuses_for_service(
 }
 
 pub(crate) async fn apply_runtime_config(state: &AppState, config: &GatewayConfig) -> Result<(), String> {
-    sync_generated_providers(&state.db, config).map_err(|e| e.to_string())?;
-
-    let mut proxy_config = state.gateway_runtime.get_config().await?;
-    proxy_config.listen_address = config.listen_address.clone();
-    proxy_config.listen_port = config.listen_port;
-    proxy_config.enable_logging = config.enable_logging;
-    state.gateway_runtime.update_config(&proxy_config).await?;
-
-    let mut candidates_per_alias: HashMap<&str, usize> = HashMap::new();
-    for provider in config.providers.iter().filter(|provider| provider.enabled) {
-        for model in provider.models.iter().filter(|model| model.enabled) {
-            *candidates_per_alias.entry(model.alias.trim()).or_default() += 1;
-        }
-    }
-    let gateway_max_retries = candidates_per_alias
-        .values()
-        .copied()
-        .max()
-        .unwrap_or(1)
-        .saturating_sub(1)
-        .min(u32::MAX as usize) as u32;
-
-    for app_type in ["claude", "codex"] {
-        if let Ok(mut app_config) = state.db.get_proxy_config_for_app(app_type).await {
-            app_config.auto_failover_enabled = true;
-            // The unified gateway owns its route chain. Size the attempt budget to
-            // the largest configured alias instead of silently truncating at the
-            // legacy UI cap of 11 attempts.
-            app_config.max_retries = gateway_max_retries;
-            state
-                .db
-                .update_proxy_config_for_app(app_config)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-    }
-
-    Ok(())
+    configuration::apply(state, config).await
 }
 
 #[tauri::command]
 pub async fn save_gateway_config(
     state: tauri::State<'_, AppState>,
     config: GatewayConfig,
-) -> Result<(), String> {
+) -> Result<GatewayConfig, String> {
     let config = normalize_config(config);
     validate_config(&config)?;
-    apply_runtime_config(&state, &config).await?;
-    save_model_registry_overrides_file(&config.model_registry_overrides)
-        .map_err(|e| e.to_string())?;
-
-    // Keep the legacy field in the Rust/IPC shape for backwards compatibility,
-    // but stop persisting a duplicate copy in the DB. load_config() hydrates it
-    // from model-registry.overrides.json on every load.
-    let mut persisted = config.clone();
-    persisted.model_registry_overrides.clear();
-    let serialized = serde_json::to_string_pretty(&persisted).map_err(|e| e.to_string())?;
-    state
-        .db
-        .set_setting(CONFIG_KEY, &serialized)
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    configuration::save(&state, config).await
 }
 
 #[tauri::command]
@@ -3123,6 +3078,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unsupported_schema_is_rejected_before_legacy_migration() {
+        for version in [
+            serde_json::json!(2),
+            serde_json::json!(0),
+            serde_json::json!("1"),
+            Value::Null,
+        ] {
+            let raw = serde_json::json!({
+                "schemaVersion": version, "listenAddress": "127.0.0.1",
+                "listenPort": 10888, "providers": [], "routes": []
+            });
+            assert!(parse_config_with_migration(&raw.to_string()).is_err());
+        }
+        let legacy = serde_json::json!({
+            "listenAddress": "127.0.0.1", "listenPort": 10888,
+            "providers": [], "routes": []
+        });
+        let migrated = parse_config_with_migration(&legacy.to_string()).unwrap();
+        assert_eq!(migrated.schema_version, GATEWAY_CONFIG_SCHEMA_VERSION);
+        assert_eq!(migrated.revision, 0);
+    }
+
+    #[test]
     fn provider_reasoning_enum_overrides_different_catalog_spelling() {
         let mut metadata = GatewayModelMetadata { reasoning_levels: vec!["xhigh".into()], ..Default::default() };
         metadata.constrain_with_provider_metadata(&GatewayModelMetadata { reasoning_levels: vec!["high".into(), "max".into()], ..Default::default() });
@@ -3324,6 +3302,53 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn route_candidates_use_captured_config_instead_of_stale_materialized_rows() {
+        let db = Database::memory().unwrap();
+        let mut source = provider_with_format("source", GatewayApiFormat::OpenaiChat);
+        source.max_concurrent_requests = 1;
+        let mut captured = GatewayConfig {
+            revision: 1,
+            providers: vec![source],
+            ..Default::default()
+        };
+        captured.routing_policies.insert("local".into(), GatewayRoutingPolicy::WeightedRoundRobin);
+        captured.routing_weights.insert("local".into(), HashMap::from([("source".into(), 2)]));
+        let old_row = materialize_provider(&captured.providers[0], GatewayApiFormat::OpenaiChat, "codex", 0, &captured.model_registry_overrides, Some(captured.revision));
+        db.save_provider("codex", &old_row).unwrap();
+
+        // Simulate a save after the request captured revision 1. The derived row
+        // deliberately stays old: routing must read neither its parameters nor
+        // a newer revision when materializing the captured request plan.
+        let mut saved = captured.clone();
+        saved.revision = 2;
+        saved.providers[0].base_url = "https://saved.example/v1".into();
+        saved.providers[0].models[0].upstream_model = "saved-model".into();
+        saved.providers[0].max_concurrent_requests = 3;
+        saved.routing_policies.insert("local".into(), GatewayRoutingPolicy::RoundRobin);
+        saved.routing_weights.insert("local".into(), HashMap::from([("source".into(), 7)]));
+        db.set_setting(CONFIG_KEY, &serde_json::to_string(&saved).unwrap()).unwrap();
+
+        let (old_candidates, old_policy, old_weights) =
+            resolve_route_providers_from_config(&captured, "codex", "local").unwrap();
+        assert_eq!(old_candidates[0].settings_config["base_url"], "https://example.com/v1");
+        assert_eq!(old_candidates[0].settings_config["gateway_model_map"]["local"], "model-a");
+        assert_eq!(old_candidates[0].gateway_max_concurrent_requests(), 1);
+        assert_eq!(old_candidates[0].gateway_config_revision(), Some(1));
+        assert_eq!(old_policy, GatewayRoutingPolicy::WeightedRoundRobin);
+        assert_eq!(old_weights["source"], 2);
+
+        let (new_candidates, new_policy, new_weights) =
+            resolve_route_providers(&db, "codex", None, "local").unwrap().unwrap();
+        assert_eq!(new_candidates[0].settings_config["base_url"], "https://saved.example/v1");
+        assert_eq!(new_candidates[0].settings_config["gateway_model_map"]["local"], "saved-model");
+        assert_eq!(new_candidates[0].gateway_max_concurrent_requests(), 3);
+        assert_eq!(new_candidates[0].gateway_config_revision(), Some(2));
+        assert_eq!(new_policy, GatewayRoutingPolicy::RoundRobin);
+        assert_eq!(new_weights["source"], 7);
+    }
+
+    #[test]
     fn provider_meta_body_recording_scopes() {
         // 未开启：None
         let p = provider_with_format("a", GatewayApiFormat::OpenaiChat);
@@ -3497,6 +3522,7 @@ mod tests {
             "codex",
             0,
             &config.model_registry_overrides,
+            Some(config.revision),
         );
         assert_eq!(
             generated.settings_config["gateway_model_map"]["best-code"],

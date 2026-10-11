@@ -773,6 +773,113 @@ async fn incomplete_chat_tool_stream_reports_error_and_records_interruption() {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn same_source_protocol_failover_releases_previous_attempt_capacity() {
+    for stream in [false, true] {
+        let seen = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let chat_seen = seen.clone();
+        let responses_seen = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mock = Router::new()
+            .route(Format::Chat.path(), post(move |Json(body): Json<Value>| {
+                chat_seen.lock().unwrap().push(("chat".into(), body));
+                async {
+                    Response::builder().status(StatusCode::BAD_REQUEST)
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"error":{"message":"Chat is unsupported here"}}).to_string())).unwrap()
+                }
+            }))
+            .route(Format::Responses.path(), post(move |Json(body): Json<Value>| {
+                responses_seen.lock().unwrap().push(("responses".into(), body.clone()));
+                async move {
+                    let (content_type, wire) = if body["stream"] == true {
+                        ("text/event-stream", response_sse(Format::Responses, false))
+                    } else {
+                        ("application/json", response_json(Format::Responses, false).to_string())
+                    };
+                    Response::builder().header("content-type", content_type).body(Body::from(wire)).unwrap()
+                }
+            }));
+        let task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap(); });
+        let provider: GatewayProvider = serde_json::from_value(json!({
+            "id":"shared-source","name":"shared-source","baseUrl":format!("http://{address}/v1"),
+            "apiKey":"fixture-upstream-key","maxConcurrentRequests":1,
+            "models":[
+                {"alias":ALIAS,"upstreamModel":MODEL,"apiFormat":"openai_chat"},
+                {"alias":ALIAS,"upstreamModel":MODEL,"apiFormat":"openai_responses"}
+            ]
+        })).unwrap();
+        // 内部/迁移候选 fixture：产品 UI 仍禁止供应商内重复 alias。
+        // 这里直接物化两种协议，验证路由内核的源供应商容量共享契约。
+        let config = GatewayConfig { providers:vec![provider], local_api_key:"matrix-local-key".into(), enable_logging:false, ..Default::default() };
+        let db = Arc::new(Database::memory().unwrap());
+        db.set_setting(CONFIG_KEY, &serde_json::to_string(&config).unwrap()).unwrap();
+        let runtime = configured_runtime(db, &config).await;
+        let info = runtime.start().await.unwrap();
+        let response = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(15)).build().unwrap()
+            .post(format!("http://127.0.0.1:{}{}", info.port, Format::Chat.path()))
+            .bearer_auth("matrix-local-key").json(&request(Format::Chat, stream, "text")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+        let wire = response.text().await.unwrap();
+        check_response(Format::Chat, stream, false, &wire, &mut String::new()).unwrap();
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.iter().map(|(kind, _)| kind.as_str()).collect::<Vec<_>>(), vec!["chat", "responses"]);
+        assert_eq!(requests[0].1["model"], MODEL);
+        assert_eq!(requests[1].1["model"], MODEL);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime.get_provider_capacity_snapshot("shared-source").await == (1, 0, 0) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("response completion must release shared source capacity");
+        runtime.stop().await.unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn final_stream_health_uses_conversion_result_and_accepts_output_limit() {
+    let prefix = format!("data: {}\n\n", json!({"id":"chatcmpl_health","model":MODEL,"choices":[{"delta":{"content":"partial"}}]}));
+    let partial_tool = format!("data: {}\n\n", json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_health","type":"function","function":{"name":"weather","arguments":"{"}}]}}]}));
+    for (suffix, failed) in [
+        ("data: {\"error\":{\"message\":\"late upstream failure\"}}\n\n".to_string(), true),
+        (format!("{partial_tool}data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"), true),
+        ("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n".to_string(), false),
+    ] {
+        let sse = format!("{prefix}{suffix}");
+        let (status, wire, seen, db) = routing_contract_with_database(
+            Format::Anthropic, request(Format::Anthropic, true, "text"), vec![
+                (Format::Chat, json!({}), Some(json!({"_http_status":200,"_sse":sse}))),
+                (Format::Chat, json!({}), None),
+            ],
+        ).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(wire.contains("partial"), "{wire}");
+        assert!(seen[1].is_empty(), "committed streams must never replay onto another source");
+        if failed { assert!(wire.contains("event: error"), "{wire}"); }
+        else { assert!(wire.contains("max_tokens") && wire.contains("event: message_stop"), "{wire}"); }
+        let id = generated_provider_id("route-0", GatewayApiFormat::OpenaiChat);
+        let (failures, last_success, last_failure): (u32, Option<String>, Option<String>) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row = {
+                    use rusqlite::OptionalExtension;
+                    let conn = db.conn.lock().unwrap();
+                    conn.query_row("SELECT consecutive_failures,last_success_at,last_failure_at FROM provider_health WHERE provider_id=?1 AND app_type='claude'", [&id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional().unwrap()
+                };
+                if let Some(row) = row { break row; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("final health result must be persisted");
+        assert_eq!(failures, u32::from(failed), "{wire}");
+        assert_eq!(last_success.is_some(), !failed, "stream opening must not count as healthy completion: {wire}");
+        assert_eq!(last_failure.is_some(), failed, "{wire}");
+    }
+}
+
 fn agent_chat_request(stream: bool) -> Value {
     json!({"model":ALIAS,"stream":stream,"reasoning_effort":"xhigh",
         "messages":[{"role":"user","content":"continue"},

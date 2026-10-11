@@ -1,16 +1,15 @@
 mod app_config;
 mod app_store;
 mod auto_launch;
+mod build_info;
 mod claude_desktop_config;
 mod claude_mcp;
-mod claude_plugin;
 mod codex_config;
 mod codex_history_migration;
 mod codex_state_db;
 mod commands;
 mod config;
 mod database;
-mod deeplink;
 mod error;
 mod gemini_config;
 mod gemini_mcp;
@@ -47,22 +46,12 @@ pub use commands::open_provider_terminal;
 pub use commands::*;
 pub use config::{get_claude_mcp_path, get_claude_settings_path, read_json_file};
 pub use database::{Database, Profile};
-pub use deeplink::{import_provider_from_deeplink, parse_deeplink_url, DeepLinkImportRequest};
 pub use error::AppError;
-pub use mcp::{
-    import_from_claude, import_from_codex, import_from_gemini, remove_server_from_claude,
-    remove_server_from_codex, remove_server_from_gemini, sync_enabled_to_claude,
-    sync_enabled_to_codex, sync_enabled_to_gemini, sync_single_server_to_claude,
-    sync_single_server_to_codex, sync_single_server_to_gemini,
-};
-pub use prompt::Prompt;
 pub use provider::{Provider, ProviderMeta};
 pub use services::{
     profile::{ProfilePayload, ProfileScope, ProfileService},
     provider::reapply_current_codex_official_live,
-    skill::{migrate_skills_to_ssot, ImportSkillSelection},
-    ConfigService, EndpointLatency, McpService, PromptService, ProviderService, ProxyService,
-    SkillService, SpeedtestService,
+    ConfigService, EndpointLatency, ProviderService, ProxyService, SpeedtestService,
 };
 pub use settings::{update_settings, AppSettings};
 pub use store::AppState;
@@ -469,6 +458,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            build_info::get_build_info,
             gateway::get_gateway_snapshot,
             gateway::save_gateway_config,
             gateway::start_gateway,

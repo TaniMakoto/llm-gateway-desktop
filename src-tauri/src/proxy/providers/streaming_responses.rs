@@ -14,6 +14,7 @@ use super::transform_responses::{
     sanitize_anthropic_tool_use_input_json,
 };
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
+use crate::proxy::tool_completion::{validate_tool_completion, ToolArgumentFormat};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -58,6 +59,12 @@ fn anthropic_error_sse(message: &str, error_type: &str) -> Bytes {
             "error": {"type": error_type, "message": message}
         }),
     )
+}
+
+fn function_tool_error(name: &str, streamed: &str, had_delta: bool, final_arguments: Option<&str>) -> Option<&'static str> {
+    let arguments = if had_delta { streamed } else { final_arguments.unwrap_or(streamed) };
+    validate_tool_completion(name, arguments, ToolArgumentFormat::JsonObject, true).err()
+        .or_else(|| final_arguments.and_then(|arguments| validate_tool_completion(name, arguments, ToolArgumentFormat::JsonObject, true).err()))
 }
 
 /// Convert a compatible gateway's non-streaming Responses JSON into a complete
@@ -314,8 +321,8 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
         let mut reasoning_item_by_index: HashMap<u32, Value> = HashMap::new();
         let mut reasoning_text_by_index: HashMap<u32, String> = HashMap::new();
         let mut legacy_reasoning_index: Option<u32> = None;
-        let mut has_substantive_output = false;
         let mut terminated = false;
+        let mut late_failure_emitted = false;
 
         // Append an EOF sentinel so the same parser handles a final SSE event that
         // omitted its trailing blank line. The boolean distinguishes the sentinel
@@ -414,6 +421,11 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                         // do not synthesize message_start if a broken gateway emits a
                         // late delta after response.failed/error.
                         if terminated {
+                            if !late_failure_emitted && (event_name == "error" || crate::proxy::sse::classify_terminal_event(&data) == Some(crate::proxy::sse::SseTerminalState::Failed)) {
+                                let (message, error_type) = responses_error_details(&data, "Responses upstream reported a late error");
+                                yield Ok(anthropic_error_sse(&message, &error_type));
+                                late_failure_emitted = true;
+                            }
                             continue;
                         }
 
@@ -426,9 +438,6 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                 | "response.reasoning_text.delta"
                                 | "response.reasoning.delta"
                         );
-                        if delta_requires_message_start {
-                            has_substantive_output = true;
-                        }
                         if delta_requires_message_start && !has_sent_message_start {
                             yield Ok(anthropic_sse(
                                 "message_start",
@@ -650,7 +659,6 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                     if item_type == "function_call" {
                                         has_tool_use = true;
-                                        has_substantive_output = true;
                                         if let Some(index) = current_text_index.take() {
                                             if open_indices.remove(&index) {
                                                 let stop_event = json!({
@@ -871,6 +879,18 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                 })
                                 .or(last_tool_index);
                                 if let Some(index) = index {
+                                    if !open_indices.contains(&index) { continue; }
+                                    if let Some(problem) = function_tool_error(
+                                        tool_name_by_index.get(&index).map(String::as_str).unwrap_or(""),
+                                        tool_args_by_index.get(&index).map(String::as_str).unwrap_or(""),
+                                        tool_had_delta.contains(&index),
+                                        data.get("arguments").or_else(|| data.pointer("/item/arguments")).and_then(Value::as_str),
+                                    ) {
+                                        yield Ok(anthropic_error_sse(&format!("Incomplete upstream tool call at index {index}: {problem}"), "incomplete_tool_call"));
+                                        terminated = true;
+                                        late_failure_emitted = true;
+                                        continue;
+                                    }
                                     if !open_indices.remove(&index) {
                                         continue;
                                     }
@@ -1206,6 +1226,35 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                         .and_then(|r| r.as_str()),
                                 );
 
+                                let mut tool_error = None;
+                                if let Some(items) = response_obj.get("output").and_then(Value::as_array) {
+                                    for item in items.iter().filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call")) {
+                                        if let Some(problem) = function_tool_error(
+                                            item.get("name").and_then(Value::as_str).unwrap_or(""),
+                                            item.get("arguments").and_then(Value::as_str).unwrap_or(""), true, None,
+                                        ) {
+                                            tool_error = Some(format!("Incomplete upstream function call in terminal response: {problem}"));
+                                            break;
+                                        }
+                                    }
+                                }
+                                for (index, name) in &tool_name_by_index {
+                                    if let Some(problem) = function_tool_error(
+                                        name,
+                                        tool_args_by_index.get(index).map(String::as_str).unwrap_or(""),
+                                        tool_had_delta.contains(index), None,
+                                    ) {
+                                        tool_error = Some(format!("Incomplete upstream tool call at index {index}: {problem}"));
+                                        break;
+                                    }
+                                }
+                                if let Some(message) = tool_error {
+                                    yield Ok(anthropic_error_sse(&message, "incomplete_tool_call"));
+                                    terminated = true;
+                                    late_failure_emitted = true;
+                                    continue;
+                                }
+
                                 // Best effort: close any dangling blocks before message_delta/message_stop.
                                 if !open_indices.is_empty() {
                                     let mut remaining: Vec<u32> = open_indices.iter().copied().collect();
@@ -1311,6 +1360,16 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                                 .get(&index)
                                                 .map(String::as_str)
                                                 .unwrap_or("");
+                                            if let Some(problem) = function_tool_error(
+                                                name,
+                                                tool_args_by_index.get(&index).map(String::as_str).unwrap_or(""),
+                                                tool_had_delta.contains(&index), item.get("arguments").and_then(Value::as_str),
+                                            ) {
+                                                yield Ok(anthropic_error_sse(&format!("Incomplete upstream tool call at index {index}: {problem}"), "incomplete_tool_call"));
+                                                terminated = true;
+                                                late_failure_emitted = true;
+                                                continue;
+                                            }
                                             if !tool_had_delta.contains(&index) || name == "Read" {
                                                 let raw = item
                                                     .get("arguments")
@@ -1479,58 +1538,11 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
         }
 
         if !terminated {
-            let has_open_tool = open_indices.iter().any(|index| {
-                tool_name_by_index.contains_key(index) || tool_args_by_index.contains_key(index)
-            });
-            let has_open_reasoning = open_indices.iter().any(|index| {
-                reasoning_item_by_index.contains_key(index)
-                    || reasoning_text_by_index.contains_key(index)
-                    || legacy_reasoning_index == Some(*index)
-            });
-
-            if has_substantive_output && !has_open_tool && !has_open_reasoning {
-                // Text-only partial output is safe to expose as a max-token style
-                // incomplete turn. Close blocks before the terminal events.
-                let mut remaining: Vec<u32> = open_indices.iter().copied().collect();
-                remaining.sort_unstable();
-                for index in remaining {
-                    yield Ok(anthropic_sse(
-                        "content_block_stop",
-                        &json!({"type":"content_block_stop","index":index}),
-                    ));
-                }
-                if !has_sent_message_start {
-                    yield Ok(anthropic_sse(
-                        "message_start",
-                        &json!({
-                            "type":"message_start",
-                            "message":{
-                                "id":message_id.clone().unwrap_or_default(),
-                                "type":"message",
-                                "role":"assistant",
-                                "model":current_model.clone().unwrap_or_default(),
-                                "usage":{"input_tokens":0,"output_tokens":0}
-                            }
-                        }),
-                    ));
-                }
-                yield Ok(anthropic_sse(
-                    "message_delta",
-                    &json!({
-                        "type":"message_delta",
-                        "delta":{"stop_reason":"max_tokens","stop_sequence":null},
-                        "usage":{"input_tokens":0,"output_tokens":0}
-                    }),
-                ));
-                yield Ok(anthropic_sse("message_stop", &json!({"type":"message_stop"})));
-            } else {
-                // A truncated tool/reasoning block cannot be safely finalized: tool
-                // JSON may be partial and thinking may be missing its signature.
-                yield Ok(anthropic_error_sse(
-                    "Responses upstream stream ended before a terminal event",
-                    "stream_truncated",
-                ));
-            }
+            // EOF cannot invent a model token limit, even for partial text.
+            yield Ok(anthropic_error_sse(
+                "Responses upstream stream ended before a terminal event",
+                "stream_truncated",
+            ));
         }
     }
 }
@@ -1672,7 +1684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clean_eof_after_partial_text_is_explicitly_incomplete() {
+    async fn test_clean_eof_after_partial_text_is_transport_failure() {
         let input = concat!(
             "event: response.created\n",
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n",
@@ -1681,9 +1693,10 @@ mod tests {
         );
 
         let merged = convert_stream_text(input).await;
-        assert!(merged.contains("\"stop_reason\":\"max_tokens\""));
-        assert!(merged.contains("event: content_block_stop"));
-        assert!(merged.contains("event: message_stop"));
+        assert!(merged.contains("event: error"));
+        assert!(merged.contains("stream_truncated"));
+        assert!(!merged.contains("event: message_stop"));
+        assert!(!merged.contains("max_tokens"));
     }
 
     #[tokio::test]

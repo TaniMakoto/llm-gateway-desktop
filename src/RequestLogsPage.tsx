@@ -737,7 +737,9 @@ function LogDetail({ log, onClose }: { log: RequestLog; onClose: () => void }) {
                 <p className="mt-2">跳过原因：{attempt.skipReason}</p>
               )}
               {attempt.reasoningNote && (
-                <p className="mt-2 text-muted-foreground">思考处理：{attempt.reasoningNote}</p>
+                <p className="mt-2 text-muted-foreground">
+                  思考处理：{attempt.reasoningNote}
+                </p>
               )}
               {attempt.error && (
                 <p className="mt-2 whitespace-pre-wrap break-words text-destructive">

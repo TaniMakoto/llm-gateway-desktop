@@ -2,6 +2,7 @@
 //!
 //! 提供本地HTTP代理服务，支持多Provider故障转移和请求透传
 
+pub(crate) mod attempt_lease;
 pub mod body_filter;
 pub(crate) mod body_recorder;
 pub mod cache_injector;
@@ -34,10 +35,13 @@ pub(crate) mod server;
 pub mod session;
 pub mod session_affinity;
 pub(crate) mod sse;
+#[cfg(test)]
+mod stream_lifecycle_tests;
 pub(crate) mod switch_lock;
 pub mod thinking_budget_rectifier;
 pub mod thinking_optimizer;
 pub mod thinking_rectifier;
+pub(crate) mod tool_completion;
 pub(crate) mod types;
 pub(crate) mod upstream_error;
 pub mod usage;

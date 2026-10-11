@@ -69,6 +69,6 @@ gh release view v0.1.0-alpha.1 --web
 
 - GitHub Actions 四个平台任务全部通过。
 - 仓库中没有真实 API Key、数据库、日志或 `.env`。
-- `LICENSE` 与 `THIRD_PARTY_NOTICES.md` 保持存在。
+- `LICENSE` 保留项目和第三方适用的来源、版权与许可说明，并随程序分发。
 - Release 说明明确标注 alpha、Windows 未签名、macOS 未公证。
 - 至少在 Windows 上实际启动一次安装包并完成 Mock 请求测试。

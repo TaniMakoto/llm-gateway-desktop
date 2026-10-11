@@ -714,6 +714,14 @@ pub(crate) struct PassthroughDiagnostics {
     pub model: String,
 }
 
+fn record_stream_error(trace: &super::request_trace::RequestTrace, block: &str) {
+    let event = serde_json::from_str::<Value>(&crate::proxy::sse::sse_data(block)).ok();
+    let error = event.as_ref().and_then(|event| event.get("error").or_else(|| event.pointer("/response/error")));
+    let message = error.and_then(|error| error.get("message")).and_then(Value::as_str).unwrap_or("上游流返回错误事件").to_string();
+    let tool_failure = error.is_some_and(|error| ["type", "code"].iter().any(|field| error.get(*field).and_then(Value::as_str) == Some("incomplete_tool_call")));
+    if tool_failure { trace.interrupt_tool_stream(message); } else { trace.interrupt_stream(message); }
+}
+
 /// 按应用类型推断客户端侧 SSE 协议。
 ///
 /// Claude / Claude Desktop 客户端说 Anthropic Messages，Codex 说 OpenAI Responses，
@@ -824,14 +832,7 @@ pub fn create_logged_passthrough_stream(
                         if previous_terminal != SseTerminalState::Failed
                             && terminal.state() == SseTerminalState::Failed
                         {
-                            let message = event_text.lines()
-                                .filter_map(|line| strip_sse_field(line, "data"))
-                                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
-                                .find_map(|event| event.pointer("/error/message")
-                                    .or_else(|| event.pointer("/response/error/message"))
-                                    .and_then(Value::as_str).map(str::to_owned))
-                                .unwrap_or_else(|| "上游流返回错误事件".to_string());
-                            if let Some(trace) = &trace { trace.interrupt_stream(message); }
+                            if let Some(trace) = &trace { record_stream_error(trace, &event_text); }
                         }
 
                         if inspect_sse_events {
@@ -881,6 +882,13 @@ pub fn create_logged_passthrough_stream(
                     break;
                 }
                 None => {
+                    if !buffer.trim().is_empty() {
+                        let previous_terminal = terminal.state();
+                        terminal.push(&buffer);
+                        if previous_terminal != SseTerminalState::Failed && terminal.state() == SseTerminalState::Failed {
+                            if let Some(trace) = &trace { record_stream_error(trace, &buffer); }
+                        }
+                    }
                     // 流正常结束。正常收尾都会带本协议的终态标记；到 EOF 仍停在
                     // Pending 说明上游提前收口（close-delimited 响应在字节层看不出
                     // 错误），记一条 ERROR 便于事后区分"干净结束"与"半条消息"。
@@ -890,6 +898,9 @@ pub fn create_logged_passthrough_stream(
                             protocol.name(),
                             stream_start.elapsed().as_millis()
                         );
+                    }
+                    if terminal.state() == SseTerminalState::Pending {
+                        if let Some(trace) = &trace { trace.interrupt_stream("上游流结束但未收到正常结束标记".into()); }
                     }
                     break;
                 }

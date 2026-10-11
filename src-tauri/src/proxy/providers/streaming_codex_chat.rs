@@ -14,6 +14,7 @@ use super::{
 };
 use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
+use crate::proxy::tool_completion::{validate_tool_completion, ToolArgumentFormat};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -112,6 +113,10 @@ impl ChatToResponsesState {
 
     fn handle_chat_chunk(&mut self, chunk: &Value) -> Vec<Bytes> {
         let mut events = Vec::new();
+
+        if self.completed {
+            return events;
+        }
 
         if let Some(id) = chunk.get("id").and_then(|v| v.as_str()) {
             self.response_id = response_id_from_chat_id(Some(id));
@@ -450,23 +455,27 @@ impl ChatToResponsesState {
         }
     }
 
-    fn has_substantive_output(&self) -> bool {
-        !self.text.text.trim().is_empty()
-            || !self.reasoning.text.trim().is_empty()
-            || !self.inline_think.buffer.trim().is_empty()
-            || !self.output_items.is_empty()
-            || self.tools.values().any(|state| {
-                state.added
-                    || !state.call_id.trim().is_empty()
-                    || !state.name.trim().is_empty()
-                    || !state.arguments.trim().is_empty()
-                    || !state.reasoning_content.trim().is_empty()
-            })
-    }
-
     fn finalize(&mut self) -> Vec<Bytes> {
         if self.completed {
             return Vec::new();
+        }
+
+        if self.finish_reason.is_none() {
+            return vec![self.failed_event(
+                "Upstream Chat Completions stream ended before sending finish_reason".into(),
+                Some("stream_truncated".into()),
+            )];
+        }
+        for (index, tool) in &self.tools {
+            let format = if self.tool_context.is_custom_tool_chat_name(&tool.name) {
+                ToolArgumentFormat::CustomText
+            } else {
+                ToolArgumentFormat::JsonObject
+            };
+            if let Err(problem) = validate_tool_completion(&tool.name, &tool.arguments, format, true) {
+                let message = format!("Incomplete upstream tool call at index {index}: {problem}");
+                return vec![self.failed_event(message, Some("incomplete_tool_call".into()))];
+            }
         }
 
         let mut events = self.ensure_response_started();
@@ -715,12 +724,17 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
         let mut state = ChatToResponsesState::with_tool_context(tool_context);
         let mut stream_failed = false;
 
+        // Process a final unterminated SSE block through the same decoder.
+        let stream = stream.map(|chunk| (chunk, false)).chain(futures::stream::once(async {
+            (Ok::<Bytes, E>(Bytes::new()), true)
+        }));
         tokio::pin!(stream);
 
-        while let Some(chunk) = stream.next().await {
+        while let Some((chunk, is_eof)) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
                     crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    if is_eof && !buffer.trim().is_empty() { buffer.push_str("\n\n"); }
 
                     while let Some(block) = take_sse_block(&mut buffer) {
                         if block.trim().is_empty() {
@@ -755,7 +769,9 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
                             Err(_) => continue,
                         };
 
-                        if event_name.as_deref() == Some("error") || chunk.get("error").is_some() {
+                        if event_name.as_deref() == Some("error")
+                            || crate::proxy::sse::classify_terminal_event(&chunk) == Some(crate::proxy::sse::SseTerminalState::Failed)
+                        {
                             let (message, error_type) = extract_chat_sse_error(&chunk);
                             yield Ok(state.failed_event(message, error_type));
                             stream_failed = true;
@@ -784,11 +800,6 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
 
         if !stream_failed {
             if state.completed || state.finish_reason.is_some() {
-                for event in state.finalize() {
-                    yield Ok(event);
-                }
-            } else if state.has_substantive_output() {
-                state.finish_reason = Some("length".to_string());
                 for event in state.finalize() {
                     yield Ok(event);
                 }
@@ -1065,16 +1076,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_end_with_output_without_finish_reason_emits_incomplete_without_failed() {
+    async fn stream_end_with_output_without_finish_reason_is_transport_failure() {
         let output = collect(vec![
             "data: {\"id\":\"chatcmpl_truncated\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
         ])
         .await;
 
-        assert!(output.contains("event: response.completed"));
-        assert!(output.contains("\"status\":\"incomplete\""));
-        assert!(output.contains("\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"));
-        assert!(!output.contains("event: response.failed"));
+        assert!(output.contains("event: response.failed"));
+        assert!(output.contains("partial"));
+        assert!(!output.contains("event: response.completed"));
+        assert!(!output.contains("max_output_tokens"));
     }
 
     #[tokio::test]

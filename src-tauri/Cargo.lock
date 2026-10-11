@@ -1877,6 +1877,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-core"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2839,7 +2846,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
 name = "llm-gateway-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2853,6 +2860,7 @@ dependencies = [
  "dirs 5.0.1",
  "flate2",
  "futures",
+ "gateway-core",
  "hmac",
  "http",
  "http-body",

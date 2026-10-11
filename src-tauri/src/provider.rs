@@ -58,6 +58,10 @@ impl Provider {
             .unwrap_or(0)
     }
 
+    pub(crate) fn gateway_config_revision(&self) -> Option<u64> {
+        self.meta.as_ref().and_then(|meta| meta.gateway_config_revision)
+    }
+
     pub fn gateway_queue_limit(&self) -> u32 {
         self.meta
             .as_ref()
@@ -422,6 +426,9 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub gateway_source_provider_id: Option<String>,
+    /// Captured unified config revision; older requests cannot restore old admission limits.
+    #[serde(rename = "gatewayConfigRevision", skip_serializing_if = "Option::is_none")]
+    pub gateway_config_revision: Option<u64>,
     /// Provider-level concurrency cap for the local gateway. 0/None = unlimited.
     #[serde(
         rename = "gatewayMaxConcurrentRequests",

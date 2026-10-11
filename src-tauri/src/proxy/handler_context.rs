@@ -109,7 +109,7 @@ impl RequestContext {
         let start_time = Instant::now();
 
         // 从数据库读取应用级代理配置（per-app）
-        let app_config = state
+        let mut app_config = state
             .db
             .get_proxy_config_for_app(app_type_str)
             .await
@@ -156,6 +156,7 @@ impl RequestContext {
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
+        let mut gateway_route = false;
         let providers = match crate::gateway::resolve_route_providers(
             state.db.as_ref(),
             app_type_str,
@@ -165,6 +166,7 @@ impl RequestContext {
         .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
         {
             Some((providers, routing_policy, routing_weights)) if !providers.is_empty() => {
+                gateway_route = true;
                 // CPA filters blocked credentials before Round Robin/Weighted
                 // selection. Otherwise an open circuit still consumes a turn and
                 // biases traffic toward the candidate immediately behind it.
@@ -214,6 +216,14 @@ impl RequestContext {
                     _ => ProxyError::DatabaseError(e.to_string()),
                 })?,
         };
+
+        if gateway_route {
+            // 统一路由必须覆盖本次捕获的全部可用候选；旧 per-app budget
+            // 可能在热更新前读取，不能据此截断新候选链或关闭故障转移。
+            app_config.auto_failover_enabled = true;
+            app_config.max_retries =
+                u32::try_from(providers.len().saturating_sub(1)).unwrap_or(u32::MAX);
+        }
 
         let provider = providers
             .first()
@@ -379,7 +389,51 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_gemini_model_from_path, scoped_session_affinity_key};
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn gateway_context_uses_candidate_budget_even_when_app_budget_is_stale() {
+        use crate::{database::Database, gateway::{GatewayConfig, GatewayProvider}};
+        use std::{collections::HashMap, sync::Arc};
+        use tokio::sync::RwLock;
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = false;
+        app_config.max_retries = 0;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let providers = ["first", "second"].into_iter().map(|id| {
+            serde_json::from_value::<GatewayProvider>(serde_json::json!({
+                "id": id, "name": id, "baseUrl": "https://mock.example/v1",
+                "apiKey": "fixture-key", "models": [{
+                    "alias": "snapshot-alias", "upstreamModel": "snapshot-model",
+                    "apiFormat": "openai_chat"
+                }]
+            })).unwrap()
+        }).collect();
+        let config = GatewayConfig { providers, enable_logging: false, ..Default::default() };
+        db.set_setting(crate::gateway::CONFIG_KEY, &serde_json::to_string(&config).unwrap()).unwrap();
+        let state = ProxyState {
+            db: db.clone(),
+            config: Arc::new(RwLock::new(super::super::types::ProxyConfig::default())),
+            status: Arc::new(RwLock::new(super::super::types::ProxyStatus::default())),
+            start_time: Arc::new(RwLock::new(None)),
+            current_providers: Arc::new(RwLock::new(HashMap::new())),
+            active_provider_counts: Arc::new(RwLock::new(HashMap::new())),
+            provider_router: Arc::new(super::super::provider_router::ProviderRouter::new(db.clone())),
+            gemini_shadow: Arc::new(super::super::providers::gemini_shadow::GeminiShadowStore::default()),
+            codex_chat_history: Arc::new(super::super::providers::codex_chat_history::CodexChatHistoryStore::default()),
+            session_affinity: Arc::new(RwLock::new(super::super::session_affinity::SessionAffinityStore::default())),
+            app_handle: None,
+            failover_manager: Arc::new(super::super::failover_switch::FailoverSwitchManager::new(db)),
+        };
+        let context = RequestContext::new(&state, &serde_json::json!({"model":"snapshot-alias"}),
+            &HeaderMap::new(), AppType::Codex, "Codex", "codex", Some("openai_chat")).await.unwrap();
+        assert_eq!(context.get_providers().len(), 2, "candidates must not depend on derived provider rows");
+        assert!(context.app_config.auto_failover_enabled);
+        assert_eq!(context.app_config.max_retries, 1, "the saved candidate chain must survive a stale zero budget");
+    }
 
     #[test]
     fn affinity_key_isolated_by_app_and_model() {

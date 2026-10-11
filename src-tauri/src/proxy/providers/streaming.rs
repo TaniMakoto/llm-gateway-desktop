@@ -138,18 +138,11 @@ fn tool_completion_error(
     indices.sort_unstable();
     for index in indices {
         let tool = &tools[&index];
-        let problem = if tool.aborted {
-            Some("tool arguments were aborted")
-        } else if tool.name.trim().is_empty() {
-            Some("tool name is missing")
-        } else if !serde_json::from_str::<Value>(&tool.arguments)
-            .is_ok_and(|arguments| arguments.is_object())
-        {
-            Some("tool arguments are incomplete or are not a JSON object")
-        } else if !has_finish_reason {
-            Some("tool call has no finish_reason")
-        } else {
-            None
+        let problem = if tool.aborted { Some("tool arguments were aborted") } else {
+            crate::proxy::tool_completion::validate_tool_completion(
+                &tool.name, &tool.arguments,
+                crate::proxy::tool_completion::ToolArgumentFormat::JsonObject, has_finish_reason,
+            ).err()
         };
         if let Some(problem) = problem {
             // 不记录参数内容，避免把工具参数中的私有数据写进错误日志。
@@ -160,9 +153,10 @@ fn tool_completion_error(
 }
 
 fn stream_error_event(message: &str) -> Bytes {
+    let error_type = if message.starts_with("Incomplete upstream tool call") { "incomplete_tool_call" } else { "stream_error" };
     let event = json!({
         "type": "error",
-        "error": {"type": "stream_error", "message": message}
+        "error": {"type": error_type, "message": message}
     });
     Bytes::from(format!("event: error\ndata: {event}\n\n"))
 }
@@ -251,11 +245,26 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 
                         for l in line.lines() {
                             if let Some(data) = strip_sse_field(l, "data") {
+                                // A late error must survive an earlier completion marker.
+                                if let Ok(event) = serde_json::from_str::<Value>(data) {
+                                    if crate::proxy::sse::classify_terminal_event(&event) == Some(crate::proxy::sse::SseTerminalState::Failed) {
+                                        let message = event.pointer("/error/message").and_then(Value::as_str).unwrap_or("Upstream Chat stream reported an error");
+                                        stream_ended_with_error = true;
+                                        yield Ok(stream_error_event(message));
+                                        break 'upstream;
+                                    }
+                                }
                                 if has_sent_message_stop {
                                     continue;
                                 }
                                 if data.trim() == "[DONE]" {
                                     log::debug!("[Claude/OpenRouter] <<< OpenAI SSE: [DONE]");
+
+                                    if !has_emitted_message_delta {
+                                        stream_ended_with_error = true;
+                                        yield Ok(stream_error_event("Upstream Chat stream ended before finish_reason"));
+                                        break 'upstream;
+                                    }
 
                                     if let Some(message) = tool_completion_error(
                                         &tool_blocks_by_index, has_emitted_message_delta,
@@ -734,6 +743,9 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                 log::error!("[Claude/OpenRouter] {message}");
                 stream_ended_with_error = true;
                 yield Ok(stream_error_event(&message));
+            } else if !has_emitted_message_delta {
+                stream_ended_with_error = true;
+                yield Ok(stream_error_event("Upstream Chat stream ended before finish_reason"));
             }
         }
 

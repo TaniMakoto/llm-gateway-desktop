@@ -85,10 +85,7 @@ pub(crate) fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, new
     }
 }
 
-/// 客户端侧 SSE 协议。**仅用于诊断日志**：识别该协议"正常结束"与"失败"标记的形态。
-///
-/// 透传层只做字节级转发、不解析各协议的完整状态机，因此这里只保留判定终态所需的
-/// 最小信息，不参与任何转发决策。
+/// SSE 协议。终态观察不改写透传字节，供请求记录和诊断共用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientSseProtocol {
     /// Anthropic Messages SSE（Claude / Claude Desktop 客户端）
@@ -109,82 +106,13 @@ impl ClientSseProtocol {
         }
     }
 
-    /// 便宜的预筛：该事件块是否**可能**携带终态标记。
-    ///
-    /// 只是为了免去对每个事件都做一次 JSON 解析。真正的判定走 [`Self::classify`]，
-    /// 所以工具参数/正文里恰好出现 `stop_reason` 这类字样不会被误判成已收尾。
-    fn may_carry_terminal(self, block: &str) -> bool {
-        match self {
-            ClientSseProtocol::Anthropic => {
-                block.contains("message_stop")
-                    || block.contains("stop_reason")
-                    || block.contains("event: error")
-            }
-            ClientSseProtocol::Responses => {
-                block.contains("response.completed")
-                    || block.contains("response.incomplete")
-                    || block.contains("response.failed")
-                    || block.contains("event: error")
-            }
-            ClientSseProtocol::Chat => {
-                block.contains("[DONE]")
-                    || block.contains("finish_reason")
-                    || block.contains("error")
-            }
-        }
-    }
-
-    /// 按事件 JSON 的 `type` / 字段判定终态；`None` 表示该事件不是终态标记。
-    fn classify(self, event: &serde_json::Value) -> Option<SseTerminalState> {
-        let event_type = event.get("type").and_then(serde_json::Value::as_str);
-        match self {
-            ClientSseProtocol::Anthropic => match event_type {
-                Some("message_stop") => Some(SseTerminalState::Completed),
-                // message_delta 的 stop_reason 非 null 才算收尾（null 表示流还在继续）
-                Some("message_delta") => event
-                    .pointer("/delta/stop_reason")
-                    .filter(|value| !value.is_null())
-                    .map(|_| SseTerminalState::Completed),
-                Some("error") => Some(SseTerminalState::Failed),
-                _ => None,
-            },
-            ClientSseProtocol::Responses => match event_type {
-                // response.incomplete 是 token 上限截断，仍属正常收尾
-                Some("response.completed" | "response.incomplete") => {
-                    Some(SseTerminalState::Completed)
-                }
-                Some("response.failed" | "error") => Some(SseTerminalState::Failed),
-                _ => None,
-            },
-            ClientSseProtocol::Chat => {
-                if event_type == Some("error")
-                    || event.get("error").is_some_and(|value| !value.is_null())
-                {
-                    return Some(SseTerminalState::Failed);
-                }
-                let finished = event
-                    .get("choices")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|choices| {
-                        choices.iter().any(|choice| {
-                            choice.get("finish_reason").is_some_and(|value| !value.is_null())
-                        })
-                    });
-                finished.then_some(SseTerminalState::Completed)
-            }
-        }
-    }
 }
 
-/// 客户端侧 SSE 流已观察到的终态。仅用于日志，不影响转发行为。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SseTerminalState {
-    /// 尚未见到任何协议终态标记（流被中途掐断时停在这里）
-    Pending,
-    /// 已见到正常结束标记（message_stop / [DONE] / response.completed ...）
-    Completed,
-    /// 已见到失败终态（event: error / response.failed），上游已自行报错
-    Failed,
+pub(crate) use gateway_core::{classify_terminal_event, SseTerminalState};
+
+/// SSE data 可以跨多行；与协议转换器使用相同的拼接语义。
+pub(crate) fn sse_data(block: &str) -> String {
+    block.lines().filter_map(|line| strip_sse_field(line, "data")).collect::<Vec<_>>().join("\n")
 }
 
 /// 统计客户端侧 SSE 流是否已经出现过本协议的终态标记。
@@ -210,31 +138,19 @@ impl TerminalMarkerScanner {
         self.state
     }
 
-    /// 喂入一个完整的 SSE 事件块，返回当前已观察到的终态（首个命中的标记生效）。
+    /// 喂入完整事件块；晚到错误覆盖成功，usage 尾事件不重置终态。
     pub(crate) fn push(&mut self, block: &str) -> SseTerminalState {
-        if self.state != SseTerminalState::Pending {
+        if self.state == SseTerminalState::Failed {
             return self.state;
         }
-        if !self.protocol.may_carry_terminal(block) {
-            return self.state;
-        }
-        for payload in block.lines().filter_map(|line| strip_sse_field(line, "data")) {
-            let payload = payload.trim();
-            if payload.is_empty() {
-                continue;
-            }
-            // Chat 的结束标记是字面量 [DONE]，不是 JSON。
-            if self.protocol == ClientSseProtocol::Chat && payload == "[DONE]" {
-                self.state = SseTerminalState::Completed;
-                return self.state;
-            }
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(payload) else {
-                continue;
-            };
-            if let Some(state) = self.protocol.classify(&event) {
-                self.state = state;
-                return self.state;
-            }
+        let payload = sse_data(block);
+        let named_error = block.lines().filter_map(|line| strip_sse_field(line, "event")).any(|name| name.trim() == "error");
+        if named_error {
+            self.state.observe(SseTerminalState::Failed);
+        } else if self.protocol == ClientSseProtocol::Chat && payload.trim() == "[DONE]" {
+            self.state.observe(SseTerminalState::Completed);
+        } else if let Ok(event) = serde_json::from_str::<serde_json::Value>(&payload) {
+            if let Some(state) = classify_terminal_event(&event) { self.state.observe(state); }
         }
         self.state
     }
@@ -361,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_scanner_keeps_first_terminal_marker() {
+    fn terminal_scanner_late_failure_overrides_completion() {
         let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Responses);
         assert_eq!(
             scanner.push("event: response.completed\ndata: {\"type\":\"response.completed\"}"),
@@ -369,8 +285,24 @@ mod tests {
         );
         assert_eq!(
             scanner.push("event: error\ndata: {\"type\":\"error\"}"),
-            SseTerminalState::Completed
+            SseTerminalState::Failed
         );
+        assert_eq!(scanner.push("event: response.completed\ndata: {\"type\":\"response.completed\"}"), SseTerminalState::Failed);
+    }
+
+    #[test]
+    fn terminal_scanner_preserves_explicit_limit_through_usage_and_done() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Chat);
+        assert_eq!(scanner.push("data: {\"choices\":[{\"finish_reason\":\"length\"}]}"), SseTerminalState::Incomplete);
+        assert_eq!(scanner.push("data: {\"choices\":[],\"usage\":{\"completion_tokens\":12}}"), SseTerminalState::Incomplete);
+        assert_eq!(scanner.push("data: [DONE]"), SseTerminalState::Incomplete);
+    }
+
+    #[test]
+    fn terminal_scanner_reads_multiline_data_and_named_errors() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Responses);
+        assert_eq!(scanner.push("event: response.completed\ndata: {\"type\":\"response.completed\",\ndata: \"response\":{\"status\":\"incomplete\"}}"), SseTerminalState::Incomplete);
+        assert_eq!(scanner.push("event: error\ndata: {\"message\":\"late failure\"}"), SseTerminalState::Failed);
     }
 
     #[test]

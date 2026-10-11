@@ -15,6 +15,7 @@ Thanks for helping improve LLM Gateway Desktop.
 pnpm install --frozen-lockfile
 pnpm typecheck
 pnpm format:check
+cargo test --locked --manifest-path crates/gateway-core/Cargo.toml
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 cargo test --locked --manifest-path src-tauri/Cargo.toml gateway::protocol_tests --lib -- --nocapture
 ```
