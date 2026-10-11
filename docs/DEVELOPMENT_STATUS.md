@@ -25,10 +25,12 @@
 
 ## 本批本地验证与 CI 边界
 
-- 按用户要求检查了提交 `dc2de4e` 的失败结果：[Windows 打包](https://github.com/TaniMakoto/llm-gateway-desktop/actions/runs/38112592889) 的独立 core 测试通过，Rust lib 测试目标编译通过，测试结果为 1981 通过、19 失败，因此安装包构建未执行；[Linux 验证](https://github.com/TaniMakoto/llm-gateway-desktop/actions/runs/38112580112) 为 1991 通过、11 失败，共享失败原因一致。
-- 本次修复请求详情联表查询的 `created_at` 歧义，并增加供应商存在/已删除、请求不存在的回归；用仓库中的实际 SQL 和表定义在本地内存 SQLite 中复现旧错误，验证新查询返回日志时间及完整 28 列。这是 SQL 检查，不替代 Rust 测试。
-- Windows 路径夹具改由 TOML 序列化生成；旧测试与当前 Codex 包管理器升级、schema 版本、模型 reasoning 能力映射及异常终态规则对齐。Chat 收到 `[DONE]` 时优先检查工具完整性，使缺少 finish_reason 的工具与自然 EOF 使用相同错误分类；没有跳过测试或放宽工具成功条件。
-- 本次修复的 8 个 Rust 文件已通过 rustfmt 语法解析，静态检查通过；修复后的 Rust 全量测试与安装包构建仍交由新一轮 CI 执行，触发后立即汇报，不等待结果。
+- 按用户要求检查提交 `beece2a` 的失败结果：[Windows 打包](https://github.com/TaniMakoto/llm-gateway-desktop/actions/runs/38113459760) 的独立 core 测试、前端检查及 Rust lib 测试目标编译通过，测试为 1999 通过、2 失败，安装包构建未执行；[Linux 验证](https://github.com/TaniMakoto/llm-gateway-desktop/actions/runs/38113455191) 为 2001 通过、2 失败，失败测试一致。上一批提交 `dc2de4e` 的 Windows/Linux 分别为 19/11 项失败；修复后两个测试继续执行，暴露出原先未检查到的后续断言。
+- 本批将日志断言夹具显式设为 `enable_logging: true`；读取完整 HTTP 响应和停止监听不代表异步 usage/连接任务已经释放 trace，因此使用有界等待读取最终 observation 与日志的 JOIN。缺少 finish_reason、畸形工具参数、关闭日志三个场景拆成独立测试，仍严格要求流内错误、无成功终态、已提交输出不重放。
+- 自检发现 usage 先写入请求日志后，trace 的 `INSERT OR IGNORE` 会丢失转换阶段的最终错误。本批改为仅更新非空最终 `error_message` 的 UPSERT；保留已有 token、费用、HTTP 状态和时间，也不清空此前记录的错误。新增两个 Rust 回归比较除错误字段外的全部日志列；本地内存 SQLite 使用实际源码 SQL/表定义复现旧问题，并验证错误更新、已有错误保留、无 usage 的首次插入及 observation 联查。
+- 混合协议切换改为两个方向 × JSON/SSE 的四个独立测试，分别比较首选和备用候选的完整请求。同一模型的协议能力声明不同：此夹具的 Chat 将 `xhigh` 映射为 `max`，Responses 保留其声明支持的 `xhigh`；每个候选从客户端原始请求重建，避免首选候选的 reasoning/profile 改动污染备用请求。
+- 上一批已修复请求详情查询的 `created_at` 歧义、Windows TOML 路径夹具及旧 schema/升级方式预期；Chat `[DONE]` 优先检查工具完整性。这些旧失败点在本轮 CI 已通过，没有跳过测试或放宽工具成功条件。
+- 本批修改的两个 Rust 文件通过 rustfmt 语法解析，`python tools/static_check.py` 和 `git diff --check` 通过。两个只读审阅分别复核了完整协议夹具与日志生命周期/SQL/API；这些检查不替代 Rust 编译与实际 HTTP 测试。新回归及全量测试、Windows 安装包仍由下一轮 CI 执行，触发后立即汇报，不等待结果。
 - `python tools/static_check.py`：通过，包括所选 Rust 文件结构、公开路由、清单/Python 解析及 TS 语法检查。
 - `pnpm install --frozen-lockfile`、`pnpm typecheck`、`pnpm format:check`：通过。
 - `pnpm build:renderer`：通过前端产物构建；不代表 Tauri 安装包已生成。

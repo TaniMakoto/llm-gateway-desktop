@@ -18,7 +18,9 @@
 
 `chatSchemaRequiredDefaults` 默认关闭。开启时只遍历 schema 位置，为对象 schema 的缺省 required 补 []；保留已有 required、显式 null、enum 中的 null、examples 和 strict:true 工具。这是服务商兼容选项，不意味着 Hermes 缺省 required 的请求违反 JSON Schema。
 
-不能仅凭“null is not of type array”证明 null 由网关生成。真实渠道仍需比较客户端输入和最终出站录制；本次回归断言整份原生 Chat 出站请求仅改变模型名。
+不能仅凭“null is not of type array”证明 null 由网关生成。真实渠道仍需比较客户端输入和最终出站录制；回归比较整份原生 Chat 请求，除模型映射、声明的 reasoning 能力及显式兼容 profile 外保留原始字段和工具 schema。
+
+reasoning 能力按模型和候选协议分别读取。例如测试注册表中的 deepseek-v4-flash：Chat 将 `xhigh` 映射为 `max`，Responses 声明支持 `xhigh`，因此保留该值。JSON/SSE 的两种切换方向使用独立测试，并分别断言首选与备用的完整请求；备用从客户端原始输入重建，不继承首选候选的 effort 映射或 `thinking` 字段。
 
 ## 故障转移
 

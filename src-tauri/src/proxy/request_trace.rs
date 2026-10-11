@@ -545,8 +545,13 @@ impl Drop for Inner {
         let result = (|| -> Result<(), crate::error::AppError> {
             let conn = crate::database::lock_conn!(db.conn);
             conn.execute("INSERT OR REPLACE INTO request_observations (request_id, evidence, outcome) VALUES (?1, ?2, ?3)", rusqlite::params![self.id, json, evidence.outcome])?;
-            // Even canceled streams and missing usage must have a visible request row.
-            conn.execute("INSERT OR IGNORE INTO proxy_request_logs (request_id, provider_id, app_type, model, request_model, status_code, error_message, latency_ms, is_streaming, created_at, reasoning_effort) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10)", rusqlite::params![self.id, provider, self.app_type, self.model, status, error, self.started.elapsed().as_millis() as i64, self.streaming.load(std::sync::atomic::Ordering::Relaxed) as i64, self.created_at, evidence.sent_reasoning])?;
+            // Usage may already have written this row before conversion discovers
+            // a terminal error. Fill in that final error without replacing usage,
+            // prices or timing, and preserve an existing error when none was observed.
+            conn.execute("INSERT INTO proxy_request_logs (request_id, provider_id, app_type, model, request_model, status_code, error_message, latency_ms, is_streaming, created_at, reasoning_effort)
+                VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(request_id) DO UPDATE SET error_message = excluded.error_message
+                WHERE excluded.error_message IS NOT NULL", rusqlite::params![self.id, provider, self.app_type, self.model, status, error, self.started.elapsed().as_millis() as i64, self.streaming.load(std::sync::atomic::Ordering::Relaxed) as i64, self.created_at, evidence.sent_reasoning])?;
             Ok(())
         })();
         if let Err(e) = result {
@@ -589,6 +594,92 @@ mod tests {
             headers,
             Bytes::copy_from_slice(body.as_bytes()),
         )
+    }
+
+    fn seed_usage_log(db: &Database, id: &str, error: Option<&str>) {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO proxy_request_logs
+                (request_id, provider_id, app_type, model, request_model, pricing_model,
+                 reasoning_effort, input_tokens, output_tokens, cache_read_tokens,
+                 cache_creation_tokens, input_cost_usd, output_cost_usd,
+                 cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
+                 latency_ms, first_token_ms, duration_ms, status_code, error_message,
+                 session_id, provider_type, is_streaming, cost_multiplier, created_at)
+             VALUES (?1, 'usage-provider', 'codex', 'usage-model', 'usage-alias',
+                     'usage-pricing-model', 'high', 123, 45, 67, 8, '0.01', '0.02',
+                     '0.03', '0.04', '0.10', 789, 12, 777, 200, ?2,
+                     'usage-session', 'openai', 1, '1.25', 1234567890)",
+                rusqlite::params![id, error],
+            )
+            .unwrap();
+    }
+
+    fn usage_columns(db: &Database, id: &str) -> Vec<rusqlite::types::Value> {
+        let conn = db.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT * FROM proxy_request_logs WHERE request_id = ?1")
+            .unwrap();
+        let error_column = statement
+            .column_names()
+            .iter()
+            .position(|name| *name == "error_message")
+            .unwrap();
+        let column_count = statement.column_count();
+        statement
+            .query_row([id], |row| {
+                (0..column_count)
+                    .filter(|column| *column != error_column)
+                    .map(|column| row.get(column))
+                    .collect()
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn terminal_tool_error_updates_existing_usage_without_replacing_it() {
+        let db = Arc::new(Database::memory().unwrap());
+        let trace = RequestTrace::new(
+            Some(db.clone()),
+            "codex",
+            &json!({"model":"alias", "stream":true}),
+        );
+        let id = trace.id().to_string();
+        seed_usage_log(&db, &id, None);
+        let original_usage = usage_columns(&db, &id);
+        attempt(&trace, "a", 200, "pending");
+        trace.interrupt_tool_stream("Incomplete upstream tool call".into());
+        drop(trace);
+
+        assert_eq!(usage_columns(&db, &id), original_usage);
+        let log = db.get_request_detail(&id).unwrap().unwrap();
+        assert_eq!(log.status_code, 200);
+        assert_eq!(
+            log.error_message.as_deref(),
+            Some("Incomplete upstream tool call")
+        );
+        assert_eq!(log.evidence.unwrap().outcome, "stream_interrupted");
+    }
+
+    #[test]
+    fn absent_terminal_error_preserves_existing_forward_error_and_usage() {
+        let db = Arc::new(Database::memory().unwrap());
+        let trace = RequestTrace::new(Some(db.clone()), "codex", &json!({"model":"alias"}));
+        let id = trace.id().to_string();
+        seed_usage_log(&db, &id, Some("Recorded forwarding error"));
+        let original_usage = usage_columns(&db, &id);
+        // A local failure can leave no upstream attempt/error on the trace.
+        drop(trace);
+
+        assert_eq!(usage_columns(&db, &id), original_usage);
+        let log = db.get_request_detail(&id).unwrap().unwrap();
+        assert_eq!(
+            log.error_message.as_deref(),
+            Some("Recorded forwarding error")
+        );
+        assert_eq!(log.evidence.unwrap().outcome, "failed");
     }
 
     #[tokio::test]

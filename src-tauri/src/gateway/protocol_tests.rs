@@ -674,7 +674,7 @@ async fn routing_contract(
     payload: Value,
     candidates: Vec<(Format, Value, Option<Value>)>,
 ) -> (StatusCode, String, Vec<Vec<Value>>) {
-    let (status, wire, seen, _) = routing_contract_with_database(down, payload, candidates).await;
+    let (status, wire, seen, _) = routing_contract_with_database(down, payload, candidates, false).await;
     (status, wire, seen)
 }
 
@@ -682,6 +682,7 @@ async fn routing_contract_with_database(
     down: Format,
     payload: Value,
     candidates: Vec<(Format, Value, Option<Value>)>,
+    enable_logging: bool,
 ) -> (StatusCode, String, Vec<Vec<Value>>, Arc<Database>) {
     let mut tasks = Vec::new();
     let mut captures = Vec::new();
@@ -725,7 +726,7 @@ async fn routing_contract_with_database(
         captures.push(seen);
     }
     let db = Arc::new(Database::memory().unwrap());
-    let config = GatewayConfig { providers, local_api_key:"matrix-local-key".into(), enable_logging:false, ..Default::default() };
+    let config = GatewayConfig { providers, local_api_key:"matrix-local-key".into(), enable_logging, ..Default::default() };
     db.set_setting(CONFIG_KEY, &serde_json::to_string(&config).unwrap()).unwrap();
     let runtime = configured_runtime(db.clone(), &config).await;
     let info = runtime.start().await.unwrap();
@@ -739,38 +740,112 @@ async fn routing_contract_with_database(
     (status, wire, captures.iter().map(|seen| seen.lock().unwrap().clone()).collect(), db)
 }
 
-#[tokio::test]
-#[serial_test::serial]
-async fn incomplete_chat_tool_stream_reports_error_and_records_interruption() {
-    for finish in ["", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"] {
-        let text = json!({"id":"chatcmpl_partial","model":"mock-model",
+// Reading the HTTP body and stopping the accept loop do not join the connection
+// or usage tasks holding the trace. Wait for both final records, without holding
+// the SQLite lock across an await, instead of assuming immediate publication.
+async fn wait_for_recorded_request(db: &Database) -> (String, String, Option<String>) {
+    use rusqlite::OptionalExtension;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let recorded: Option<(String, String, Option<String>)> = {
+                let conn = db.conn.lock().unwrap();
+                conn.query_row(
+                    "SELECT o.outcome, o.evidence, l.error_message
+                     FROM request_observations o
+                     JOIN proxy_request_logs l ON l.request_id = o.request_id",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .expect("read recorded request")
+            };
+            if let Some(recorded) = recorded {
+                break recorded;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("logging-enabled request must publish its final observation and log")
+}
+
+async fn assert_incomplete_chat_tool_stream(finish: &str, enable_logging: bool) {
+    let text = json!({"id":"chatcmpl_partial","model":"mock-model",
             "choices":[{"delta":{"content":"准备调用工具："}}]});
-        let tool = json!({"choices":[{"delta":{"tool_calls":[{"index":0,
+    let tool = json!({"choices":[{"delta":{"tool_calls":[{"index":0,
             "id":"call_partial","type":"function",
             "function":{"name":"weather","arguments":"{"}}]}}]});
-        let sse = format!("data: {text}\n\ndata: {tool}\n\n{finish}data: [DONE]\n\n");
-        let (status, wire, seen, db) = routing_contract_with_database(
-            Format::Anthropic, request(Format::Anthropic, true, "tool"), vec![
-                (Format::Chat, json!({}), Some(json!({"_http_status":200,"_sse":sse}))),
-                (Format::Chat, json!({}), None),
-            ],
-        ).await;
-        // 已下发文本后 HTTP 状态无法改写，只能发流内 error，不能拼接备用模型。
-        assert_eq!(status, StatusCode::OK);
-        assert!(wire.contains("准备调用工具："));
-        assert!(wire.contains("event: error") && wire.contains("Incomplete upstream tool call"), "{wire}");
-        assert!(!wire.contains("event: message_stop") && !wire.contains("event: message_delta"), "{wire}");
-        assert!(seen[1].is_empty(), "already committed output must not fail over");
+    let sse = format!("data: {text}\n\ndata: {tool}\n\n{finish}data: [DONE]\n\n");
+    let (status, wire, seen, db) = routing_contract_with_database(
+        Format::Anthropic,
+        request(Format::Anthropic, true, "tool"),
+        vec![
+            (
+                Format::Chat,
+                json!({}),
+                Some(json!({"_http_status":200,"_sse":sse})),
+            ),
+            (Format::Chat, json!({}), None),
+        ],
+        enable_logging,
+    )
+    .await;
+    // 已下发文本后 HTTP 状态无法改写，只能发流内 error，不能拼接备用模型。
+    assert_eq!(status, StatusCode::OK);
+    assert!(wire.contains("准备调用工具："));
+    assert!(
+        wire.contains("event: error") && wire.contains("Incomplete upstream tool call"),
+        "{wire}"
+    );
+    assert!(
+        !wire.contains("event: message_stop") && !wire.contains("event: message_delta"),
+        "{wire}"
+    );
+    assert!(
+        seen[1].is_empty(),
+        "already committed output must not fail over"
+    );
+    if !enable_logging {
         let conn = db.conn.lock().unwrap();
-        let (outcome, evidence): (String, String) = conn.query_row(
-            "SELECT outcome,evidence FROM request_observations", [], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
-        assert_eq!(outcome, "stream_interrupted", "{evidence}");
-        let error: Option<String> = conn.query_row(
-            "SELECT error_message FROM proxy_request_logs", [], |row| row.get(0),
-        ).unwrap();
-        assert!(error.is_some_and(|e| e.contains("Incomplete upstream tool call")), "{evidence}");
+        for table in ["request_observations", "proxy_request_logs"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "logging disabled must not persist {table}");
+        }
+        return;
     }
+    let (outcome, evidence, error) = wait_for_recorded_request(&db).await;
+    assert_eq!(outcome, "stream_interrupted", "{evidence}");
+    assert!(
+        error.is_some_and(|e| e.contains("Incomplete upstream tool call")),
+        "{evidence}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn unfinished_chat_tool_without_finish_reason_records_interruption() {
+    assert_incomplete_chat_tool_stream("", true).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn malformed_chat_tool_with_finish_reason_records_interruption() {
+    assert_incomplete_chat_tool_stream(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn unfinished_chat_tool_with_logging_disabled_still_reports_error() {
+    assert_incomplete_chat_tool_stream("", false).await;
 }
 
 #[tokio::test]
@@ -855,7 +930,7 @@ async fn final_stream_health_uses_conversion_result_and_accepts_output_limit() {
             Format::Anthropic, request(Format::Anthropic, true, "text"), vec![
                 (Format::Chat, json!({}), Some(json!({"_http_status":200,"_sse":sse}))),
                 (Format::Chat, json!({}), None),
-            ],
+            ], false,
         ).await;
         assert_eq!(status, StatusCode::OK);
         assert!(wire.contains("partial"), "{wire}");
@@ -915,34 +990,94 @@ async fn native_chat_preserves_agent_fields_schema_and_response() {
         }
     }
 }
+// Explicit wire fixtures: do not derive the expected Responses body by calling
+// the converter being tested. Candidate capabilities depend on the API format.
+fn expected_agent_responses_request(stream: bool) -> Value {
+    let original = agent_chat_request(stream);
+    json!({
+        "model":"deepseek-v4-flash", "stream":stream,
+        "input":[
+            {"type":"message","role":"user","content":"continue"},
+            {"type":"function_call","call_id":"call_delegate","name":"delegate_task","arguments":"{}","status":"completed"},
+            {"type":"function_call_output","call_id":"call_delegate","output":"done"}
+        ],
+        "tools":[{"type":"function","name":"delegate_task","strict":false,
+            "parameters":original["tools"][0]["function"]["parameters"].clone()}],
+        "text":{"format":{"type":"json_object"}},
+        "reasoning":{"effort":"xhigh"}
+    })
+}
+
+async fn assert_mixed_protocol_failover(first: Format, second: Format, stream: bool) {
+    let payload = agent_chat_request(stream);
+    let rejection =
+        json!({"error":{"code":"unsupported_parameter","message":"reasoning is not supported"}});
+    let (status, wire, seen) = routing_contract(
+        Format::Chat,
+        payload.clone(),
+        vec![
+            (
+                first,
+                json!({"chatReasoningProfile":"deepseek"}),
+                Some(rejection),
+            ),
+            (second, json!({}), None),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first:?} -> {second:?}: {wire}");
+    assert_eq!(seen[0].len(), 1);
+    assert_eq!(seen[1].len(), 1);
+    let mut expected_chat = payload;
+    expected_chat["model"] = json!("deepseek-v4-flash");
+    expected_chat["reasoning_effort"] = json!("max");
+    let expected_responses = expected_agent_responses_request(stream);
+    let expected_second = match second {
+        Format::Chat => expected_chat.clone(),
+        Format::Responses => expected_responses.clone(),
+        Format::Anthropic => unreachable!(),
+    };
+    let expected_first = match first {
+        Format::Chat => {
+            expected_chat["thinking"] = json!({"type":"enabled"});
+            expected_chat
+        }
+        Format::Responses => expected_responses,
+        Format::Anthropic => unreachable!(),
+    };
+    assert_eq!(
+        seen[0][0], expected_first,
+        "first {first:?}, stream={stream}"
+    );
+    assert_eq!(
+        seen[1][0], expected_second,
+        "fallback {second:?}, stream={stream}"
+    );
+    check_response(Format::Chat, stream, false, &wire, &mut String::new()).unwrap();
+}
 
 #[tokio::test]
 #[serial_test::serial]
-async fn mixed_protocol_failover_rebuilds_each_candidate_from_original() {
-    for (first, second) in [(Format::Responses, Format::Chat), (Format::Chat, Format::Responses)] {
-        for stream in [false, true] {
-            let payload = agent_chat_request(stream);
-            let rejection = json!({"error":{"code":"unsupported_parameter","message":"reasoning is not supported"}});
-            let (status, wire, seen) = routing_contract(Format::Chat, payload.clone(), vec![
-                (first, json!({"chatReasoningProfile":"deepseek"}), Some(rejection)),
-                (second, json!({}), None),
-            ]).await;
-            assert_eq!(status, StatusCode::OK, "{first:?} -> {second:?}: {wire}");
-            assert_eq!(seen[0].len(), 1);
-            assert_eq!(seen[1].len(), 1);
-            if matches!(second, Format::Chat) {
-                let mut expected = payload;
-                expected["model"] = json!("deepseek-v4-flash");
-                expected["reasoning_effort"] = json!("max");
-                assert_eq!(seen[1][0], expected);
-            } else {
-                assert!(seen[1][0].get("messages").is_none());
-                assert_eq!(seen[1][0]["reasoning"]["effort"], "max");
-                assert!(seen[1][0].get("thinking").is_none());
-            }
-            check_response(Format::Chat, stream, false, &wire, &mut String::new()).unwrap();
-        }
-    }
+async fn responses_to_chat_failover_json_rebuilds_original_request() {
+    assert_mixed_protocol_failover(Format::Responses, Format::Chat, false).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn responses_to_chat_failover_sse_rebuilds_original_request() {
+    assert_mixed_protocol_failover(Format::Responses, Format::Chat, true).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn chat_to_responses_failover_json_restores_original_reasoning() {
+    assert_mixed_protocol_failover(Format::Chat, Format::Responses, false).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn chat_to_responses_failover_sse_restores_original_reasoning() {
+    assert_mixed_protocol_failover(Format::Chat, Format::Responses, true).await;
 }
 
 #[tokio::test]
