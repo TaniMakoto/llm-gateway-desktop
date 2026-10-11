@@ -1,21 +1,21 @@
 mod app_config;
 mod app_store;
 mod auto_launch;
+mod build_info;
 mod claude_desktop_config;
 mod claude_mcp;
-mod claude_plugin;
 mod codex_config;
 mod codex_history_migration;
 mod codex_state_db;
 mod commands;
 mod config;
 mod database;
-mod deeplink;
 mod error;
 mod gemini_config;
 mod gemini_mcp;
 mod gateway;
 mod gateway_chat;
+mod gateway_runtime;
 pub mod hermes_config;
 mod init_status;
 mod lightweight;
@@ -33,7 +33,6 @@ mod provider;
 mod provider_defaults;
 mod proxy;
 mod services;
-mod session_manager;
 mod settings;
 mod store;
 
@@ -47,22 +46,12 @@ pub use commands::open_provider_terminal;
 pub use commands::*;
 pub use config::{get_claude_mcp_path, get_claude_settings_path, read_json_file};
 pub use database::{Database, Profile};
-pub use deeplink::{import_provider_from_deeplink, parse_deeplink_url, DeepLinkImportRequest};
 pub use error::AppError;
-pub use mcp::{
-    import_from_claude, import_from_codex, import_from_gemini, remove_server_from_claude,
-    remove_server_from_codex, remove_server_from_gemini, sync_enabled_to_claude,
-    sync_enabled_to_codex, sync_enabled_to_gemini, sync_single_server_to_claude,
-    sync_single_server_to_codex, sync_single_server_to_gemini,
-};
-pub use prompt::Prompt;
 pub use provider::{Provider, ProviderMeta};
 pub use services::{
     profile::{ProfilePayload, ProfileScope, ProfileService},
     provider::reapply_current_codex_official_live,
-    skill::{migrate_skills_to_ssot, ImportSkillSelection},
-    ConfigService, EndpointLatency, McpService, PromptService, ProviderService, ProxyService,
-    SkillService, SpeedtestService,
+    ConfigService, EndpointLatency, ProviderService, ProxyService, SpeedtestService,
 };
 pub use settings::{update_settings, AppSettings};
 pub use store::AppState;
@@ -297,7 +286,7 @@ pub fn run() {
             let app_state = AppState::new(db);
 
             // 设置 AppHandle 用于代理故障转移时的 UI 更新
-            app_state.proxy_service.set_app_handle(app.handle().clone());
+            app_state.gateway_runtime.set_app_handle(app.handle().clone());
 
             // 精简版不扫描或接管 Claude/Codex/Gemini/OpenCode/Hermes 配置，
             // 也不初始化 MCP、Skills、提示词或官方供应商预设。
@@ -411,7 +400,7 @@ pub fn run() {
                     if config.auto_start {
                         if let Err(error) = crate::gateway::apply_runtime_config(&state, &config).await {
                             log::error!("应用统一网关配置失败: {error}");
-                        } else if let Err(error) = state.proxy_service.start().await {
+                        } else if let Err(error) = state.gateway_runtime.start().await {
                             log::error!("统一网关自动启动失败: {error}");
                         } else {
                             log::info!("统一网关已自动启动");
@@ -469,13 +458,17 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            build_info::get_build_info,
             gateway::get_gateway_snapshot,
             gateway::save_gateway_config,
             gateway::start_gateway,
             gateway::stop_gateway,
             gateway::fetch_gateway_provider_models,
+            gateway::resolve_gateway_model_capabilities,
+            gateway::get_gateway_model_registry,
             gateway::generate_gateway_api_key,
             gateway::test_gateway_model,
+            gateway::open_gateway_recording_folder,
             commands::get_startup_preferences,
             commands::get_auto_launch_status,
             commands::set_auto_launch,
@@ -487,6 +480,8 @@ pub fn run() {
             commands::test_proxy_url,
             commands::get_upstream_proxy_status,
             commands::scan_local_proxies,
+            commands::get_request_logs,
+            commands::get_request_detail,
         ]);
 
     let app = builder
@@ -585,9 +580,9 @@ pub fn run() {
 /// 仅停止本地网关监听服务。精简版从不扫描、接管或恢复外部 CLI 配置。
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
     if let Some(state) = app_handle.try_state::<store::AppState>() {
-        if state.proxy_service.is_running().await {
+        if state.gateway_runtime.is_running().await {
             log::info!("正在停止本地统一网关...");
-            if let Err(error) = state.proxy_service.stop().await {
+            if let Err(error) = state.gateway_runtime.stop().await {
                 log::error!("退出时停止统一网关失败: {error}");
             }
         }

@@ -1,75 +1,20 @@
 //! OpenAI Chat Completions compatibility facade.
 //!
-//! Internally the unified gateway uses the Responses endpoint as the canonical
-//! path. The inherited Responses handler already supports Responses, Chat and
-//! Anthropic upstreams with failover, so this module only translates the local
-//! Chat request/response surface.
+//! Cross-protocol conversion only. Native Chat requests and responses bypass
+//! this module; routing chooses the upstream before any conversion.
 
-use crate::proxy::{handlers, server::ProxyState, ProxyError};
+use crate::proxy::ProxyError;
 use async_stream::stream;
 use axum::{
     body::{Body, Bytes},
-    extract::State,
-    http::{header, HeaderValue, Uri},
+    http::{header, HeaderValue},
     response::Response,
 };
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-
-pub async fn handle_chat_completions(
-    State(state): State<ProxyState>,
-    request: axum::extract::Request,
-) -> Result<Response, ProxyError> {
-    crate::gateway::validate_local_auth(state.db.as_ref(), request.headers())?;
-
-    let (mut parts, body) = request.into_parts();
-    let body_bytes = body
-        .collect()
-        .await
-        .map_err(|error| ProxyError::InvalidRequest(format!("读取 Chat 请求失败: {error}")))?
-        .to_bytes();
-    let body_bytes = handlers::decode_codex_request_body(&mut parts.headers, body_bytes)?;
-    let chat_body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|error| ProxyError::InvalidRequest(format!("Chat 请求 JSON 无效: {error}")))?;
-    let requested_model = chat_body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("local-model")
-        .to_string();
-    let is_stream = chat_body
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    let responses_body = chat_request_to_responses(chat_body)?;
-    parts.uri = Uri::from_static("/v1/responses");
-    parts.headers.remove(header::CONTENT_LENGTH);
-    parts.headers.remove(header::CONTENT_ENCODING);
-    parts.headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    let responses_request = axum::extract::Request::from_parts(
-        parts,
-        Body::from(
-            serde_json::to_vec(&responses_body)
-                .map_err(|error| ProxyError::Internal(error.to_string()))?,
-        ),
-    );
-
-    let response = handlers::handle_responses(State(state), responses_request).await?;
-    if !response.status().is_success() {
-        return Ok(response);
-    }
-
-    if is_stream {
-        Ok(responses_sse_to_chat_response(response, requested_model))
-    } else {
-        responses_json_to_chat_response(response, &requested_model).await
-    }
-}
+use std::time::Instant;
 
 pub fn chat_request_to_responses(body: Value) -> Result<Value, ProxyError> {
     let object = body
@@ -87,7 +32,7 @@ pub fn chat_request_to_responses(body: Value) -> Result<Value, ProxyError> {
 
     if object.get("n").and_then(Value::as_u64).unwrap_or(1) > 1 {
         return Err(ProxyError::InvalidRequest(
-            "统一网关暂不支持 n > 1 的 Chat 请求".to_string(),
+            "跨协议转换不支持 n > 1；请使用原生 Chat 上游".to_string(),
         ));
     }
 
@@ -316,7 +261,7 @@ fn copy_field(source: &Map<String, Value>, target: &mut Map<String, Value>, fiel
     }
 }
 
-async fn responses_json_to_chat_response(
+pub(crate) async fn responses_json_to_chat_response(
     response: Response,
     requested_model: &str,
 ) -> Result<Response, ProxyError> {
@@ -329,8 +274,8 @@ async fn responses_json_to_chat_response(
     let responses_value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| ProxyError::TransformError(format!("Responses JSON 无效: {error}")))?;
     let chat_value = responses_response_to_chat(responses_value, requested_model)?;
-    let encoded = serde_json::to_vec(&chat_value)
-        .map_err(|error| ProxyError::Internal(error.to_string()))?;
+    let encoded =
+        serde_json::to_vec(&chat_value).map_err(|error| ProxyError::Internal(error.to_string()))?;
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.remove(header::CONTENT_ENCODING);
     parts.headers.insert(
@@ -398,10 +343,7 @@ pub fn responses_response_to_chat(
                     .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
                     .unwrap_or("call_gateway");
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool");
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
                 let arguments = item
                     .get("arguments")
                     .map(arguments_as_string)
@@ -526,26 +468,38 @@ fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
     })
 }
 
-fn responses_sse_to_chat_response(response: Response, requested_model: String) -> Response {
+pub(crate) fn responses_sse_to_chat_response(response: Response, requested_model: String) -> Response {
     let (mut parts, body) = response.into_parts();
     let mut upstream = body.into_data_stream();
+    let log_model = requested_model.clone();
     let converted = stream! {
         let mut buffer = String::new();
+        let mut utf8_remainder = Vec::new();
         let mut converter = ResponsesChatSseConverter::new(requested_model);
+        // 只喂给断流日志，不影响下发的字节。
+        let stream_start = Instant::now();
+        let mut forwarded_chunks: u64 = 0;
+        let mut forwarded_bytes: u64 = 0;
 
         while let Some(next) = upstream.next().await {
             match next {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes).replace("\r\n", "\n"));
-                    while let Some(position) = buffer.find("\n\n") {
-                        let event = buffer[..position].to_string();
-                        buffer.drain(..position + 2);
+                    forwarded_bytes += bytes.len() as u64;
+                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    while let Some(event) = crate::proxy::sse::take_sse_block(&mut buffer) {
                         for output in converter.process_sse_event(&event) {
+                            forwarded_chunks += 1;
                             yield Ok::<Bytes, axum::Error>(Bytes::from(output));
                         }
                     }
                 }
                 Err(error) => {
+                    // 行为不变（仍然 yield Err）：只补上可定位的上下文，此前这里连
+                    // 一条日志都没有，上游半途断开时日志里完全看不出来。
+                    log::error!(
+                        "[Chat] 上游流式中断: model={log_model}, 已转发 {forwarded_chunks} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms, error={error}",
+                        stream_start.elapsed().as_millis()
+                    );
                     yield Err(error);
                     return;
                 }
@@ -554,11 +508,17 @@ fn responses_sse_to_chat_response(response: Response, requested_model: String) -
 
         if !buffer.trim().is_empty() {
             for output in converter.process_sse_event(&buffer) {
+                forwarded_chunks += 1;
                 yield Ok::<Bytes, axum::Error>(Bytes::from(output));
             }
         }
         if !converter.finished {
-            for output in converter.finish(None) {
+            // EOF without a protocol terminal is a failed response, not a stop.
+            log::error!(
+                "[Chat] 上游流式响应提前结束（未收到 Responses 正常结束标记）: model={log_model}, 已转发 {forwarded_chunks} 个 SSE 事件 / {forwarded_bytes} 字节, 耗时={}ms",
+                stream_start.elapsed().as_millis()
+            );
+            for output in converter.fail(json!({"type":"stream_error","code":"incomplete_stream","message":"Upstream stream ended before a terminal response event"})) {
                 yield Ok::<Bytes, axum::Error>(Bytes::from(output));
             }
         }
@@ -570,10 +530,9 @@ fn responses_sse_to_chat_response(response: Response, requested_model: String) -
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/event-stream"),
     );
-    parts.headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache"),
-    );
+    parts
+        .headers
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     Response::from_parts(parts, Body::from_stream(converted))
 }
 
@@ -603,6 +562,9 @@ impl ResponsesChatSseConverter {
     }
 
     fn process_sse_event(&mut self, raw: &str) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
         let data = raw
             .lines()
             .filter_map(|line| line.strip_prefix("data:"))
@@ -619,7 +581,10 @@ impl ResponsesChatSseConverter {
             return Vec::new();
         };
         self.update_metadata(&event);
-        let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let mut output = Vec::new();
 
         match event_type {
@@ -665,7 +630,10 @@ impl ResponsesChatSseConverter {
                     .or_else(|| self.last_tool_key.clone())
                     .unwrap_or_else(|| "gateway_tool".to_string());
                 let index = self.tool_index(&key);
-                let delta = event.get("delta").and_then(Value::as_str).unwrap_or_default();
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 output.push(self.chunk(
                     json!({
                         "tool_calls": [{
@@ -682,12 +650,30 @@ impl ResponsesChatSseConverter {
                 output.extend(self.finish(response));
             }
             "response.failed" | "error" => {
-                output.push(format!("data: {}\n\n", event));
-                output.extend(self.finish(None));
+                let error = event
+                    .pointer("/response/error")
+                    .or_else(|| event.get("error"))
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .unwrap_or_else(
+                        || json!({"type":"upstream_error","message":"Upstream response failed"}),
+                    );
+                output.extend(self.fail(error));
             }
             _ => {}
         }
         output
+    }
+
+    fn fail(&mut self, error: Value) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        vec![
+            format!("data: {}\n\n", json!({"error":error})),
+            "data: [DONE]\n\n".into(),
+        ]
     }
 
     fn update_metadata(&mut self, event: &Value) {
@@ -721,10 +707,7 @@ impl ResponsesChatSseConverter {
             .or_else(|| item.get("id"))
             .and_then(Value::as_str)
             .unwrap_or("call_gateway");
-        let name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
         vec![self.chunk(
             json!({
                 "tool_calls": [{
@@ -804,6 +787,62 @@ fn chat_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn converted_wire(wire: String) -> String {
+        let chunks: Vec<_> = wire
+            .as_bytes()
+            .iter()
+            .map(|byte| Ok::<_, std::io::Error>(Bytes::from(vec![*byte])))
+            .collect();
+        let response = Response::new(Body::from_stream(futures::stream::iter(chunks)));
+        let converted = responses_sse_to_chat_response(response, "test".into());
+        let bytes = converted.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gateway_chat_sse_handles_single_byte_utf8_and_crlf_chunks() {
+        let wire = format!(
+            "data: {}\r\n\r\ndata: {}\r\n\r\n",
+            json!({"type":"response.output_text.delta","delta":"杭州 🌏"}),
+            json!({"type":"response.completed","response":{"status":"completed"}})
+        );
+        let converted = converted_wire(wire).await;
+        assert!(converted.contains("杭州 🌏"), "{converted}");
+        assert_eq!(converted.matches("data: [DONE]").count(), 1);
+        assert_eq!(converted.matches("\"finish_reason\":\"stop\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_chat_truncated_stream_never_reports_success() {
+        let converted = converted_wire(format!(
+            "data: {}\n\n",
+            json!({"type":"response.output_text.delta","delta":"partial"})
+        ))
+        .await;
+        assert!(converted.contains("incomplete_stream"), "{converted}");
+        assert!(!converted.contains("\"finish_reason\":\"stop\""));
+        assert_eq!(converted.matches("data: [DONE]").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_chat_error_is_normalized_and_terminal_is_not_repeated() {
+        let failed = json!({"type":"response.failed","response":{"error":{"type":"server_error","message":"mock failure"}}});
+        let late = json!({"type":"response.completed","response":{"status":"completed"}});
+        let converted = converted_wire(format!("data: {failed}\n\ndata: {late}\n\n")).await;
+        let error: Value = serde_json::from_str(
+            converted
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(error["error"]["type"], "server_error");
+        assert_eq!(error["error"]["message"], "mock failure");
+        assert!(!converted.contains("\"finish_reason\":\"stop\""));
+        assert_eq!(converted.matches("data: [DONE]").count(), 1);
+        assert_eq!(converted.matches("mock failure").count(), 1);
+    }
 
     #[test]
     fn chat_request_maps_messages_tools_and_limits() {

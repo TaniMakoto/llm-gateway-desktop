@@ -16,7 +16,7 @@ Date: 2026-07-20
 
 ## Required attribution retained
 
-The root `LICENSE` preserves the original MIT copyright and permission notice. `THIRD_PARTY_NOTICES.md` identifies the upstream project and derived areas. These files must remain in public source and redistributed packages.
+The root `LICENSE` preserves the original MIT copyright, permission notice, source attribution and derived areas. This consolidated file is retained in public source and redistributed packages.
 
 ## Validation completed
 

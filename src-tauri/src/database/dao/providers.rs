@@ -183,6 +183,16 @@ impl Database {
             .transaction()
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        Self::save_provider_in_transaction(&tx, app_type, provider)?;
+        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn save_provider_in_transaction(
+        tx: &rusqlite::Connection,
+        app_type: &str,
+        provider: &Provider,
+    ) -> Result<(), AppError> {
         let mut meta_clone = provider.meta.clone().unwrap_or_default();
         let endpoints = std::mem::take(&mut meta_clone.custom_endpoints);
 
@@ -273,7 +283,6 @@ impl Database {
             }
         }
 
-        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
     }
 

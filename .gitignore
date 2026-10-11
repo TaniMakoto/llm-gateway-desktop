@@ -19,6 +19,10 @@ GEMINI.md
 vitest-report.json
 nul
 
+# Python 辅助脚本（tools/）的字节码缓存
+__pycache__/
+*.pyc
+
 # Flatpak build artifacts
 flatpak/llm-gateway.deb
 flatpak-build/
@@ -29,3 +33,5 @@ copilot-api
 .history
 CODEBUDDY.md
 mainWindow.js
+/_refs/
+/docs/history-session/

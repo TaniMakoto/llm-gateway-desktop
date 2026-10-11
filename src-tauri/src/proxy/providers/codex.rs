@@ -320,6 +320,26 @@ pub fn resolve_codex_chat_reasoning_config(
     infer_codex_chat_reasoning_config(provider, body)
 }
 
+/// Explicit wire profiles override host inference, including private relays.
+pub fn chat_reasoning_profile(profile: &str) -> Option<CodexChatReasoningConfig> {
+    let (thinking, effort, mode, output) = match profile {
+        "openai" => ("none", "reasoning_effort", "passthrough", "auto"),
+        "deepseek" => ("thinking", "reasoning_effort", "deepseek", "reasoning_content"),
+        "openrouter" => ("none", "reasoning.effort", "openrouter", "auto"),
+        "siliconflow" => ("enable_thinking", "none", "passthrough", "reasoning_content"),
+        "disabled" => ("none", "none", "passthrough", "auto"),
+        _ => return None,
+    };
+    Some(CodexChatReasoningConfig {
+        supports_thinking: Some(thinking != "none"),
+        supports_effort: Some(effort != "none"),
+        thinking_param: Some(thinking.into()),
+        effort_param: Some(effort.into()),
+        effort_value_mode: Some(mode.into()),
+        output_format: Some(output.into()),
+    })
+}
+
 fn normalize_codex_chat_reasoning_config(
     mut config: CodexChatReasoningConfig,
 ) -> CodexChatReasoningConfig {
@@ -355,17 +375,19 @@ fn infer_codex_chat_reasoning_config(
         })
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let name = provider.name.to_ascii_lowercase();
+    let host = url::Url::parse(&base_url).ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
 
     // 平台优先：聚合 / 托管平台的 reasoning 接口由平台的推理框架决定，而非模型官方实现，
     // 因此先按平台标识（仅 name + base_url，不含 model 名）判定并覆盖模型规则。
-    if let Some(config) = infer_aggregator_platform_config(&name, &base_url) {
+    if let Some(config) = infer_aggregator_platform_config("", &base_url) {
         return Some(config);
     }
 
-    let haystack = format!("{name} {base_url} {model}");
+    // Model names and display labels never authorize vendor-specific wire fields.
+    let haystack = host.as_str();
 
-    if haystack.contains("deepseek") {
+    if haystack == "api.deepseek.com" {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),
             supports_effort: Some(true),
@@ -379,7 +401,7 @@ fn infer_codex_chat_reasoning_config(
     // StepFun：仅 step-3.5-flash-2603 这一版支持 reasoning effort（low/high 两档），
     // 其余 step 模型不暴露 effort，故 supports_effort 仅对含 "2603" 的模型置真。
     // 第二个 OR 分支覆盖「经中转/聚合跑该模型、但平台 name/base_url 不含 stepfun」的情况。
-    if haystack.contains("stepfun") || haystack.contains("step-3.5-flash-2603") {
+    if matches!(haystack, "api.stepfun.com" | "api.stepfun.ai") {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),
             supports_effort: Some(model.contains("2603")),
@@ -390,7 +412,7 @@ fn infer_codex_chat_reasoning_config(
         });
     }
 
-    if haystack.contains("kimi") || haystack.contains("moonshot") {
+    if matches!(haystack, "api.moonshot.cn" | "api.moonshot.ai" | "api.kimi.com") {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),
             supports_effort: Some(false),
@@ -401,7 +423,7 @@ fn infer_codex_chat_reasoning_config(
         });
     }
 
-    if haystack.contains("glm") || haystack.contains("zhipu") || haystack.contains("z.ai") {
+    if matches!(haystack, "open.bigmodel.cn" | "api.z.ai") {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),
             supports_effort: Some(false),
@@ -412,7 +434,7 @@ fn infer_codex_chat_reasoning_config(
         });
     }
 
-    if haystack.contains("qwen") || haystack.contains("dashscope") || haystack.contains("bailian") {
+    if matches!(haystack, "dashscope.aliyuncs.com" | "dashscope-intl.aliyuncs.com") {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),
             supports_effort: Some(false),
@@ -423,7 +445,7 @@ fn infer_codex_chat_reasoning_config(
         });
     }
 
-    if haystack.contains("minimax") {
+    if matches!(haystack, "api.minimax.io" | "api.minimaxi.com" | "api.minimax.chat") {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),
             supports_effort: Some(false),
@@ -434,7 +456,7 @@ fn infer_codex_chat_reasoning_config(
         });
     }
 
-    if haystack.contains("mimo") {
+    if haystack == "api.xiaomimimo.com" {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),
             supports_effort: Some(false),
@@ -445,7 +467,7 @@ fn infer_codex_chat_reasoning_config(
         });
     }
 
-    None
+    chat_reasoning_profile("openai")
 }
 
 /// 聚合 / 托管平台的 reasoning 接口由平台决定：同一个模型在不同平台参数可能完全不同
@@ -453,17 +475,18 @@ fn infer_codex_chat_reasoning_config(
 /// OpenRouter 用原生 `reasoning:{effort}` 对象）。仅以平台标识（name / base_url）判定，
 /// 绝不掺入 model 名——model 名属于模型厂商，会把托管平台误判成模型官方接口。
 fn infer_aggregator_platform_config(
-    name: &str,
+    _name: &str,
     base_url: &str,
 ) -> Option<CodexChatReasoningConfig> {
-    let platform = format!("{name} {base_url}");
+    let platform = url::Url::parse(base_url).ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
 
     // OpenRouter：用原生归一化对象 `reasoning: { effort }`（由 OpenRouter 翻译成各底层
     // 模型的正确推理参数，比顶层 OpenAI 别名 reasoning_effort 覆盖面更全）。effort 走
     // "openrouter" 值映射：枚举为 xhigh|high|medium|low|minimal，无 max——max 会触发
     // `400 reasoning_effort: Invalid option`（见 openclaw#77350），故钳到 xhigh。
     // 安全降级：不发 `thinking:{type}`（OpenRouter 不认该字段），避免误配导致请求被拒。
-    if platform.contains("openrouter") {
+    if platform == "openrouter.ai" {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(false),
             supports_effort: Some(true),
@@ -477,7 +500,7 @@ fn infer_aggregator_platform_config(
     // SiliconFlow：平台级统一 `enable_thinking`，思维回传 reasoning_content。
     // 安全降级：不按 reasoning_effort 发 effort（平台用 thinking_budget 控制深度，
     // 发 reasoning_effort 反而可能不被接受）。
-    if platform.contains("siliconflow") {
+    if matches!(platform.as_str(), "api.siliconflow.cn" | "api.siliconflow.com") {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),
             supports_effort: Some(false),
@@ -1353,6 +1376,18 @@ wire_api = "responses"
 
         assert_eq!(upstream_model.as_deref(), Some("kimi-k2"));
         assert_eq!(body.get("model").and_then(|v| v.as_str()), Some("kimi-k2"));
+    }
+
+    #[test]
+    fn reasoning_wire_inference_ignores_model_labels_and_spoofed_hosts() {
+        for url in ["https://relay.example/v1", "https://api.deepseek.com.evil.example/v1", "https://relay.example/deepseek", "https://openrouter.ai.evil.example/v1"] {
+            let mut provider = create_provider(json!({"base_url":url}));
+            provider.name = "DeepSeek OpenRouter".into();
+            let config = resolve_codex_chat_reasoning_config(&provider, &json!({"model":"deepseek-v4-flash"})).unwrap();
+            assert_eq!(config.thinking_param.as_deref(), Some("none"), "{url}");
+            assert_eq!(config.effort_param.as_deref(), Some("reasoning_effort"));
+            assert_eq!(config.effort_value_mode.as_deref(), Some("passthrough"));
+        }
     }
 
     #[test]

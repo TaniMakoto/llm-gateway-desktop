@@ -85,9 +85,225 @@ pub(crate) fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, new
     }
 }
 
+/// SSE 协议。终态观察不改写透传字节，供请求记录和诊断共用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientSseProtocol {
+    /// Anthropic Messages SSE（Claude / Claude Desktop 客户端）
+    Anthropic,
+    /// OpenAI Responses SSE（Codex 客户端）
+    Responses,
+    /// OpenAI Chat Completions / Gemini 的 data-only SSE
+    Chat,
+}
+
+impl ClientSseProtocol {
+    /// 协议名，用于断流日志。
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            ClientSseProtocol::Anthropic => "Anthropic",
+            ClientSseProtocol::Responses => "Responses",
+            ClientSseProtocol::Chat => "Chat",
+        }
+    }
+
+}
+
+pub(crate) use gateway_core::{classify_terminal_event, SseTerminalState};
+
+/// SSE data 可以跨多行；与协议转换器使用相同的拼接语义。
+pub(crate) fn sse_data(block: &str) -> String {
+    block.lines().filter_map(|line| strip_sse_field(line, "data")).collect::<Vec<_>>().join("\n")
+}
+
+/// 统计客户端侧 SSE 流是否已经出现过本协议的终态标记。
+///
+/// 调用方必须喂入**完整的 SSE 事件块**（以空行分隔，见 [`take_sse_block`]），
+/// 这样标记不会被 TCP 分片切断，无需额外的跨块缓冲。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TerminalMarkerScanner {
+    protocol: ClientSseProtocol,
+    state: SseTerminalState,
+}
+
+impl TerminalMarkerScanner {
+    pub(crate) fn new(protocol: ClientSseProtocol) -> Self {
+        Self {
+            protocol,
+            state: SseTerminalState::Pending,
+        }
+    }
+
+    /// 已观察到的终态。`Pending` 表示流结束时仍未见到任何协议终态标记。
+    pub(crate) fn state(&self) -> SseTerminalState {
+        self.state
+    }
+
+    /// 喂入完整事件块；晚到错误覆盖成功，usage 尾事件不重置终态。
+    pub(crate) fn push(&mut self, block: &str) -> SseTerminalState {
+        if self.state == SseTerminalState::Failed {
+            return self.state;
+        }
+        let payload = sse_data(block);
+        let named_error = block.lines().filter_map(|line| strip_sse_field(line, "event")).any(|name| name.trim() == "error");
+        if named_error {
+            self.state.observe(SseTerminalState::Failed);
+        } else if self.protocol == ClientSseProtocol::Chat && payload.trim() == "[DONE]" {
+            self.state.observe(SseTerminalState::Completed);
+        } else if let Ok(event) = serde_json::from_str::<serde_json::Value>(&payload) {
+            if let Some(state) = classify_terminal_event(&event) { self.state.observe(state); }
+        }
+        self.state
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{append_utf8_safe, strip_sse_field, take_sse_block};
+    use super::{
+        append_utf8_safe, strip_sse_field, take_sse_block, ClientSseProtocol, SseTerminalState,
+        TerminalMarkerScanner,
+    };
+
+    // ------------------------------------------------------------------
+    // 终态判定（只用于诊断日志）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn terminal_scanner_accepts_anthropic_message_stop() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Anthropic);
+        assert_eq!(
+            scanner.push("event: message_start\ndata: {\"type\":\"message_start\"}"),
+            SseTerminalState::Pending
+        );
+        assert_eq!(
+            scanner.push("event: message_stop\ndata: {\"type\":\"message_stop\"}"),
+            SseTerminalState::Completed
+        );
+    }
+
+    #[test]
+    fn terminal_scanner_accepts_anthropic_non_null_stop_reason() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Anthropic);
+        assert_eq!(
+            scanner.push(
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}"
+            ),
+            SseTerminalState::Completed
+        );
+    }
+
+    #[test]
+    fn terminal_scanner_rejects_null_stop_reason() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Anthropic);
+        assert_eq!(
+            scanner.push(
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null}}"
+            ),
+            SseTerminalState::Pending
+        );
+    }
+
+    /// 关键回归：终态标记出现在**工具参数/正文文本里**时不能被误判成已收尾。
+    /// 这正是裸字节子串匹配会出错、而按事件 JSON 判定不会出错的地方。
+    #[test]
+    fn terminal_scanner_ignores_marker_text_inside_tool_arguments() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Anthropic);
+        assert_eq!(
+            scanner.push(
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"stop_reason\\\"}\"}}"
+            ),
+            SseTerminalState::Pending
+        );
+
+        let mut chat = TerminalMarkerScanner::new(ClientSseProtocol::Chat);
+        assert_eq!(
+            chat.push(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"finish_reason appears in prose\"},\"finish_reason\":null}]}"
+            ),
+            SseTerminalState::Pending
+        );
+    }
+
+    #[test]
+    fn terminal_scanner_chat_requires_done_or_non_null_finish_reason() {
+        let mut chat = TerminalMarkerScanner::new(ClientSseProtocol::Chat);
+        assert_eq!(
+            chat.push("data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}]}"),
+            SseTerminalState::Pending
+        );
+        // 上游终止流但省略 [DONE] 时，非 null 的 finish_reason 同样算正常收尾。
+        assert_eq!(
+            chat.push("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}"),
+            SseTerminalState::Completed
+        );
+
+        let mut done = TerminalMarkerScanner::new(ClientSseProtocol::Chat);
+        assert_eq!(done.push("data: [DONE]"), SseTerminalState::Completed);
+    }
+
+    #[test]
+    fn terminal_scanner_responses_failed_is_terminal_but_not_completed() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Responses);
+        assert_eq!(
+            scanner.push("event: response.created\ndata: {\"type\":\"response.created\"}"),
+            SseTerminalState::Pending
+        );
+        assert_eq!(
+            scanner.push(
+                "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}"
+            ),
+            SseTerminalState::Failed
+        );
+    }
+
+    #[test]
+    fn terminal_scanner_treats_error_event_as_failed_terminal() {
+        for protocol in [
+            ClientSseProtocol::Anthropic,
+            ClientSseProtocol::Responses,
+            ClientSseProtocol::Chat,
+        ] {
+            let mut scanner = TerminalMarkerScanner::new(protocol);
+            assert_eq!(
+                scanner.push("event: error\ndata: {\"type\":\"error\"}"),
+                SseTerminalState::Failed
+            );
+        }
+        // Chat 形状的错误体（error.rs 的 {"error":{...}}）
+        let mut chat = TerminalMarkerScanner::new(ClientSseProtocol::Chat);
+        assert_eq!(
+            chat.push("data: {\"error\":{\"message\":\"boom\",\"type\":\"stream_error\"}}"),
+            SseTerminalState::Failed
+        );
+    }
+
+    #[test]
+    fn terminal_scanner_late_failure_overrides_completion() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Responses);
+        assert_eq!(
+            scanner.push("event: response.completed\ndata: {\"type\":\"response.completed\"}"),
+            SseTerminalState::Completed
+        );
+        assert_eq!(
+            scanner.push("event: error\ndata: {\"type\":\"error\"}"),
+            SseTerminalState::Failed
+        );
+        assert_eq!(scanner.push("event: response.completed\ndata: {\"type\":\"response.completed\"}"), SseTerminalState::Failed);
+    }
+
+    #[test]
+    fn terminal_scanner_preserves_explicit_limit_through_usage_and_done() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Chat);
+        assert_eq!(scanner.push("data: {\"choices\":[{\"finish_reason\":\"length\"}]}"), SseTerminalState::Incomplete);
+        assert_eq!(scanner.push("data: {\"choices\":[],\"usage\":{\"completion_tokens\":12}}"), SseTerminalState::Incomplete);
+        assert_eq!(scanner.push("data: [DONE]"), SseTerminalState::Incomplete);
+    }
+
+    #[test]
+    fn terminal_scanner_reads_multiline_data_and_named_errors() {
+        let mut scanner = TerminalMarkerScanner::new(ClientSseProtocol::Responses);
+        assert_eq!(scanner.push("event: response.completed\ndata: {\"type\":\"response.completed\",\ndata: \"response\":{\"status\":\"incomplete\"}}"), SseTerminalState::Incomplete);
+        assert_eq!(scanner.push("event: error\ndata: {\"message\":\"late failure\"}"), SseTerminalState::Failed);
+    }
 
     #[test]
     fn strip_sse_field_accepts_optional_space() {

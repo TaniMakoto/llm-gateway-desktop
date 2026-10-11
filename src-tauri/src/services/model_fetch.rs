@@ -18,6 +18,41 @@ pub struct FetchedModel {
     pub id: String,
     pub owned_by: Option<String>,
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    #[serde(default)]
+    pub reasoning_levels: Vec<String>,
+}
+
+fn first_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|candidate| {
+            candidate.as_u64().or_else(|| {
+                candidate
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<u64>().ok())
+            })
+        })
+    })
+}
+
+fn first_string_array(value: &Value, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_array))
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(|item| item.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 const FETCH_TIMEOUT_SECS: u64 = 15;
@@ -215,6 +250,23 @@ fn parse_models_payload(payload: &Value) -> Result<Vec<FetchedModel>, String> {
                     .get("display_name")
                     .and_then(Value::as_str)
                     .map(ToString::to_string),
+                context_length: first_u64(
+                    entry,
+                    &["context_length", "context_window", "inputTokenLimit"],
+                ),
+                max_output_tokens: first_u64(
+                    entry,
+                    &["max_output_tokens", "max_completion_tokens", "outputTokenLimit"],
+                ),
+                input_modalities: first_string_array(
+                    entry,
+                    &["input_modalities", "supportedInputModalities"],
+                ),
+                reasoning_levels: entry
+                    .get("reasoning")
+                    .or_else(|| entry.get("thinking"))
+                    .map(|value| first_string_array(value, &["levels"]))
+                    .unwrap_or_default(),
             })
         })
         .collect::<Vec<_>>();
@@ -566,6 +618,41 @@ mod tests {
         assert_eq!(data[0].id, "gpt-4");
         assert_eq!(data[0].owned_by.as_deref(), Some("openai"));
         assert_eq!(data[1].id, "claude-3-sonnet");
+    }
+
+    #[test]
+    fn test_parse_model_capability_metadata() {
+        let payload = serde_json::json!({
+            "data": [
+                {
+                    "id": "reasoning-model",
+                    "context_length": 1000000,
+                    "max_completion_tokens": "128000",
+                    "input_modalities": ["TEXT", "image"],
+                    "reasoning": {"levels": ["low", "medium", "high", "xhigh"]}
+                },
+                {
+                    "id": "gemini-shaped-model",
+                    "context_window": 2000000,
+                    "max_output_tokens": 65536,
+                    "supportedInputModalities": ["TEXT", "IMAGE", "AUDIO"],
+                    "thinking": {"levels": ["medium", "high"]}
+                }
+            ]
+        });
+
+        let data = parse_models_payload(&payload).unwrap();
+        assert_eq!(data[0].context_length, Some(1_000_000));
+        assert_eq!(data[0].max_output_tokens, Some(128_000));
+        assert_eq!(data[0].input_modalities, vec!["text", "image"]);
+        assert_eq!(
+            data[0].reasoning_levels,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(data[1].context_length, Some(2_000_000));
+        assert_eq!(data[1].max_output_tokens, Some(65_536));
+        assert_eq!(data[1].input_modalities, vec!["text", "image", "audio"]);
+        assert_eq!(data[1].reasoning_levels, vec!["medium", "high"]);
     }
 
     #[test]

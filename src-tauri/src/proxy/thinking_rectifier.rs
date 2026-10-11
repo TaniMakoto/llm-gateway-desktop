@@ -521,18 +521,22 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_invalid_request() {
-        // 场景7: 非法请求（与 CCH 对齐，统一触发）
+    fn test_detect_thinking_related_invalid_request() {
+        // f756040 有意移除了「非法请求/illegal request/invalid request」的宽泛
+        // 兜底（generic 请求错误不应触发签名整流），但漏删了本测试的旧断言。
+        // 这里保留的断言只落在既有模式真实覆盖的形态上；纯 generic 错误由
+        // test_generic_invalid_request_does_not_trigger_signature_rectifier
+        // 负向覆盖。
+        // 场景1: "Invalid 'signature' in 'thinking' block"
         assert!(should_rectify_thinking_signature(
-            Some("非法请求：thinking signature 不合法"),
+            Some("Invalid 'signature' in 'thinking' block"),
             &enabled_config()
         ));
+        // 场景6: thinking 块不可修改（错误文案以 invalid request 开头）
         assert!(should_rectify_thinking_signature(
-            Some("illegal request: tool_use block mismatch"),
-            &enabled_config()
-        ));
-        assert!(should_rectify_thinking_signature(
-            Some("invalid request: malformed JSON"),
+            Some(
+                "invalid request: thinking or redacted_thinking blocks in the request cannot be modified"
+            ),
             &enabled_config()
         ));
     }

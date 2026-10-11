@@ -23,6 +23,10 @@ pub struct StreamingTimeoutConfig {
     pub idle_timeout: u64,
 }
 
+fn scoped_session_affinity_key(app_type: &str, model: &str, session_id: &str) -> String {
+    format!("{app_type}\u{0}{model}\u{0}{session_id}")
+}
+
 /// 请求上下文
 ///
 /// 贯穿整个请求生命周期，包含：
@@ -48,6 +52,9 @@ pub struct RequestContext {
     pub current_provider_id: String,
     /// 请求中的模型名称
     pub request_model: String,
+    /// 最终成功候选或最后失败尝试收到的上游思考配置（适配后的真值）。
+    pub reasoning_effort: Option<String>,
+    pub trace: super::request_trace::RequestTrace,
     /// 实际发往上游的模型名（路由接管/模型映射后的真值，forward 成功后回填）。
     ///
     /// usage 归因的兜底顺序：上游响应回显 → outbound_model → request_model。
@@ -64,6 +71,11 @@ pub struct RequestContext {
     pub session_id: String,
     /// Session ID 是否由客户端提供。生成的 UUID 不能作为上游缓存 key，否则每个请求都会换 key。
     pub session_client_provided: bool,
+    /// 会话亲和的键（仅当 Session ID 是**稳定**键时存在）
+    ///
+    /// `None` = 这个会话没有可复用的身份（客户端没提供标识、内容也推不出锚点），
+    /// 不参与粘性路由——绑一个一次性随机 UUID 只会污染绑定表。
+    pub session_affinity_key: Option<String>,
     /// 整流器配置
     pub rectifier_config: RectifierConfig,
     /// 优化器配置
@@ -97,7 +109,7 @@ impl RequestContext {
         let start_time = Instant::now();
 
         // 从数据库读取应用级代理配置（per-app）
-        let app_config = state
+        let mut app_config = state
             .db
             .get_proxy_config_for_app(app_type_str)
             .await
@@ -121,6 +133,18 @@ impl RequestContext {
         // 提取 Session ID
         let session_result = extract_session_id(headers, body, app_type_str);
         let session_id = session_result.session_id.clone();
+        // Match CPA's provider/model/session affinity scope. A raw session ID is
+        // not globally unique across API families and one conversation may switch
+        // aliases; sharing the binding would leak one route's choice into another.
+        let session_affinity_key = session_result
+            .is_stable()
+            .then(|| scoped_session_affinity_key(app_type_str, &request_model, &session_id));
+        let existing_affinity_provider = if let Some(key) = session_affinity_key.as_deref() {
+            let mut store = state.session_affinity.write().await;
+            store.get(key)
+        } else {
+            None
+        };
 
         log::debug!(
             "[{}] Session ID: {} (from {:?}, client_provided: {})",
@@ -132,6 +156,7 @@ impl RequestContext {
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
+        let mut gateway_route = false;
         let providers = match crate::gateway::resolve_route_providers(
             state.db.as_ref(),
             app_type_str,
@@ -140,8 +165,43 @@ impl RequestContext {
         )
         .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
         {
-            Some(providers) if !providers.is_empty() => providers,
+            Some((providers, routing_policy, routing_weights)) if !providers.is_empty() => {
+                gateway_route = true;
+                // CPA filters blocked credentials before Round Robin/Weighted
+                // selection. Otherwise an open circuit still consumes a turn and
+                // biases traffic toward the candidate immediately behind it.
+                let providers = state
+                    .provider_router
+                    .schedulable_providers(app_type_str, &request_model, providers)
+                    .await;
+                if providers.is_empty() {
+                    return Err(ProxyError::NoAvailableProvider);
+                }
+                let affinity_is_valid = existing_affinity_provider
+                    .as_deref()
+                    .is_some_and(|bound| providers.iter().any(|provider| provider.id == bound));
+                if affinity_is_valid {
+                    providers
+                } else {
+                    let active_provider_counts = state.active_provider_counts.read().await.clone();
+                    state
+                        .provider_router
+                        .apply_gateway_routing_policy(
+                            app_type_str,
+                            &request_model,
+                            routing_policy,
+                            &routing_weights,
+                            &active_provider_counts,
+                            providers,
+                        )
+                        .await
+                }
+            }
             Some(_) => return Err(ProxyError::NoAvailableProvider),
+            None if state.db.get_setting(crate::gateway::CONFIG_KEY)
+                .map_err(|e| ProxyError::DatabaseError(e.to_string()))?.is_some() => {
+                return Err(ProxyError::InvalidRequest(format!("未知模型别名: {request_model}")));
+            }
             None => state
                 .provider_router
                 .select_providers(app_type_str)
@@ -156,6 +216,14 @@ impl RequestContext {
                     _ => ProxyError::DatabaseError(e.to_string()),
                 })?,
         };
+
+        if gateway_route {
+            // 统一路由必须覆盖本次捕获的全部可用候选；旧 per-app budget
+            // 可能在热更新前读取，不能据此截断新候选链或关闭故障转移。
+            app_config.auto_failover_enabled = true;
+            app_config.max_retries =
+                u32::try_from(providers.len().saturating_sub(1)).unwrap_or(u32::MAX);
+        }
 
         let provider = providers
             .first()
@@ -178,10 +246,14 @@ impl RequestContext {
             providers,
             current_provider_id,
             request_model,
+            reasoning_effort: None,
+            trace: super::request_trace::RequestTrace::new(
+                super::response_processor::usage_logging_enabled(state).then(|| state.db.clone()), app_type_str, body),
             outbound_model: None,
             tag,
             app_type_str,
             app_type,
+            session_affinity_key,
             session_id,
             session_client_provided: session_result.client_provided,
             rectifier_config,
@@ -250,13 +322,15 @@ impl RequestContext {
             self.current_provider_id.clone(),
             self.session_id.clone(),
             self.session_client_provided,
+            self.session_affinity_key.clone(),
+            state.session_affinity.clone(),
             first_byte_timeout,
             idle_timeout,
             self.rectifier_config.clone(),
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
-        )
+        ).with_trace(self.trace.clone())
     }
 
     /// 获取 Provider 列表（用于故障转移）
@@ -315,7 +389,68 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_gemini_model_from_path;
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn gateway_context_uses_candidate_budget_even_when_app_budget_is_stale() {
+        use crate::{database::Database, gateway::{GatewayConfig, GatewayProvider}};
+        use std::{collections::HashMap, sync::Arc};
+        use tokio::sync::RwLock;
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = false;
+        app_config.max_retries = 0;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let providers = ["first", "second"].into_iter().map(|id| {
+            serde_json::from_value::<GatewayProvider>(serde_json::json!({
+                "id": id, "name": id, "baseUrl": "https://mock.example/v1",
+                "apiKey": "fixture-key", "models": [{
+                    "alias": "snapshot-alias", "upstreamModel": "snapshot-model",
+                    "apiFormat": "openai_chat"
+                }]
+            })).unwrap()
+        }).collect();
+        let config = GatewayConfig { providers, enable_logging: false, ..Default::default() };
+        db.set_setting(crate::gateway::CONFIG_KEY, &serde_json::to_string(&config).unwrap()).unwrap();
+        let state = ProxyState {
+            db: db.clone(),
+            config: Arc::new(RwLock::new(super::super::types::ProxyConfig::default())),
+            status: Arc::new(RwLock::new(super::super::types::ProxyStatus::default())),
+            start_time: Arc::new(RwLock::new(None)),
+            current_providers: Arc::new(RwLock::new(HashMap::new())),
+            active_provider_counts: Arc::new(RwLock::new(HashMap::new())),
+            provider_router: Arc::new(super::super::provider_router::ProviderRouter::new(db.clone())),
+            gemini_shadow: Arc::new(super::super::providers::gemini_shadow::GeminiShadowStore::default()),
+            codex_chat_history: Arc::new(super::super::providers::codex_chat_history::CodexChatHistoryStore::default()),
+            session_affinity: Arc::new(RwLock::new(super::super::session_affinity::SessionAffinityStore::default())),
+            app_handle: None,
+            failover_manager: Arc::new(super::super::failover_switch::FailoverSwitchManager::new(db)),
+        };
+        let context = RequestContext::new(&state, &serde_json::json!({"model":"snapshot-alias"}),
+            &HeaderMap::new(), AppType::Codex, "Codex", "codex", Some("openai_chat")).await.unwrap();
+        assert_eq!(context.get_providers().len(), 2, "candidates must not depend on derived provider rows");
+        assert!(context.app_config.auto_failover_enabled);
+        assert_eq!(context.app_config.max_retries, 1, "the saved candidate chain must survive a stale zero budget");
+    }
+
+    #[test]
+    fn affinity_key_isolated_by_app_and_model() {
+        let base = scoped_session_affinity_key("codex", "agent", "session-1");
+        assert_ne!(
+            base,
+            scoped_session_affinity_key("claude", "agent", "session-1")
+        );
+        assert_ne!(
+            base,
+            scoped_session_affinity_key("codex", "vision", "session-1")
+        );
+        assert_ne!(
+            base,
+            scoped_session_affinity_key("codex", "agent", "session-2")
+        );
+    }
 
     #[test]
     fn extract_model_with_action() {

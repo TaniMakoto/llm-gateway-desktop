@@ -22,6 +22,7 @@ use super::transform_codex_chat::{
 use super::transform_responses::sanitize_anthropic_tool_use_input_json;
 use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
+use crate::proxy::tool_completion::{validate_tool_completion, ToolArgumentFormat};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
@@ -54,6 +55,7 @@ struct BlockState {
 struct AnthropicToResponsesState {
     response_started: bool,
     completed: bool,
+    failed: bool,
     response_id: String,
     model: String,
     next_output_index: u32,
@@ -61,7 +63,6 @@ struct AnthropicToResponsesState {
     output_items: Vec<(u32, Value)>,
     anthropic_usage: Map<String, Value>,
     stop_reason: Option<String>,
-    stream_truncated: bool,
     tool_context: CodexToolContext,
 }
 
@@ -70,6 +71,7 @@ impl Default for AnthropicToResponsesState {
         Self {
             response_started: false,
             completed: false,
+            failed: false,
             response_id: "resp_llmgateway".to_string(),
             model: String::new(),
             next_output_index: 0,
@@ -77,7 +79,6 @@ impl Default for AnthropicToResponsesState {
             output_items: Vec::new(),
             anthropic_usage: Map::new(),
             stop_reason: None,
-            stream_truncated: false,
             tool_context: CodexToolContext::default(),
         }
     }
@@ -207,7 +208,6 @@ impl AnthropicToResponsesState {
                 // no input_json_delta; capture it as a fallback (see close_block).
                 let start_input = block
                     .get("input")
-                    .filter(|v| v.as_object().map(|o| !o.is_empty()).unwrap_or(false))
                     .map(|v| v.to_string())
                     .unwrap_or_default();
                 let item_id =
@@ -335,6 +335,13 @@ impl AnthropicToResponsesState {
     }
 
     fn close_block(&mut self, index: u64) -> Vec<Bytes> {
+        if let Some(block) = self.blocks.get(&index).filter(|block| !block.done && block.kind == BlockKind::Tool) {
+            let raw = if block.accum.trim().is_empty() { &block.start_input } else { &block.accum };
+            let format = if self.tool_context.is_custom_tool_chat_name(&block.name) { ToolArgumentFormat::CustomText } else { ToolArgumentFormat::JsonObject };
+            if let Err(problem) = validate_tool_completion(&block.name, raw, format, true) {
+                return self.failed_event(format!("Incomplete upstream tool call at index {index}: {problem}"), Some("incomplete_tool_call".into())).into_iter().collect();
+            }
+        }
         let Some(block) = self.blocks.get_mut(&index) else {
             return Vec::new();
         };
@@ -376,11 +383,7 @@ impl AnthropicToResponsesState {
                 let is_custom_tool = self.tool_context.is_custom_tool_chat_name(&name);
                 let item = response_tool_call_item_from_chat_name(
                     &item_id,
-                    if self.stream_truncated {
-                        "incomplete"
-                    } else {
-                        "completed"
-                    },
+                    "completed",
                     &call_id,
                     &name,
                     &arguments,
@@ -388,21 +391,19 @@ impl AnthropicToResponsesState {
                     &self.tool_context,
                 );
                 let mut events = Vec::new();
-                if !self.stream_truncated {
-                    if is_custom_tool {
-                        let input = item.get("input").and_then(Value::as_str).unwrap_or("");
-                        events.push(sse::custom_tool_call_input_done(
-                            output_index,
-                            &item_id,
-                            input,
-                        ));
-                    } else {
-                        events.push(sse::function_call_arguments_done(
-                            output_index,
-                            &item_id,
-                            &arguments,
-                        ));
-                    }
+                if is_custom_tool {
+                    let input = item.get("input").and_then(Value::as_str).unwrap_or("");
+                    events.push(sse::custom_tool_call_input_done(
+                        output_index,
+                        &item_id,
+                        input,
+                    ));
+                } else {
+                    events.push(sse::function_call_arguments_done(
+                        output_index,
+                        &item_id,
+                        &arguments,
+                    ));
                 }
                 events.push(sse::output_item_done(output_index, &item));
                 self.output_items.push((output_index, item));
@@ -441,18 +442,6 @@ impl AnthropicToResponsesState {
         Vec::new()
     }
 
-    /// Whether any partial output was produced (completed items, buffered text, or a
-    /// started tool call). Used to distinguish a truncated-with-output stream (report
-    /// incomplete) from one that produced nothing (report failed).
-    fn has_substantive_output(&self) -> bool {
-        !self.output_items.is_empty()
-            || self.blocks.values().any(|b| {
-                !b.accum.trim().is_empty()
-                    || !b.call_id.trim().is_empty()
-                    || !b.name.trim().is_empty()
-            })
-    }
-
     fn finalize(&mut self) -> Vec<Bytes> {
         if self.completed {
             return Vec::new();
@@ -468,6 +457,7 @@ impl AnthropicToResponsesState {
             .collect();
         for index in open {
             events.extend(self.close_block(index));
+            if self.failed { return events; }
         }
 
         let (status, incomplete_reason) =
@@ -488,9 +478,10 @@ impl AnthropicToResponsesState {
     }
 
     fn failed_event(&mut self, message: String, error_type: Option<String>) -> Option<Bytes> {
-        if self.completed {
+        if self.failed {
             return None;
         }
+        self.failed = true;
         self.completed = true;
         let mut error = json!({ "message": message });
         if let Some(error_type) = error_type.filter(|value| !value.is_empty()) {
@@ -554,6 +545,8 @@ fn process_anthropic_sse_block(
         .or(event_name)
         .unwrap_or_default();
 
+    if state.completed && msg_type != "error" { return (Vec::new(), false); }
+
     let events = match msg_type.as_str() {
         "message_start" => state.handle_message_start(&data),
         "content_block_start" => state.handle_content_block_start(&data),
@@ -573,7 +566,7 @@ fn process_anthropic_sse_block(
         }
         _ => Vec::new(),
     };
-    (events, false)
+    (events, state.failed)
 }
 
 fn json_document_candidate(input: &str) -> Option<&str> {
@@ -589,7 +582,7 @@ pub(crate) fn responses_sse_events_from_anthropic_message(
     tool_context: CodexToolContext,
 ) -> Vec<Bytes> {
     let mut state = AnthropicToResponsesState::with_tool_context(tool_context);
-    if body.get("type").and_then(Value::as_str) == Some("error") || body.get("error").is_some() {
+    if body.get("type").and_then(Value::as_str) == Some("error") || body.get("error").is_some_and(|value| !value.is_null()) {
         let (message, error_type) = extract_anthropic_sse_error(body);
         return state
             .failed_event(message, error_type)
@@ -749,15 +742,6 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
                 for event in state.finalize() {
                     yield Ok(event);
                 }
-            } else if state.has_substantive_output() {
-                // Upstream truncated mid-stream (e.g. a proxy closed the connection without
-                // an I/O error) after emitting partial output. Report it as incomplete so
-                // Codex does not accept the truncated output as a normal completion.
-                state.stop_reason = Some("max_tokens".to_string());
-                state.stream_truncated = true;
-                for event in state.finalize() {
-                    yield Ok(event);
-                }
             } else {
                 // Stream ended before any terminal signal or output: surface a failure.
                 if let Some(event) = state.failed_event(
@@ -894,9 +878,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_truncated_stream_with_output_reports_incomplete() {
+    async fn test_truncated_stream_with_output_reports_transport_failure() {
         // Upstream closes after partial text but before message_delta/message_stop.
-        // The partial output must be reported as incomplete, not a normal completion.
+        // Transport EOF is distinct from an explicit token limit.
         let input = concat!(
             "event: message_start\n",
             "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_t1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":4}}}\n\n",
@@ -907,11 +891,9 @@ mod tests {
         );
         let merged = run(input).await;
         assert!(merged.contains("\"delta\":\"partial\""));
-        assert!(merged.contains("event: response.completed"));
-        // The top-level response is incomplete (message output items keep their own
-        // "completed" status, but the response status must not be "completed").
-        assert!(merged.contains("\"status\":\"incomplete\""));
-        assert!(merged.contains("\"reason\":\"max_output_tokens\""));
+        assert!(merged.contains("event: response.failed"));
+        assert!(!merged.contains("event: response.completed"));
+        assert!(!merged.contains("max_output_tokens"));
     }
 
     #[tokio::test]
@@ -926,9 +908,9 @@ mod tests {
         );
 
         let merged = run(input).await;
-        assert!(merged.contains("\"status\":\"incomplete\""));
+        assert!(merged.contains("event: response.failed"));
         assert!(!merged.contains("event: response.function_call_arguments.done"));
-        assert!(merged.contains("\"reason\":\"max_output_tokens\""));
+        assert!(!merged.contains("max_output_tokens"));
     }
 
     #[tokio::test]
@@ -1161,11 +1143,13 @@ mod tests {
         );
         let merged = run(input).await;
         assert!(merged.contains("\"delta\":\"tail\""));
-        assert!(merged.contains("\"status\":\"incomplete\""));
+        assert!(merged.contains("event: response.failed"));
+        assert!(merged.contains("stream_truncated"));
+        assert!(!merged.contains("event: response.completed"));
     }
 
     #[tokio::test]
-    async fn test_error_after_message_stop_does_not_emit_second_terminal_event() {
+    async fn test_error_after_message_stop_is_not_discarded() {
         let input = concat!(
             "event: message_start\n",
             "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_terminal\"}}\n\n",
@@ -1176,7 +1160,12 @@ mod tests {
         );
         let merged = run(input).await;
         assert_eq!(merged.matches("event: response.completed").count(), 1);
-        assert_eq!(merged.matches("event: response.failed").count(), 0);
+        assert_eq!(merged.matches("event: response.failed").count(), 1);
+        assert!(merged.contains("\"status\":\"failed\""));
+        assert!(merged.contains("late"));
+        assert!(
+            merged.rfind("event: response.failed") > merged.rfind("event: response.completed")
+        );
     }
 
     #[tokio::test]

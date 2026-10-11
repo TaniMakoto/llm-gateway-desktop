@@ -1,46 +1,64 @@
 # 开发与验证状态
 
-版本：`0.1.0-alpha`
+核对日期：2026-10-11；版本 `0.2.0`，仍按 alpha 阶段看待。此前已实施协议回归、400 切换修复、未完成工具调用修复、运行服务分离与首轮裁剪；本批落实 [重构计划](REFACTOR_PLAN.md) 的第一阶段。
 
-## 已实现
+## 当前源码已实现
 
-- 精简桌面 UI：仪表盘、上游供应商、模型路由、网关设置
-- 独立数据目录和 SQLite 配置
-- 本地访问密钥
-- 供应商 URL、鉴权方式和自定义请求头
-- 模型别名、上游模型映射和有序故障转移
-- OpenAI Chat、OpenAI Responses、Anthropic Messages 下游入口
-- 普通响应、SSE 和标准工具调用转换路径
-- `/v1/models` 与 `/health`
-- 专用启动、停止、托盘菜单和自动启动
-- Mock 上游与冒烟测试工具
-- Windows、Linux 和 macOS GitHub Actions 打包流程
+- Tauri 桌面、托盘、开机启动、轻量模式、Windows portable 数据隔离。
+- 三协议入口与转换：Chat Completions、Responses、Anthropic Messages；另有 Responses compact、模型列表及运行状态入口。
+- 供应商内模型条目、每模型协议、别名聚合、旧路由配置迁移。
+- 优先顺序、轮询、加权轮询、最少未完成请求四种路由策略。
+- 会话亲和、故障转移、熔断、429 冷却、供应商并发上限与有界排队。
+- 模型发现与缓存、集中模型能力注册表、手动能力覆盖、reasoning 兼容选项。
+- 直连/经网关测试台、流式正文与思考显示、usage、请求/响应正文录制。
+- 独立 `GatewayRuntime`，桌面启动/停止/状态不再使用 CLI 接管服务；统一网关路由不触发外部 CLI 配置切换。
+- 首轮裁剪约 6,700 行无入口命令和 CLI 会话历史浏览代码；共享服务与数据库迁移仍保留。
+- 新增不依赖 Tauri/SQLite 的 `crates/gateway-core`，统一终态与工具完整性规则；流读完后再记录最终结果与健康，usage 尾事件仍可读入。
+- 尝试级容量与半开探测许可由生命周期对象管理；取消、失败、换源时释放，响应提交后不再切换上游。
+- 配置增加 schemaVersion/revision，保存时检查旧版本；配置、生成供应商与代理设置使用同一数据库事务。新监听先准备再发布，覆盖文件使用原子替换和版本恢复。
+- 候选、模型映射、策略权重和容量参数从同一次配置读取生成，统一路由预算不再依赖旧派生行；监听重绑定保留容量与健康状态，并关闭旧空闲长连接。
+- 第二轮删除约 7,100 行无入口命令、深链和无消费者同步模块；共享服务、用户数据与历史迁移保留。前端抽出类型、辅助函数和模型测试台。
+- 桌面和状态接口展示版本、提交号与构建时间；第三方来源说明合并到 LICENSE，打包仅引用该文件。
+- Mock 上游、真实 HTTP 三协议回归、内联 Rust 测试，以及多平台 CI 打包工作流。
 
-## 当前环境已完成
+上述是源码能力清单，不是所有组合已在真实供应商上通过的保证。
 
-- JSON、TOML 和 Python 源码解析
-- 修改过的 Rust 文件分隔符静态检查
-- 路由存在性检查
-- Mock 冒烟测试 8/8：健康检查、模型列表、三种 JSON 响应和三种 SSE 流
-- 品牌字符串与公开发布文件检查
+## 本批本地验证与 CI 边界
 
-## 尚未完成
+- 按用户要求检查提交 `beece2a` 的失败结果：[Windows 打包](https://github.com/TaniMakoto/llm-gateway-desktop/actions/runs/38113459760) 的独立 core 测试、前端检查及 Rust lib 测试目标编译通过，测试为 1999 通过、2 失败，安装包构建未执行；[Linux 验证](https://github.com/TaniMakoto/llm-gateway-desktop/actions/runs/38113455191) 为 2001 通过、2 失败，失败测试一致。上一批提交 `dc2de4e` 的 Windows/Linux 分别为 19/11 项失败；修复后两个测试继续执行，暴露出原先未检查到的后续断言。
+- 本批将日志断言夹具显式设为 `enable_logging: true`；读取完整 HTTP 响应和停止监听不代表异步 usage/连接任务已经释放 trace，因此使用有界等待读取最终 observation 与日志的 JOIN。缺少 finish_reason、畸形工具参数、关闭日志三个场景拆成独立测试，仍严格要求流内错误、无成功终态、已提交输出不重放。
+- 自检发现 usage 先写入请求日志后，trace 的 `INSERT OR IGNORE` 会丢失转换阶段的最终错误。本批改为仅更新非空最终 `error_message` 的 UPSERT；保留已有 token、费用、HTTP 状态和时间，也不清空此前记录的错误。新增两个 Rust 回归比较除错误字段外的全部日志列；本地内存 SQLite 使用实际源码 SQL/表定义复现旧问题，并验证错误更新、已有错误保留、无 usage 的首次插入及 observation 联查。
+- 混合协议切换改为两个方向 × JSON/SSE 的四个独立测试，分别比较首选和备用候选的完整请求。同一模型的协议能力声明不同：此夹具的 Chat 将 `xhigh` 映射为 `max`，Responses 保留其声明支持的 `xhigh`；每个候选从客户端原始请求重建，避免首选候选的 reasoning/profile 改动污染备用请求。
+- 上一批已修复请求详情查询的 `created_at` 歧义、Windows TOML 路径夹具及旧 schema/升级方式预期；Chat `[DONE]` 优先检查工具完整性。这些旧失败点在本轮 CI 已通过，没有跳过测试或放宽工具成功条件。
+- 本批修改的两个 Rust 文件通过 rustfmt 语法解析，`python tools/static_check.py` 和 `git diff --check` 通过。两个只读审阅分别复核了完整协议夹具与日志生命周期/SQL/API；这些检查不替代 Rust 编译与实际 HTTP 测试。新回归及全量测试、Windows 安装包仍由下一轮 CI 执行，触发后立即汇报，不等待结果。
+- `python tools/static_check.py`：通过，包括所选 Rust 文件结构、公开路由、清单/Python 解析及 TS 语法检查。
+- `pnpm install --frozen-lockfile`、`pnpm typecheck`、`pnpm format:check`：通过。
+- `pnpm build:renderer`：通过前端产物构建；不代表 Tauri 安装包已生成。
+- 临时 rustfmt 用于修改文件的语法解析；未在本机编译 Rust，也未运行 Rust 测试。
+- 独立 core 测试、全量 Rust lib 测试（含真实 HTTP 矩阵）和 Windows 打包已配置为本批 GitHub Actions 的前置检查；交付时只触发，不等待或轮询结果。
+- 历史版本曾通过全量 Rust 测试及 54 组合真实 HTTP 回归：[首轮裁剪验证](https://github.com/TaniMakoto/llm-gateway-desktop/actions/runs/35498053687)。该结果不能替代 0.2.0 的 CI 验证。
+- 未使用真实上游凭证；mock 端到端通过不代表所有真实供应商已验收。
 
-当前打包环境未安装 Rust 工具链和 pnpm 项目依赖，因此尚未完成：
+## 回归与修复内容
 
-- `cargo check` / `cargo test` / `cargo fmt`
-- 完整 `pnpm typecheck`
-- 四个平台的真实 Tauri 打包
-- 真实付费 API 端到端兼容性测试
-- 独立安全审计
+- 54 个组合：三下游 × 三上游 × JSON/SSE × 文本/工具调用/工具结果。检查模型映射、系统提示、输出预算、工具定义/参数/关联、usage 和流终止；上游按小块发送字节以覆盖跨分片处理。
+- 工具结果回放使用网关实际返回的 ID；Anthropic usage 同时读取 message_start 和 message_delta，避免把合法协议差异当作丢失。
+- 增加三下游 JSON/SSE 的错误密钥、429 后故障转移和冷却期间不重复访问故障上游的真实 HTTP 测试。
+- 修复 Chat SSE 桥的中文跨分片乱码，以及提前 EOF/失败事件被补成正常 stop 的问题。
+- 运行服务回归覆盖并发启动、重复停止、端口占用时保留原服务与配置，并检查不会开启 CLI 接管。
+- 本批新增异常终态、坏工具参数、UTF-8 分片、usage 尾事件和输出限制回归，以及同源协议切换容量释放、最终流健康和计数回归。
+- 配置新增发布失败事务回滚、过期 revision 拒绝、覆盖文件恢复、监听准备后持久化拒绝等回归；等待 CI 执行。
+- 另外覆盖派生行过期时的候选快照、旧重试预算、新旧监听共享容量与旧监听退出后新状态保留；等待 CI 执行。
+- 容量回归覆盖旧配置不能恢复过期限额、不限额降限时计入已有请求、提升限额唤醒排队者；等待 CI 执行。
 
-首次公开发布应标记为 alpha，并在 GitHub Actions 通过后再上传 Release。
+## 后续边界
 
-## 建议验收顺序
+- reasoning、多模态、供应商专属字段、Responses compact 尚未全部纳入这次 54 组合矩阵。
+- 统一网关配置存在时，未知别名已明确拒绝；只有未配置统一网关的旧应用路径保留继承 router。
+- 真实客户端/上游验收、更多排队取消压力场景仍需补充。
+- 本批仅删除依赖关系明确的模块；剩余继承服务和 schema 不应未经迁移直接删除。
+- 同协议直通仍保留原始字节，工具完整性观察影响最终记录；额外注入错误事件的直通策略、全请求不可变配置快照和候选执行完整拆分仍待后续批次。
 
-1. GitHub Actions 四个平台构建通过。
-2. 使用 `tools/mock_upstream.py` 验证普通响应与 SSE。
-3. 验证标准 function tool call。
-4. 各接入一个真实 Chat、Responses 和 Anthropic 上游。
-5. 验证第一目标失败后切换到第二目标。
-6. 接入实际客户端进行回归测试。
+## 历史结果的解释
+
+旧报告记载的 mock 8/8 是历史工具自测，复现命令直接访问 mock 端口；不能据此宣称当前 Rust 网关端到端通过。历史记录保留在 [VALIDATION_REPORT.md](../VALIDATION_REPORT.md)，本页记录本次审阅的验证范围。

@@ -232,8 +232,12 @@ pub fn anthropic_to_responses(
 
     // Map Anthropic thinking → OpenAI Responses reasoning.effort
     if let Some(model_name) = body.get("model").and_then(|m| m.as_str()) {
-        if super::transform::supports_reasoning_effort(model_name) {
-            if let Some(effort) = super::transform::resolve_reasoning_effort(&body) {
+        if let Some(requested) = super::transform::resolve_reasoning_effort(&body) {
+            if let Some(effort) = super::transform::reasoning_effort_for_model(
+                model_name,
+                "openai_responses",
+                requested,
+            ) {
                 result["reasoning"] = json!({ "effort": effort });
             }
         }

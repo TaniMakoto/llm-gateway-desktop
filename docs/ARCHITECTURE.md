@@ -1,93 +1,88 @@
 # 架构说明
 
-## 目标
+核对日期：2026-10-11。依据 0.2.0 重构源码；验证范围见 [开发状态](DEVELOPMENT_STATUS.md)，分批路线见 [重构计划](REFACTOR_PLAN.md)。
 
-LLM Gateway Desktop 将多个第三方 LLM API 统一暴露为一个本地端口，并将“客户端协议”和“上游协议”解耦。
+## 产品边界
+
+单机桌面 LLM 网关：统一本地入口、管理上游 API、模型别名、协议转换、稳定转发与诊断。不以多用户、销售计费、订阅套餐或团队权限为目标。
 
 ```text
-客户端
-  ├─ OpenAI Chat
-  ├─ OpenAI Responses
-  └─ Anthropic Messages
-        │
-        ▼
-127.0.0.1:10888
-  ├─ 本地鉴权
-  ├─ 模型别名解析
-  ├─ 有序路由链
-  ├─ 精确模型映射
-  ├─ 协议转换
-  ├─ SSE 转换
-  └─ 熔断与故障转移
-        │
-        ▼
-第三方 API A / B / C
+React 配置 / 测试台 / 托盘 → Tauri commands → GatewayConfig / SQLite
+客户端 → axum → 本地鉴权 → 别名候选集 → 路由策略 / 会话亲和
+       → 容量控制 / 冷却 / 熔断 → 协议转换 → 上游
+       ← JSON / SSE 转换、usage 与诊断
 ```
 
-## 核心模块
+## 配置与路由
 
-### `gateway.rs`
+`src-tauri/src/gateway.rs` 是产品配置入口。当前结构是 `GatewayConfig.providers[].models[]`：
 
-保存一份与原 LLM Gateway Desktop 应用切换逻辑隔离的统一网关配置：
+- `GatewayProvider` 保存 URL、凭证、请求头、诊断开关、并发和排队参数。
+- `GatewayProviderModel` 保存 `alias`、`upstream_model`、`api_format`、启用状态和能力元数据。协议属于模型条目，同一供应商可以配置不同协议。
+- 相同 alias 的启用模型条目构成候选集，默认按供应商配置顺序选择。
+- `routing_policies` 支持 `priority`、`round_robin`、`weighted_round_robin`、`least_outstanding`；`routing_weights` 保存别名下各供应商的权重。
+- `model_registry_overrides` 与数据目录下的 `model-registry.overrides.json` 管理模型能力修正；内置能力来源为 `resources/model_capabilities.json`。
+- 请求候选、模型映射、容量参数、策略和权重从同一次捕获的配置直接生成，统一路由的重试预算按候选数计算；派生供应商表只保留兼容用途。
 
-- `GatewayProvider`
-- `GatewayRoute`
-- `GatewayRouteTarget`
-- 本地监听和鉴权配置
+监听重绑定复用原来的路由、健康、容量和会话亲和状态。旧监听停止时关闭空闲长连接，已开始的响应继续收尾；监听代次防止旧退出任务覆盖新监听状态。
 
-配置存储在 SQLite `settings` 表的 `unified_gateway_config_v1` 键中。
+配置仍存储于 SQLite `settings` 表的 `unified_gateway_config_v1` 键，新增 `schemaVersion` 和递增的 `revision`；旧配置缺省为 1/0，未来未知版本明确拒绝。保存检查 revision，防止过期编辑覆盖。供应商镜像、代理参数和主配置在同一个 SQLite 事务中写入；旧 `routes/targets` 结构仍由迁移函数读取。
 
-为了复用原代理内核，每个通用供应商会被物化为内部 `claude` 和 `codex` provider。它们只属于 `unified_gateway` 分类，不会写入 Claude Code、Codex CLI 或 Gemini 的 live 配置。
+`gateway/configuration.rs` 准备模型覆盖文件，`GatewayRuntime` 先保留新端口、持久化后才发布监听；失败恢复文件并保留旧服务。覆盖文件附带配置 revision，主配置保留恢复副本，文件保留前一版本，防止中断的发布覆盖已提交配置。提交后的监听发布不随 UI 调用取消而中止。
 
-### `gateway_chat.rs`
+为了复用原代理，每个供应商与协议组合物化为 `unified_gateway` 分类下的内部 provider，并分别写入 `claude`、`codex` 应用域。它们不是本机 CLI 配置。
 
-OpenAI Chat 请求先转换成 Responses 请求，再进入成熟的 Responses 路由链。这样 Chat 客户端也能路由到：
+`proxy/handler_context.rs` 先解析统一网关别名，再应用路由策略；有效会话绑定优先于重新分配。网关配置存在时，未知别名返回明确的请求错误，不再进入继承 provider router；仅未配置统一网关的旧应用路径保留旧行为。
 
-- Chat 上游
-- Responses 上游
-- Anthropic 上游
+## 请求与响应
 
-非流式 Responses 响应转换回 Chat Completion；流式 Responses SSE 事件转换为 Chat Completion chunks。
+`proxy/server.rs` 暴露：
 
-### `proxy/`
+```text
+GET  /health
+GET  /v1/gateway/status
+GET  /v1/models
+POST /v1/chat/completions
+POST /v1/responses
+POST /v1/responses/compact
+POST /v1/messages
+```
 
-保留的关键代理基础设施：
+网关公开三类客户端协议。继承目录含 Gemini、OAuth 等实现，不代表这些能力已通过当前 UI、配置和 HTTP 路由成为产品功能。
 
-- HTTP 转发
-- SSE 解码和重建
-- Anthropic ↔ OpenAI Chat
-- Anthropic ↔ OpenAI Responses
-- Responses ↔ OpenAI Chat
-- 工具调用转换
-- 模型映射
-- 请求日志
-- 超时、熔断与重试
+Chat 和 Responses 入口共享 OpenAI handler，保留原始请求直到选定候选。`proxy/request_plan.rs` 在每次尝试中按候选协议决定转换：Chat → Chat 直接转发，只进行模型映射、显式兼容配置及已有私有字段过滤；跨协议才调用 `gateway_chat.rs`。成功响应按实际成功候选的协议处理，原生 Chat 的 JSON/SSE 不绕 Responses。响应协议和应用配置域分开，Chat SSE 使用自己的终态检查与 usage parser。
 
-### 数据隔离
+推理接口由已知服务端域名或供应商显式 `chatReasoningProfile` 决定，模型名和展示名称不能触发厂商字段注入。原生 Chat 在 auto 下保留客户端推理参数；跨协议未知服务商采用 OpenAI effort 字段。工具 schema 默认保留；`chatSchemaRequiredDefaults` 仅为要求此字段的服务商补齐非 strict 工具缺省的 required 数组，不删除 null 或改写 enum/items。
 
-默认使用 `~/.llm-gateway-desktop/llm-gateway.db`。专用启动流程不会扫描或接管本机 Claude、Codex、Gemini、OpenCode、Hermes、MCP、Skills 或提示词配置。
+`proxy/providers/` 负责三类协议转换、工具调用、reasoning 与 SSE。`forwarder.rs` 组织发送、错误处理与故障转移；`provider_router.rs` 提供路由、供应商容量控制、排队和冷却；`session_affinity.rs` 保存有界的会话绑定。并发容量按源供应商共享，避免物化为多个协议后重复获得并发额度。
 
-## 路由选择
+已有 429 / Retry-After 冷却、熔断、会话重新绑定及取消排队计数。输出提交前，上游 HTTP 拒绝（包括 400/401/403/413/422）仍允许尝试下一可用候选；本地鉴权或本地请求校验错误可立即终止。每家仅从原始请求构建自己的出站参数。HTTP 200 错误正文和 SSE 实际输出前的错误也在尝试循环内识别；输出已提交后不重放请求。详见 [路由可靠性改造](ROUTING_RELIABILITY.md)。
 
-客户端请求中的 `model` 是本地模型别名。`RequestContext` 在正常 provider router 之前检查统一网关路由：
+`crates/gateway-core` 保存终态语义和工具参数完成校验，不依赖桌面、HTTP 或 SQLite。合法限额结束、异常 EOF、错误和取消分别处理；晚到错误可以覆盖之前的完成标记。`AttemptLease` 管理每次尝试的容量与半开探测许可；成功后移交响应，最终转换结果决定供应商健康和请求计数，取消中性释放。
 
-1. 查找启用的同名 route。
-2. 按 route targets 顺序取得启用的 provider。
-3. 交给既有 forwarder 执行故障转移。
-4. 每个 provider 的 `gateway_model_map` 将本地别名替换为对应真实模型名。
+## 桌面、数据与继承代码
 
-## 安全默认值
+`lib.rs` 负责专用启动、Tauri 命令、托盘、监听恢复；这些路径统一使用 `AppState.gateway_runtime`。`gateway_runtime.rs` 独立管理监听、停止、配置热更新和状态，使用同一个锁串行化启动/停止/重新绑定；新端口绑定失败时保留原监听及代理配置。它不调用 CLI 配置接管服务。`forwarder.rs` 也禁止统一网关 provider 的成功路由触发继承的 live 配置切换。
 
-- 默认仅绑定 `127.0.0.1`
-- 默认启用本地 API Key
-- API Key 不返回给下游客户端
-- 默认不保存额外提示词正文；日志行为沿用代理内核配置
-- 允许手动绑定 `0.0.0.0`，但应配合防火墙并保持本地鉴权开启
+`lightweight.rs`、`auto_launch.rs`、`portable.rs` 负责桌面生命周期。默认数据目录为 `~/.llm-gateway-desktop/`；可执行文件旁存在 `portable.flag` 时使用旁边的 `data/`。
 
-## 暂未独立实现的功能
+入口不执行原应用的 CLI 配置接管、MCP、Skills 和提示词初始化。首轮已删除未注册的认证聚合、深链、导入导出、模型发现包装、OMO、插件、S3/WebDAV 同步、workspace 和 session manager 命令，以及整个 CLI 会话历史浏览模块，共约 6,700 行；模型发现本身仍由 gateway 命令提供。
 
-- 单个 provider 内的多 Key 轮换；目前可通过添加多个 provider 条目实现
-- 按价格或实时延迟自动选择
-- 配额感知路由
-- 完全无损转换厂商专属字段
-- 独立于 LLM Gateway Desktop 内核的最小 Rust crate 拆分
+`lib.rs`、`services/mod.rs`、`commands/mod.rs` 仍声明部分继承模块，旧 `ProxyService` 暂时留在 `AppState` 供继承服务引用。数据库及 provider 类型仍与其有依赖。2026-10-11 的第二轮移除不可达深链、未注册的 MCP/Prompt/Skill 命令及没有 worker 的 S3/WebDAV 同步服务和数据库通知 hook；仍被共享服务引用的业务与历史 schema 迁移保留。
+
+后续精简应先分离网关运行服务与外部应用配置服务，随后按编译依赖移除模块；旧数据库结构应通过迁移处理。不能仅凭目录名批量删除。
+
+## 安全与诊断默认值
+
+- 默认监听 `127.0.0.1:10888`，启用本地访问密钥。
+- 凭证与配置保存在本地，备份应作为敏感数据处理。
+- 供应商或模型可显式开启请求/响应正文录制，默认关闭；录制文件位于日志目录的 `request-bodies/` 下。
+- 本地 usage、延迟、失败原因与并发状态用于诊断，不需要扩展为销售计费系统。
+
+选型结论与后续顺序见 [内核选型评估](KERNEL_COMPARISON.md)。
+
+## 回归入口
+
+`gateway/protocol_tests.rs` 使用内存 SQLite 和临时端口，沿真实 `GatewayRuntime → ProxyServer → handler → forwarder → mock upstream` 路径发 HTTP 请求。54 个组合覆盖三种下游 × 三种上游 × JSON/SSE × 文本/工具调用/工具结果；工具结果使用实际返回的工具 ID。另有三种下游 JSON/SSE 的鉴权、故障转移与 429 冷却测试。
+
+Chat SSE 桥共用增量 UTF-8 解码和 SSE 分块，避免中文跨网络分片时损坏；提前 EOF 或明确失败输出错误，不再伪造成功的 `finish_reason: stop`。针对逐字节 UTF-8、CRLF、断流和重复终态有额外测试。

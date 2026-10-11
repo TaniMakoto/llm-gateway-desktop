@@ -336,6 +336,28 @@ pub fn responses_to_chat_completions_with_reasoning(
             obj.remove("parallel_tool_calls");
         }
     }
+
+    // DeepSeek thinking 模式要求带 tools 的请求把所有历史轮的 reasoning_content
+    // 全量回传（含未发生 tool call 的纯文本轮），缺失即 400。客户端若在回放
+    // 历史时丢弃了 reasoning item，这里按供应商声明的 reasoning_content 回传
+    // 格式给缺失的 assistant 消息补占位，保住请求。
+    // 仅在声明 reasoning_content 输出且携带 tools 时生效，避免向严格上游
+    // （vLLM 等）引入它们不认识的字段。客户端没有显式声明 `reasoning` 不算「关闭」：
+    // Codex/pi 这类客户端往往不带该字段，而上游（如 AgentRouter 的
+    // deepseek-v4-flash）仍默认开思考，缺失历史轮 reasoning_content 一样 400。
+    // 只有客户端显式表达关闭（reasoning 为 null 或 effort 为 none/off/disabled）
+    // 才跳过回填。
+    let preserve_history_reasoning = reasoning_config
+        .and_then(|config| config.output_format.as_deref())
+        == Some("reasoning_content");
+    if preserve_history_reasoning
+        && reasoning_requested(&body) != Some(false)
+        && has_tools
+    {
+        if let Some(messages) = result.get_mut("messages").and_then(|v| v.as_array_mut()) {
+            backfill_missing_assistant_reasoning(messages);
+        }
+    }
     // OpenAI 兼容上游在流式下默认不在 SSE 里返回 usage，必须显式声明
     // include_usage 才会在末尾吐 usage chunk。Codex CLI 用 Responses 协议、
     // 自身不带 stream_options，缺这一注入会导致 kimi/MiniMax 等第三方流式请求的
@@ -346,6 +368,23 @@ pub fn responses_to_chat_completions_with_reasoning(
     Ok(result)
 }
 
+/// Only explicit provider profiles may rewrite a native Chat request.
+pub(crate) fn apply_native_chat_reasoning(body: &mut Value, config: &CodexChatReasoningConfig) {
+    let effort = body.get("reasoning_effort").cloned()
+        .or_else(|| body.pointer("/reasoning/effort").cloned());
+    let disabled = config.effort_param.as_deref() == Some("none")
+        && config.thinking_param.as_deref() == Some("none");
+    if effort.is_none() && !disabled { return; }
+    let normalized = effort.map(|effort| json!({"reasoning":{"effort":effort}})).unwrap_or_else(|| json!({}));
+    if let Some(object) = body.as_object_mut() {
+        for key in ["reasoning_effort", "reasoning", "thinking", "enable_thinking", "reasoning_split"] {
+            object.remove(key);
+        }
+    }
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    apply_reasoning_options(body, &normalized, &model, Some(config));
+}
+
 fn apply_reasoning_options(
     result: &mut Value,
     body: &Value,
@@ -353,16 +392,18 @@ fn apply_reasoning_options(
     config: Option<&CodexChatReasoningConfig>,
 ) {
     let Some(config) = config else {
-        if super::transform::supports_reasoning_effort(model) {
-            if let Some(effort) = body.pointer("/reasoning/effort") {
-                result["reasoning_effort"] = effort.clone();
+        if let Some(requested) = body.pointer("/reasoning/effort").and_then(Value::as_str) {
+            if let Some(effort) =
+                super::transform::reasoning_effort_for_model(model, "openai_chat", requested)
+            {
+                result["reasoning_effort"] = json!(effort);
             }
         }
         return;
     };
 
     let supports_effort = config.supports_effort.unwrap_or(false);
-    let supports_thinking = config.supports_thinking.unwrap_or(false) || supports_effort;
+    let supports_thinking = config.supports_thinking.unwrap_or(false);
     let Some(reasoning_enabled) = reasoning_requested(body) else {
         return;
     };
@@ -409,6 +450,8 @@ fn apply_reasoning_options(
         // 不会走到这里，故只有上游「显式」表达关闭才透传 none。
         if effort_param == "reasoning.effort" {
             result["reasoning"] = json!({ "effort": "none" });
+        } else if effort_param == "reasoning_effort" && config.effort_value_mode.as_deref() == Some("passthrough") {
+            result["reasoning_effort"] = json!("none");
         }
         return;
     }
@@ -556,9 +599,11 @@ fn append_responses_input_as_chat_messages(
             }));
         }
         Value::Array(items) => {
-            for item in items {
+            for (index, item) in items.iter().enumerate() {
+                let next_item = items.get(index + 1);
                 append_responses_item_as_chat_message(
                     item,
+                    next_item,
                     messages,
                     &mut pending_tool_calls,
                     &mut pending_reasoning,
@@ -570,6 +615,7 @@ fn append_responses_input_as_chat_messages(
         Value::Object(_) => {
             append_responses_item_as_chat_message(
                 input,
+                None,
                 messages,
                 &mut pending_tool_calls,
                 &mut pending_reasoning,
@@ -592,6 +638,7 @@ fn append_responses_input_as_chat_messages(
 
 fn append_responses_item_as_chat_message(
     item: &Value,
+    next_item: Option<&Value>,
     messages: &mut Vec<Value>,
     pending_tool_calls: &mut Vec<Value>,
     pending_reasoning: &mut Option<String>,
@@ -651,11 +698,24 @@ fn append_responses_item_as_chat_message(
         }
         Some("reasoning") => {
             let reasoning = responses_reasoning_item_text(item);
-            let attached_to_previous = pending_tool_calls.is_empty()
-                && attach_reasoning_to_last_assistant(messages, *last_assistant_index, &reasoning);
-            if !attached_to_previous {
-                append_pending_reasoning(pending_reasoning, reasoning);
+            // Responses 历史里 reasoning item 归属于其后紧随的 assistant 输出
+            // （message 或 function_call）。只有尾随 reasoning（后面没有可归属
+            // 对象）才回填给上一条 assistant 消息。若一律优先回填上一条，
+            // 多轮历史的 reasoning 会整体前移一轮：R2 串进 A1、R3 串进 tool-call
+            // 消息，最后一条纯文本 assistant 轮缺失 reasoning_content——
+            // DeepSeek thinking 模式对带 tools 的请求因此返回 400。
+            if !next_item_takes_reasoning(next_item) {
+                let attached_to_previous = pending_tool_calls.is_empty()
+                    && attach_reasoning_to_last_assistant(
+                        messages,
+                        *last_assistant_index,
+                        &reasoning,
+                    );
+                if attached_to_previous {
+                    return Ok(());
+                }
             }
+            append_pending_reasoning(pending_reasoning, reasoning);
         }
         Some("input_text" | "input_image" | "input_file" | "input_audio") => {
             flush_pending_tool_calls(
@@ -915,6 +975,78 @@ fn attach_reasoning_to_last_assistant(
     }
 
     false
+}
+
+/// 判断 reasoning item 之后的下一个输入项是否会消费这段思考。
+/// Responses 协议里 reasoning item 位于它所归属的 assistant 输出（message 或
+/// function_call 系）之前；尾随 reasoning（后面是 user/tool 输出或已到末尾）
+/// 才归属于上一条 assistant 消息。
+fn next_item_takes_reasoning(next_item: Option<&Value>) -> bool {
+    let Some(next) = next_item else {
+        return false;
+    };
+    match next.get("type").and_then(|v| v.as_str()) {
+        Some("function_call" | "custom_tool_call" | "tool_search_call") => true,
+        // 顶层 input_* 项在带 role=assistant 时同样会被转成 assistant 消息，
+        // 与 message 项一样消费 pending reasoning，不能漏掉。
+        Some("message")
+        | Some("input_text" | "input_image" | "input_file" | "input_audio")
+        | None => next.get("role").and_then(|v| v.as_str()) == Some("assistant"),
+        _ => false,
+    }
+}
+
+/// 给仍缺 `reasoning_content` 的历史 assistant 消息补占位——纯文本轮（无
+/// tool_calls）也补。DeepSeek thinking 模式要求带 tools 的请求回传所有历史轮
+/// 的 reasoning_content，客户端（压缩/裁剪历史时）不回放 reasoning item 的轮次
+/// 只能用良性占位兜底，避免上游 400。与 `ensure_tool_call_reasoning_content`
+/// 的区别：后者无条件覆盖 tool-call 轮，本函数只在供应商声明 reasoning_content
+/// 回传格式时由调用方启用。
+fn backfill_missing_assistant_reasoning(messages: &mut [Value]) {
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(obj) = message.as_object_mut() else {
+            continue;
+        };
+        let has_reasoning = obj
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .is_some_and(|text| !text.trim().is_empty());
+        if !has_reasoning {
+            obj.insert(
+                "reasoning_content".to_string(),
+                Value::String("(reasoning unavailable)".to_string()),
+            );
+        }
+    }
+}
+
+/// Repair a native Chat history only when the request itself proves that the
+/// upstream is using DeepSeek-style `reasoning_content` history. This avoids
+/// model/vendor-name heuristics and reuses the same backfill rule as the
+/// Responses -> Chat conversion path.
+pub(crate) fn sanitize_native_chat_reasoning_history(body: &mut Value) {
+    if reasoning_requested(body) == Some(false)
+        || !body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        return;
+    }
+
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let uses_reasoning_content = messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("assistant")
+            && message.get("reasoning_content").is_some()
+    });
+    if uses_reasoning_content {
+        backfill_missing_assistant_reasoning(messages);
+    }
 }
 
 fn responses_message_reasoning_text(item: &Value) -> Option<String> {
@@ -2613,6 +2745,261 @@ mod tests {
         assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(messages[0]["reasoning_content"], "Need to read a file.");
         assert_eq!(messages[1]["role"], "tool");
+    }
+
+    #[test]
+    fn responses_request_to_chat_keeps_turn_reasoning_with_following_assistant() {
+        // 多轮历史：reasoning item 归属其后紧随的 assistant 输出，而不是回填给
+        // 上一条 assistant。旧逻辑把 R2 串进 A1、R3 串进 tool-call 消息，导致
+        // A2 缺失 reasoning_content——DeepSeek thinking 模式对带 tools 的多轮
+        // 请求返回 400「reasoning_content must be passed back」。
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "Inspect the repo"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "R1"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "A1"}]},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "R2"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "read_file", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "content"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "R3"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "A2"}]}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "read_file",
+                "parameters": {"type": "object"}
+            }]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "A1");
+        assert_eq!(messages[1]["reasoning_content"], "R1");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["reasoning_content"], "R2");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[4]["role"], "assistant");
+        assert_eq!(messages[4]["content"], "A2");
+        assert_eq!(messages[4]["reasoning_content"], "R3");
+    }
+
+    #[test]
+    fn responses_request_to_chat_keeps_text_turn_reasoning_off_previous_assistant() {
+        // 纯文本多轮（无 tool call）：R2 属于 A2，不能回填进 A1。
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "q1"},
+                {"type": "reasoning", "summary": "R1"},
+                {"type": "message", "role": "assistant", "content": "a1"},
+                {"type": "reasoning", "summary": "R2"},
+                {"type": "message", "role": "assistant", "content": "a2"}
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["reasoning_content"], "R1");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["reasoning_content"], "R2");
+    }
+
+    #[test]
+    fn responses_request_to_chat_keeps_flat_input_text_assistant_reasoning() {
+        // 顶层 input_* item 带 role=assistant 时同样消费 pending reasoning，
+        // reasoning 归属必须跟上（peek 分支不能漏掉这类后续项）。
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "q"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "R"}]},
+                {"type": "input_text", "role": "assistant", "text": "a"}
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["reasoning_content"], "R");
+    }
+
+    #[test]
+    fn responses_request_to_chat_backfills_missing_history_reasoning_for_reasoning_content_vendors() {
+        // DeepSeek thinking 模式 + tools：客户端丢弃历史 reasoning item 时，
+        // 给缺失 reasoning_content 的纯文本 assistant 轮补占位，避免上游 400。
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "q"},
+                {"type": "message", "role": "assistant", "content": "a"},
+                {"type": "message", "role": "user", "content": "q2"}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "get_date",
+                "parameters": {"type": "object"}
+            }],
+            "reasoning": {"effort": "high"}
+        });
+        let config = deepseek_codex_reasoning_config();
+
+        let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["reasoning_content"], "(reasoning unavailable)");
+        assert!(messages[0].get("reasoning_content").is_none());
+        assert!(messages[2].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn native_chat_repairs_whitespace_reasoning_history_from_request_evidence() {
+        let mut input = json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a", "reasoning_content": "R1"},
+                {"role": "user", "content": "q2"},
+                {"role": "assistant", "content": "a2", "reasoning_content": " "}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "get_date", "parameters": {"type": "object"}}
+            }],
+            "reasoning_effort": "xhigh"
+        });
+
+        sanitize_native_chat_reasoning_history(&mut input);
+
+        assert_eq!(input["messages"][1]["reasoning_content"], "R1");
+        assert_eq!(
+            input["messages"][3]["reasoning_content"],
+            "(reasoning unavailable)"
+        );
+        assert!(input["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn native_chat_does_not_invent_reasoning_history_without_request_evidence() {
+        let mut input = json!({
+            "model": "generic-model",
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "get_date", "parameters": {"type": "object"}}
+            }],
+            "reasoning_effort": "high"
+        });
+
+        sanitize_native_chat_reasoning_history(&mut input);
+
+        assert!(input["messages"][1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_skips_reasoning_backfill_without_tools_or_declaration() {
+        // 非 reasoning_content 供应商 / 未携带 tools 时不得引入占位字段：
+        // 严格上游会拒绝未知的 reasoning_content。
+        let input = json!({
+            "model": "some-generic-model",
+            "input": [
+                {"type": "message", "role": "user", "content": "q"},
+                {"type": "message", "role": "assistant", "content": "a"}
+            ],
+            "reasoning": {"effort": "high"}
+        });
+        let mut config = deepseek_codex_reasoning_config();
+        config.output_format = Some("auto".to_string());
+
+        let result = responses_to_chat_completions_with_reasoning(input.clone(), Some(&config)).unwrap();
+        assert!(result["messages"][1].get("reasoning_content").is_none());
+
+        // 声明了 reasoning_content 但请求不带 tools：回传规则不触发，不注入。
+        let mut input_no_tools = input;
+        input_no_tools.as_object_mut().unwrap().remove("tools");
+        let result = responses_to_chat_completions_with_reasoning(
+            input_no_tools,
+            Some(&deepseek_codex_reasoning_config()),
+        )
+        .unwrap();
+        assert!(result["messages"][1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_backfills_history_reasoning_without_explicit_reasoning_field() {
+        // Codex/pi 不带 `reasoning` 字段时，上游仍可能默认开思考；历史轮缺
+        // reasoning_content 依然要补占位，否则 AgentRouter + deepseek-v4-flash
+        // 返回 400「reasoning_content in the thinking mode must be passed back」。
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "q"},
+                {"type": "message", "role": "assistant", "content": "a"},
+                {"type": "message", "role": "user", "content": "q2"}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "get_date",
+                "parameters": {"type": "object"}
+            }]
+        });
+
+        let result = responses_to_chat_completions_with_reasoning(
+            input,
+            Some(&deepseek_codex_reasoning_config()),
+        )
+        .unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[1]["reasoning_content"], "(reasoning unavailable)");
+    }
+
+    #[test]
+    fn responses_request_to_chat_respects_explicitly_disabled_reasoning_backfill() {
+        // 客户端显式关闭 thinking 时上游不会进入思考模式，不得注入占位。
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "q"},
+                {"type": "message", "role": "assistant", "content": "a"}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "get_date",
+                "parameters": {"type": "object"}
+            }],
+            "reasoning": {"effort": "none"}
+        });
+
+        let result = responses_to_chat_completions_with_reasoning(
+            input,
+            Some(&deepseek_codex_reasoning_config()),
+        )
+        .unwrap();
+
+        assert!(result["messages"][1].get("reasoning_content").is_none());
+    }
+
+    fn deepseek_codex_reasoning_config() -> CodexChatReasoningConfig {
+        CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("thinking".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("deepseek".to_string()),
+            output_format: Some("reasoning_content".to_string()),
+        }
     }
 
     #[test]

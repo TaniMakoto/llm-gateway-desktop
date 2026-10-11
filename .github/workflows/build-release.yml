@@ -55,8 +55,17 @@ jobs:
       - name: TypeScript check
         run: pnpm typecheck
 
-      - name: Gateway Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml gateway --lib
+      - name: Frontend format check
+        run: pnpm format:check
+
+      - name: Independent gateway core tests
+        run: cargo test --locked --manifest-path crates/gateway-core/Cargo.toml
+
+      # 全量 lib 测试（含 proxy 协议转换层）。此前按 "gateway" 过滤，会漏跑
+      # transform_codex_chat 等转换模块的测试——这些测试路径不含 "gateway"，
+      # 改动只会被编译、不会被执行。
+      - name: Rust lib tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 
   build:
     name: ${{ matrix.name }}
@@ -175,7 +184,6 @@ jobs:
           New-Item -ItemType File -Force -Path (Join-Path $packageDir "portable.flag") | Out-Null
           Copy-Item $exePath (Join-Path $packageDir "LLM Gateway Desktop.exe")
           Copy-Item "LICENSE" $packageDir
-          Copy-Item "THIRD_PARTY_NOTICES.md" $packageDir
           Copy-Item "README.md" $packageDir
 
           @"

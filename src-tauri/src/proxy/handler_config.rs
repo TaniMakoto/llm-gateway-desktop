@@ -23,6 +23,7 @@ pub type StreamUsageEventFilter = fn(&str) -> bool;
 /// 各 API 的使用量解析配置
 #[derive(Clone, Copy)]
 pub struct UsageParserConfig {
+    pub(crate) stream_protocol: super::sse::ClientSseProtocol,
     /// 流式响应解析器
     pub stream_parser: StreamUsageParser,
     /// 非流式响应解析器
@@ -137,6 +138,7 @@ fn gemini_model_extractor(events: &[Value], fallback_model: &str) -> String {
 
 /// Claude API 解析配置
 pub const CLAUDE_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
+    stream_protocol: super::sse::ClientSseProtocol::Anthropic,
     stream_parser: TokenUsage::from_claude_stream_events,
     response_parser: TokenUsage::from_claude_response,
     model_extractor: claude_model_extractor,
@@ -146,6 +148,7 @@ pub const CLAUDE_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
 
 /// OpenAI Chat Completions API 解析配置（用于 Codex /v1/chat/completions）
 pub const OPENAI_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
+    stream_protocol: super::sse::ClientSseProtocol::Chat,
     stream_parser: TokenUsage::from_openai_stream_events,
     response_parser: TokenUsage::from_openai_response,
     model_extractor: openai_model_extractor,
@@ -155,6 +158,7 @@ pub const OPENAI_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
 
 /// Codex 智能解析配置（自动检测 OpenAI 或 Codex 格式）
 pub const CODEX_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
+    stream_protocol: super::sse::ClientSseProtocol::Responses,
     stream_parser: TokenUsage::from_codex_stream_events_auto,
     response_parser: TokenUsage::from_codex_response_auto,
     model_extractor: codex_auto_model_extractor,
@@ -164,6 +168,7 @@ pub const CODEX_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
 
 /// Gemini API 解析配置
 pub const GEMINI_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
+    stream_protocol: super::sse::ClientSseProtocol::Chat,
     stream_parser: TokenUsage::from_gemini_stream_chunks,
     response_parser: TokenUsage::from_gemini_response,
     model_extractor: gemini_model_extractor,

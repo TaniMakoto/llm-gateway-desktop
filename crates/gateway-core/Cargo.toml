@@ -1,0 +1,9 @@
+[package]
+name = "gateway-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Desktop-independent protocol completion rules for LLM Gateway"
+
+[dependencies]
+serde_json = "1.0"

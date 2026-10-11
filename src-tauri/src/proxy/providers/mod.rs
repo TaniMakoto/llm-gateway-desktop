@@ -43,8 +43,26 @@ pub(crate) use claude::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
 use crate::app_config::AppType;
 use crate::provider::Provider;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+
+/// Anthropic / Responses 客户端侧 tool id 发号器。
+///
+/// 两个协议都要求 tool id 在**会话内唯一**：客户端按 id 配对 `tool_use` 与
+/// `tool_result`。上游不保证这一点——实测某 OpenAI 兼容中转每次都返回
+/// `{工具名}:{序号}`（`Grep:0`、`Read:0`…），序号每条响应都从 0 重来，于是同一个
+/// id 在整段会话里反复出现。Claude Code 会把"该 id 之前已经出现过"的 tool_use 判成
+/// 无法配对、整段丢弃并补上 `[Tool use interrupted]`，会话从此不再推进。
+///
+/// 所以"上游 → 客户端"方向的 tool id 一律由网关发号，不再透传上游 id。客户端回传
+/// 该 id 时原样转给上游即可：Chat / Responses 的 `tool_call_id` 只要求单次请求内
+/// 自洽，上游不会拿它和自己上一轮生成的值比对。id 由客户端存回历史，跨轮次稳定，
+/// 因此不影响上游的前缀缓存。
+pub(crate) fn next_client_tool_use_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    format!("call_{}", SEQ.fetch_add(1, Ordering::Relaxed))
+}
 
 // 公开导出
 pub use adapter::ProviderAdapter;
@@ -57,6 +75,7 @@ pub use claude::{
 pub use codex::CodexAdapter;
 pub use codex::{
     apply_codex_chat_upstream_model, apply_codex_upstream_model, codex_provider_upstream_model,
+    codex_provider_uses_chat_completions, codex_provider_uses_anthropic, chat_reasoning_profile,
     inject_codex_chat_prompt_cache_key, is_codex_official_provider,
     resolve_codex_catalog_tool_profile, resolve_codex_chat_reasoning_config,
     should_convert_codex_responses_to_anthropic, should_convert_codex_responses_to_chat,

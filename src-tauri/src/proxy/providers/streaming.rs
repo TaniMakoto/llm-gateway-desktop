@@ -108,10 +108,18 @@ struct PromptTokensDetails {
 #[derive(Debug, Clone)]
 struct ToolBlockState {
     anthropic_index: u32,
+    /// 上游给的 tool_call.id。只用于判断"能否开始这个块"，不下发给客户端。
     id: String,
+    /// 下发给客户端的 tool_use.id，由网关发号保证会话内唯一。
+    ///
+    /// 不能直接透传 `id`：上游不保证它唯一（见
+    /// [`super::next_client_tool_use_id`]），重复 id 会让客户端把工具调用整段丢弃。
+    client_id: String,
     name: String,
     started: bool,
     pending_args: String,
+    /// 保留完整参数供收尾校验；pending_args 仅保存尚未下发的片段。
+    arguments: String,
     /// 连续空白字符计数 — 用于检测 Copilot 无限换行 bug
     /// 当 function call 参数中的连续空白字符达到阈值时，强制终止流
     consecutive_whitespace: usize,
@@ -121,6 +129,37 @@ struct ToolBlockState {
 
 /// 无限空白 bug 的连续空白字符阈值
 const INFINITE_WHITESPACE_THRESHOLD: usize = 500;
+
+fn tool_completion_error(
+    tools: &HashMap<usize, ToolBlockState>,
+    has_finish_reason: bool,
+) -> Option<String> {
+    let mut indices: Vec<_> = tools.keys().copied().collect();
+    indices.sort_unstable();
+    for index in indices {
+        let tool = &tools[&index];
+        let problem = if tool.aborted { Some("tool arguments were aborted") } else {
+            crate::proxy::tool_completion::validate_tool_completion(
+                &tool.name, &tool.arguments,
+                crate::proxy::tool_completion::ToolArgumentFormat::JsonObject, has_finish_reason,
+            ).err()
+        };
+        if let Some(problem) = problem {
+            // 不记录参数内容，避免把工具参数中的私有数据写进错误日志。
+            return Some(format!("Incomplete upstream tool call at index {index}: {problem}"));
+        }
+    }
+    None
+}
+
+fn stream_error_event(message: &str) -> Bytes {
+    let error_type = if message.starts_with("Incomplete upstream tool call") { "incomplete_tool_call" } else { "stream_error" };
+    let event = json!({
+        "type": "error",
+        "error": {"type": error_type, "message": message}
+    });
+    Bytes::from(format!("event: error\ndata: {event}\n\n"))
+}
 
 fn build_anthropic_usage_json(usage: &Usage) -> Value {
     // OpenAI prompt_tokens 含缓存，Anthropic input_tokens 不含，需减去 cache_read 与 cache_creation
@@ -194,7 +233,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 
         tokio::pin!(stream);
 
-        while let Some(chunk) = stream.next().await {
+        'upstream: while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
                     crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
@@ -206,8 +245,35 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 
                         for l in line.lines() {
                             if let Some(data) = strip_sse_field(l, "data") {
+                                // A late error must survive an earlier completion marker.
+                                if let Ok(event) = serde_json::from_str::<Value>(data) {
+                                    if crate::proxy::sse::classify_terminal_event(&event) == Some(crate::proxy::sse::SseTerminalState::Failed) {
+                                        let message = event.pointer("/error/message").and_then(Value::as_str).unwrap_or("Upstream Chat stream reported an error");
+                                        stream_ended_with_error = true;
+                                        yield Ok(stream_error_event(message));
+                                        break 'upstream;
+                                    }
+                                }
+                                if has_sent_message_stop {
+                                    continue;
+                                }
                                 if data.trim() == "[DONE]" {
                                     log::debug!("[Claude/OpenRouter] <<< OpenAI SSE: [DONE]");
+
+                                    if let Some(message) = tool_completion_error(
+                                        &tool_blocks_by_index, has_emitted_message_delta,
+                                    ) {
+                                        log::error!("[Claude/OpenRouter] {message}");
+                                        stream_ended_with_error = true;
+                                        yield Ok(stream_error_event(&message));
+                                        break 'upstream;
+                                    }
+
+                                    if !has_emitted_message_delta {
+                                        stream_ended_with_error = true;
+                                        yield Ok(stream_error_event("Upstream Chat stream ended before finish_reason"));
+                                        break 'upstream;
+                                    }
 
                                     // 流正常结束，发出缓存的 message_delta（含完整 usage）。
                                     if let Some((stop_reason, usage_json)) = pending_message_delta.take() {
@@ -409,9 +475,11 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                                 ToolBlockState {
                                                                     anthropic_index: index,
                                                                     id: String::new(),
+                                                                    client_id: String::new(),
                                                                     name: String::new(),
                                                                     started: false,
                                                                     pending_args: String::new(),
+                                                                    arguments: String::new(),
                                                                     consecutive_whitespace: 0,
                                                                     aborted: false,
                                                                 }
@@ -437,6 +505,9 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                                 && !state.name.is_empty();
                                                         if should_start {
                                                             state.started = true;
+                                                            // 发号只在块真正开始时做一次，避免后续 delta 改写已下发的 id。
+                                                            state.client_id =
+                                                                super::next_client_tool_use_id();
                                                         }
                                                         let pending_after_start = if should_start
                                                             && !state.pending_args.is_empty()
@@ -450,6 +521,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                             .as_ref()
                                                             .and_then(|f| f.arguments.clone());
                                                         let immediate_delta = if let Some(args) = args_delta {
+                                                            state.arguments.push_str(&args);
                                                             // 无限空白 bug 检测：跟踪连续空白字符
                                                             for ch in args.chars() {
                                                                 if ch.is_whitespace() {
@@ -476,7 +548,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                         };
                                                         (
                                                             state.anthropic_index,
-                                                            state.id.clone(),
+                                                            state.client_id.clone(),
                                                             state.name.clone(),
                                                             should_start,
                                                             pending_after_start,
@@ -547,6 +619,14 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                 }
                                                 continue;
                                             }
+                                            // 必须在关闭工具块之前校验。关闭块可能让客户端执行工具，
+                                            // 不能先发成功收尾再报告半截 JSON。
+                                            if let Some(message) = tool_completion_error(&tool_blocks_by_index, true) {
+                                                log::error!("[Claude/OpenRouter] {message}");
+                                                stream_ended_with_error = true;
+                                                yield Ok(stream_error_event(&message));
+                                                break 'upstream;
+                                            }
                                             has_emitted_message_delta = true;
 
                                             if let Some(index) = current_non_tool_block_index.take() {
@@ -563,7 +643,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                             // Late start for blocks that accumulated args before id/name arrived.
                                             let mut late_tool_starts: Vec<(u32, String, String, String)> =
                                                 Vec::new();
-                                            for (tool_idx, state) in tool_blocks_by_index.iter_mut() {
+                                            for (_, state) in tool_blocks_by_index.iter_mut() {
                                                 if state.started {
                                                     continue;
                                                 }
@@ -573,11 +653,13 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                 if !has_payload {
                                                     continue;
                                                 }
-                                                let fallback_id = if state.id.is_empty() {
-                                                    format!("tool_call_{tool_idx}")
-                                                } else {
-                                                    state.id.clone()
-                                                };
+                                                // 迟到的块在流收尾时才补发 content_block_start，
+                                                // 同样由网关发号（上游 id 不保证唯一）。
+                                                if state.client_id.is_empty() {
+                                                    state.client_id =
+                                                        super::next_client_tool_use_id();
+                                                }
+                                                let fallback_id = state.client_id.clone();
                                                 let fallback_name = if state.name.is_empty() {
                                                     "unknown_tool".to_string()
                                                 } else {
@@ -650,18 +732,20 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                 Err(e) => {
                     log::error!("Stream error: {e}");
                     stream_ended_with_error = true;
-                    let error_event = json!({
-                        "type": "error",
-                        "error": {
-                            "type": "stream_error",
-                            "message": format!("Stream error: {e}")
-                        }
-                    });
-                    let sse_data = format!("event: error\ndata: {}\n\n",
-                        serde_json::to_string(&error_event).unwrap_or_default());
-                    yield Ok(Bytes::from(sse_data));
+                    yield Ok(stream_error_event(&format!("Stream error: {e}")));
                     break;
                 }
+            }
+        }
+
+        if !stream_ended_with_error && !has_sent_message_stop {
+            if let Some(message) = tool_completion_error(&tool_blocks_by_index, has_emitted_message_delta) {
+                log::error!("[Claude/OpenRouter] {message}");
+                stream_ended_with_error = true;
+                yield Ok(stream_error_event(&message));
+            } else if !has_emitted_message_delta {
+                stream_ended_with_error = true;
+                yield Ok(stream_error_event("Upstream Chat stream ended before finish_reason"));
             }
         }
 
@@ -867,11 +951,16 @@ mod tests {
             }
         }
 
-        assert_eq!(tool_index_by_call.len(), 2);
-        assert_ne!(
-            tool_index_by_call.get("call_0"),
-            tool_index_by_call.get("call_1")
-        );
+        // tool id 由网关发号（call_N），不透传上游 id — 两个下发的 id 必须都改写过
+        // 且互不相同，路由本身仍按 anthropic index 正确分离。
+        let ids: Vec<&String> = tool_index_by_call.keys().collect();
+        assert_eq!(ids.len(), 2);
+        for id in &ids {
+            assert!(id.starts_with("call_"), "网关发号的 id 形如 call_N，实际 {id}");
+            assert_ne!(id.as_str(), "call_0");
+            assert_ne!(id.as_str(), "call_1");
+        }
+        assert_ne!(ids[0], ids[1]);
 
         let deltas: Vec<(u64, String)> = events
             .iter()
@@ -900,13 +989,87 @@ mod tests {
             .find_map(|(index, payload)| (payload == "{\"a\":1}").then_some(*index))
             .unwrap();
 
-        assert_eq!(second_idx, *tool_index_by_call.get("call_1").unwrap());
-        assert_eq!(first_idx, *tool_index_by_call.get("call_0").unwrap());
+        // 参数路由按 anthropic index 校验（id 已由网关改写，不再按上游 id 反查）。
+        let start_index_by_name = |name: &str| {
+            events
+                .iter()
+                .filter(|event| {
+                    event.get("type").and_then(|v| v.as_str()) == Some("content_block_start")
+                        && event.pointer("/content_block/name").and_then(|v| v.as_str())
+                            == Some(name)
+                })
+                .find_map(|event| event.get("index").and_then(|v| v.as_u64()))
+                .unwrap()
+        };
+        assert_eq!(first_idx, start_index_by_name("first_tool"));
+        assert_eq!(second_idx, start_index_by_name("second_tool"));
 
         assert!(events.iter().any(|event| {
             event.get("type").and_then(|v| v.as_str()) == Some("message_delta")
                 && event.pointer("/delta/stop_reason").and_then(|v| v.as_str()) == Some("tool_use")
         }));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_tool_ids_unique_across_responses() {
+        // 回归（会话级）：上游每次都返回同一个 tool_call id（如中转的
+        // "Grep:0"，序号每条响应都从 0 重来）。透传时客户端会认为第二个
+        // tool_use 与历史重复而整段丢弃（表现为 [Tool use interrupted]），
+        // 所以网关必须给每条响应的 tool_use 发新的 id。
+        let upstream_input = |id: &str| {
+            // 唯一动态片段是 id：塞 `{ID}` 占位符再替换，避免 format!/concat! 嵌套的花括号转义。
+            concat!(
+                "data: {\"id\":\"chatcmpl_k\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"{ID}\",\"type\":\"function\",\"function\":{\"name\":\"Grep\",\"arguments\":\"{\\\"pattern\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+                "data: {\"id\":\"chatcmpl_k\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .replace("{ID}", id)
+        };
+
+        let collect_emitted_id = |id: &'static str| {
+            let input = upstream_input(id);
+            async move {
+                let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(
+                    input.as_bytes().to_vec(),
+                ))]);
+                let converted = create_anthropic_sse_stream(upstream);
+                let chunks: Vec<_> = converted.collect().await;
+                let merged = chunks
+                    .into_iter()
+                    .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+                    .collect::<String>();
+                merged
+                    .split("\n\n")
+                    .filter_map(|block| {
+                        let data = block
+                            .lines()
+                            .find_map(|line| strip_sse_field(line, "data"))?;
+                        serde_json::from_str::<Value>(data).ok()
+                    })
+                    .filter(|event| {
+                        event_type(event) == Some("content_block_start")
+                            && event.pointer("/content_block/type").and_then(Value::as_str)
+                                == Some("tool_use")
+                    })
+                    .find_map(|event| {
+                        event
+                            .pointer("/content_block/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .expect("tool_use content_block_start 必须带 id")
+            }
+        };
+
+        let first = collect_emitted_id("Grep:0").await;
+        let second = collect_emitted_id("Grep:0").await;
+
+        assert_ne!(first, second, "同一上游 id 在两次响应里必须映射到不同 id");
+        assert_ne!(first, "Grep:0");
+        assert!(
+            first.starts_with("call_"),
+            "网关发号的 id 形如 call_N，实际 {first}"
+        );
     }
 
     #[tokio::test]
@@ -950,12 +1113,14 @@ mod tests {
             })
             .collect();
         assert_eq!(starts.len(), 1);
-        assert_eq!(
-            starts[0]
-                .pointer("/content_block/id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "call_0"
+        let emitted_id = starts[0]
+            .pointer("/content_block/id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // id 由网关发号，不再透传上游的 call_0。
+        assert!(
+            emitted_id.starts_with("call_") && emitted_id != "call_0",
+            "网关发号的 id 形如 call_N，实际 {emitted_id}"
         );
         assert_eq!(
             starts[0]
@@ -1268,6 +1433,59 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event_type(event) == Some("message_stop")));
+    }
+
+    fn tool_stream(arguments: &str, finish: Option<&str>, done: bool) -> String {
+        let mut input = format!("data: {}\n\n", json!({
+            "id": "chatcmpl_incomplete_tool", "model": "mock-model",
+            "choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_mock",
+                "type": "function", "function": {"name": "ask_question", "arguments": arguments}}]}}]
+        }));
+        if let Some(reason) = finish {
+            input.push_str(&format!("data: {}\n\n", json!({
+                "choices": [{"delta": {}, "finish_reason": reason}]
+            })));
+        }
+        if done { input.push_str("data: [DONE]\n\n"); }
+        input
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_tool_call_never_emits_success_or_closes_tool_block() {
+        for arguments in ["{", "", "null", "[]", "{} trailing"] {
+            for finish in [None, Some("tool_calls"), Some("length")] {
+                for done in [false, true] {
+                    let events = collect_anthropic_events(&tool_stream(arguments, finish, done)).await;
+                    assert_eq!(events.iter().filter(|e| event_type(e) == Some("error")).count(), 1,
+                        "arguments={arguments:?}, finish={finish:?}, done={done}: {events:?}");
+                    assert!(!events.iter().any(|e| matches!(event_type(e),
+                        Some("content_block_stop" | "message_delta" | "message_stop"))), "{events:?}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_done_without_tool_finish_reason_is_an_error_even_with_complete_json() {
+        let events = collect_anthropic_events(&tool_stream("{}", None, true)).await;
+        assert!(events.iter().any(|e| event_type(e) == Some("error")
+            && e["error"]["type"] == "incomplete_tool_call"
+            && e["error"]["message"].as_str().unwrap().contains("no semantic completion marker")));
+        assert!(!events.iter().any(|e| event_type(e) == Some("message_stop")));
+    }
+
+    #[tokio::test]
+    async fn test_complete_tool_call_keeps_success_and_ignores_duplicate_done() {
+        for done in [false, true] {
+            let mut input = tool_stream(r#"{"answer":"中文"}"#, Some("tool_calls"), done);
+            if done { input.push_str("data: [DONE]\n\n"); }
+            let events = collect_anthropic_events(&input).await;
+            assert!(!events.iter().any(|e| event_type(e) == Some("error")), "{events:?}");
+            assert_eq!(events.iter().filter(|e| event_type(e) == Some("content_block_stop")).count(), 1);
+            assert_eq!(events.iter().filter(|e| event_type(e) == Some("message_stop")).count(), 1);
+            assert!(events.iter().any(|e| event_type(e) == Some("message_delta")
+                && e["delta"]["stop_reason"] == "tool_use"));
+        }
     }
 
     #[tokio::test]

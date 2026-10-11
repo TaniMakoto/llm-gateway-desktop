@@ -1,0 +1,92 @@
+{
+  "models": [
+    {
+      "ids": ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+      "contextLength": 1050000,
+      "maxOutputTokens": 128000,
+      "inputModalities": ["text", "image"],
+      "reasoningLevels": ["none", "low", "medium", "high", "xhigh", "max"],
+      "defaultReasoningLevel": "medium"
+    },
+    {
+      "ids": ["gpt-6-astra"],
+      "contextLength": 1050000,
+      "maxOutputTokens": 128000,
+      "inputModalities": ["text", "image"],
+      "reasoningLevels": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "ids": ["gemini-3.7-flash", "gemini-3.8-flash"],
+      "contextLength": 1000000,
+      "maxOutputTokens": 65536,
+      "inputModalities": ["text", "image", "video", "audio", "pdf"],
+      "reasoningLevels": ["low", "medium", "high"],
+      "defaultReasoningLevel": "medium"
+    },
+    {
+      "ids": ["claude-opus-4-8", "claude-opus-5"],
+      "contextLength": 1000000,
+      "maxOutputTokens": 128000,
+      "inputModalities": ["text", "image", "pdf"],
+      "reasoningLevels": ["low", "medium", "high", "xhigh", "max"],
+      "defaultReasoningLevel": "high"
+    },
+    {
+      "ids": ["deepseek-v4-flash", "deepseek-v4-pro"],
+      "contextLength": 1048576,
+      "maxOutputTokens": 384000,
+      "inputModalities": ["text"],
+      "reasoningLevels": ["low", "high", "max"],
+      "defaultReasoningLevel": "high",
+      "protocolReasoningLevels": {
+        "openai_responses": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+      }
+    },
+    {
+      "ids": ["deepseek-v4-flash-vision-exp"],
+      "contextLength": 1048576,
+      "maxOutputTokens": 384000,
+      "inputModalities": ["text", "image"],
+      "reasoningLevels": ["low", "high", "max"],
+      "defaultReasoningLevel": "high",
+      "protocolReasoningLevels": {
+        "openai_responses": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+      }
+    },
+    {
+      "ids": ["gpt-5.5"],
+      "contextLength": 272000,
+      "inputModalities": ["text", "image"],
+      "reasoningLevels": ["low", "medium", "high", "xhigh"]
+    }
+  ],
+  "textOnlyModels": [
+    "ark-code-latest",
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "glm-5.1",
+    "glm-5.2",
+    "kat-coder",
+    "kat-coder-pro",
+    "kat-coder-pro v1",
+    "kat-coder-pro v2",
+    "kat-coder-pro-v1",
+    "kat-coder-pro-v2",
+    "ling-2.5-1t",
+    "longcat-2.0",
+    "longcat-flash-chat",
+    "minimax-m2.7",
+    "minimax-m2.7-highspeed",
+    "mimo-v2.5-pro",
+    "qwen3-coder-480b",
+    "qwen3-coder-480b-a35b-instruct",
+    "qwen3-coder-flash",
+    "qwen3-coder-next",
+    "qwen3-coder-plus",
+    "step-3.5-flash",
+    "step-3.5-flash-2603",
+    "us.deepseek.r1-v1"
+  ]
+}

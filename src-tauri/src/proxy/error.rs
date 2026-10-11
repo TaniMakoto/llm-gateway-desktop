@@ -29,6 +29,9 @@ pub enum ProxyError {
     #[error("无可用的Provider")]
     NoAvailableProvider,
 
+    #[error("网关过载: {0}")]
+    GatewayOverloaded(String),
+
     #[error("所有供应商已熔断，无可用渠道")]
     AllProvidersCircuitOpen,
 
@@ -128,6 +131,9 @@ impl IntoResponse for ProxyError {
                     ProxyError::NoAvailableProvider => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
                     }
+                    ProxyError::GatewayOverloaded(_) => {
+                        (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
+                    }
                     ProxyError::AllProvidersCircuitOpen => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
                     }
@@ -179,6 +185,8 @@ impl IntoResponse for ProxyError {
 pub enum ErrorCategory {
     /// 可重试错误（网络问题、5xx）
     Retryable, // 网络超时、5xx 错误
+    /// Candidate-specific incompatibility; fail over without poisoning provider health.
+    ProviderIncompatible,
     /// 不可重试错误（4xx、认证失败）
     NonRetryable, // 认证失败、参数错误、4xx 错误
     #[allow(dead_code)]

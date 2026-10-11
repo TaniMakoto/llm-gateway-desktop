@@ -11,19 +11,28 @@ A local desktop gateway for managing multiple LLM API providers behind one stabl
 - Local API-key authentication
 - Multiple upstream providers, custom User-Agent, and custom headers
 - Upstream model discovery with cached model selection in route editing
-- Model aliases and ordered failover routes
+- Per-model upstream formats and aliases shared across providers
+- Priority, round-robin, weighted round-robin, and least-outstanding routing
+- Session affinity, rate-limit cooldowns, circuit breaking, and ordered failover
+- Per-provider concurrency limits and bounded queues
+- Central model capability registry and manual metadata overrides
+- Direct/upstream and gateway test console with streaming text, reasoning, and usage
+- Optional request/response body recording for diagnostics (disabled by default)
 - OpenAI Chat Completions compatible endpoint
 - OpenAI Responses compatible endpoint
 - Anthropic Messages compatible endpoint
 - JSON and SSE streaming translation
 - Standard tool-call and tool-result conversion
 - SQLite-backed local configuration
+- Revision-checked configuration saves with rollback on failed publication
+- Build version and commit identity in the desktop and gateway status
 - Windows, Linux, and macOS packaging with GitHub Actions
 
 ## Supported endpoints
 
 ```text
 GET  /health
+GET  /v1/gateway/status
 GET  /v1/models
 POST /v1/chat/completions
 POST /v1/responses
@@ -35,8 +44,8 @@ The three client formats can be routed to OpenAI Chat, OpenAI Responses, or Anth
 
 ## Quick start
 
-1. Open **Upstream Providers** and add an API base URL, API key, upstream format, authentication mode, and optional compatibility headers. Use **Fetch Models** to cache the upstream model list when the provider exposes a models endpoint.
-2. Open **Model Routes** and create a local alias such as `best-code`. Add one or more ordered upstream targets.
+1. Add an upstream provider with its API base URL, API key, authentication mode, and optional compatibility headers. Fetch models when the provider exposes a models endpoint.
+2. Add model entries under the provider, choosing each entry's upstream model, API format, and local alias such as `best-code`. Reuse an alias across providers to form a routing pool, then choose its routing policy. Priority routing uses provider order; an existing healthy session binding takes precedence over fresh selection.
 3. Open **Gateway Settings**, save the listening address and local access key, then start the gateway.
 4. Point a compatible client at the local endpoint.
 
@@ -121,6 +130,11 @@ Run the dependency-free mock upstream:
 python tools/mock_upstream.py
 ```
 
+The desktop-independent completion rules can be tested with
+`cargo test --locked --manifest-path crates/gateway-core/Cargo.toml`.
+See the [refactoring plan](docs/REFACTOR_PLAN.md) and
+[validation status](docs/DEVELOPMENT_STATUS.md) for the current scope.
+
 After configuring a route to the mock server, run:
 
 ```bash
@@ -143,9 +157,13 @@ A manual workflow run uploads build artifacts. Pushing a tag such as `v0.1.0` al
 
 ## Project structure
 
+The current architecture and implementation status were reviewed on 2026-09-20. See [Architecture](docs/ARCHITECTURE.md), [Development status](docs/DEVELOPMENT_STATUS.md), the [CPA/sub2api kernel comparison](docs/KERNEL_COMPARISON.md), and [remaining feature gaps](docs/FEATURE_GAPS.md). The product targets a local single-user gateway; multi-user administration and commercial billing are outside its scope.
+
 - `src/` — React desktop interface
 - `src-tauri/src/gateway.rs` — gateway configuration and route materialization
 - `src-tauri/src/gateway_chat.rs` — OpenAI Chat compatibility bridge
+- `src-tauri/src/gateway_runtime.rs` — standalone listener lifecycle, separate from CLI configuration takeover
+- `src-tauri/src/gateway/protocol_tests.rs` — real-HTTP protocol matrix and failover regression tests
 - `src-tauri/src/proxy/` — protocol translation, streaming, forwarding, and failover
 - `tools/` — mock upstream and smoke tests
 
@@ -155,7 +173,7 @@ Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) be
 
 ## License
 
-MIT. This repository contains third-party MIT-licensed code; required attribution is preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+MIT. Third-party source attribution, copyright notices and permission text are consolidated in [LICENSE](LICENSE).
 ## Windows portable package
 
 Release builds include a Windows x64 portable ZIP in addition to NSIS and MSI installers.

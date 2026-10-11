@@ -309,58 +309,47 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
     let parent = path
         .parent()
         .ok_or_else(|| AppError::Config("无效的路径".to_string()))?;
-    let mut tmp = parent.to_path_buf();
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| AppError::Config("无效的文件名".to_string()))?
-        .to_string_lossy()
-        .to_string();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    tmp.push(format!("{file_name}.tmp.{ts}"));
-
-    {
-        let mut f = fs::File::create(&tmp).map_err(|e| AppError::io(&tmp, e))?;
-        f.write_all(data).map_err(|e| AppError::io(&tmp, e))?;
-        f.flush().map_err(|e| AppError::io(&tmp, e))?;
-    }
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| AppError::io(parent, error))?;
+    tmp.write_all(data).map_err(|error| AppError::io(tmp.path(), error))?;
+    tmp.as_file().sync_all().map_err(|error| AppError::io(tmp.path(), error))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = fs::metadata(path) {
             let perm = meta.permissions().mode();
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(perm));
+            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(perm))
+                .map_err(|error| AppError::io(tmp.path(), error))?;
         }
     }
 
-    #[cfg(windows)]
-    {
-        // Windows 上 rename 目标存在会失败，先移除再重命名（尽量接近原子性）
-        if path.exists() {
-            let _ = fs::remove_file(path);
-        }
-        fs::rename(&tmp, path).map_err(|e| AppError::IoContext {
-            context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
-            source: e,
-        })?;
-    }
-
-    #[cfg(not(windows))]
-    {
-        fs::rename(&tmp, path).map_err(|e| AppError::IoContext {
-            context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
-            source: e,
-        })?;
-    }
+    // persist replaces an existing file atomically on Windows and Unix; never
+    // delete the working configuration before attempting the replacement.
+    tmp.persist(path).map_err(|error| AppError::IoContext {
+        context: format!("原子替换失败: {}", path.display()),
+        source: error.error,
+    })?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_write_replaces_existing_file_and_preserves_failed_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        atomic_write(&path, b"old").unwrap();
+        atomic_write(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let blocked = directory.path().join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        assert!(atomic_write(&blocked, b"data").is_err());
+        assert!(blocked.is_dir());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
 
     #[test]
     fn derive_mcp_path_from_override_uses_config_dir_for_custom_path() {

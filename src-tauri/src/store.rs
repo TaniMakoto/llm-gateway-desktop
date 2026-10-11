@@ -5,6 +5,7 @@ use std::sync::Arc;
 /// 全局应用状态
 pub struct AppState {
     pub db: Arc<Database>,
+    pub gateway_runtime: crate::gateway_runtime::GatewayRuntime,
     pub proxy_service: ProxyService,
     pub usage_cache: Arc<UsageCache>,
 }
@@ -15,6 +16,7 @@ impl AppState {
         let proxy_service = ProxyService::new(db.clone());
 
         Self {
+            gateway_runtime: crate::gateway_runtime::GatewayRuntime::new(db.clone()),
             db,
             proxy_service,
             usage_cache: Arc::new(UsageCache::new()),
